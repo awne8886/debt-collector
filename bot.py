@@ -104,6 +104,50 @@ async def remind_off(interaction: discord.Interaction):
     next_fire.pop(str(interaction.guild_id), None)
     await interaction.response.send_message("🛑 Reminder disabled.", ephemeral=True)
 
+@remind.command(name="test", description="Test the reminder configuration immediately")
+async def remind_test(interaction: discord.Interaction):
+    if not await admin_gate(interaction):
+        return
+        
+    cfg = guild_cfg(interaction.guild_id)["remind"]
+    
+    # 1. Validation check
+    if not cfg["role_id"] or not cfg["channel_id"]:
+        return await interaction.response.send_message(
+            "❌ Testing failed: Set a role and a channel first via `/remind role` and `/remind channel`.",
+            ephemeral=True,
+        )
+        
+    # 2. Fetching elements
+    channel = bot.get_channel(cfg["channel_id"])
+    role = interaction.guild.get_role(cfg["role_id"])
+    
+    if not channel:
+        return await interaction.response.send_message(
+            "❌ Testing failed: Target channel not found. Did it get deleted?", 
+            ephemeral=True
+        )
+    if not role:
+        return await interaction.response.send_message(
+            "❌ Testing failed: Target role not found. Did it get deleted?", 
+            ephemeral=True
+        )
+        
+    # 3. Execution
+    try:
+        await interaction.response.send_message("⚡ Sending test reminder...", ephemeral=True)
+        await channel.send(f"{role.mention} {cfg['message']}")
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"❌ Permission Error: The bot cannot send messages or mention roles in {channel.mention}.", 
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ An error occurred: {e}", 
+            ephemeral=True
+        )
+
 
 @remind.command(name="interval", description="Set the interval in minutes (default 181 = 3h 1m)")
 @app_commands.describe(minutes="Interval in minutes (minimum 1)")
