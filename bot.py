@@ -288,5 +288,22 @@ async def setup_hook():
     await bot.tree.sync()
     reminder_loop.start()
 
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class Ping(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive")
+    def log_message(self, *args):  # silence request logging
+        pass
+
+def keep_alive():
+    port = int(os.environ.get("PORT", 8080))
+    HTTPServer(("0.0.0.0", port), Ping).serve_forever()
+
+threading.Thread(target=keep_alive, daemon=True).start()
 
 bot.run(TOKEN)
+
