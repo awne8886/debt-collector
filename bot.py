@@ -75,32 +75,51 @@ next_fire: dict[str, float] = {}  # guild_id -> unix timestamp of next ping
 
 # ---------- permission helpers ----------
 
-# 2. Fix the require_perm helper function
+# ---------- Hardened Permission Helpers ----------
+def is_admin(interaction: discord.Interaction) -> bool:
+    return interaction.user.guild_permissions.administrator
+
+async def admin_gate(interaction: discord.Interaction) -> bool:
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "❌ You need Administrator permissions to use this.", ephemeral=True
+        )
+        return False
+    return True
+
 async def require_perm(interaction: discord.Interaction, perm: str) -> bool:
-    # Use getattr properly to read the boolean value of the permission
+    # Safe fallback attribute fetch using getattr
     if getattr(interaction.user.guild_permissions, perm, False):
         return True
     await interaction.response.send_message(
-        "You don't have permission to use this command.", ephemeral=True
+        f"❌ You don't have the `{perm}` permission to use this.", ephemeral=True
     )
     return False
 
-
-def can_act_on(actor: discord.Member, target: discord.Member) -> bool:
-    if actor.guild.owner_id == actor.id:
-        return True
-    return actor.top_role > target.top_role
-
-
 async def hierarchy_gate(interaction: discord.Interaction, target: discord.Member) -> bool:
     if target.id == interaction.user.id:
-        await interaction.response.send_message("You can't use that on yourself.", ephemeral=True)
+        await interaction.response.send_message("❌ You can't use that on yourself.", ephemeral=True)
         return False
-    if not can_act_on(interaction.user, target):
+        
+    # Owner exception safety check
+    if interaction.guild.owner_id == interaction.user.id:
+        return True
+
+    # Use .position value integers instead of comparing raw role objects directly
+    if interaction.user.top_role.position <= target.top_role.position:
         await interaction.response.send_message(
-            "You can't act on someone with an equal or higher role.", ephemeral=True
+            "❌ You can't act on someone with an equal or higher role.", ephemeral=True
         )
         return False
+        
+    # Check the bot's own role position relative to the target
+    bot_member = interaction.guild.me
+    if bot_member.top_role.position <= target.top_role.position:
+        await interaction.response.send_message(
+            "❌ My role rank is lower or equal to that user. Drag my role higher in Server Settings.", ephemeral=True
+        )
+        return False
+        
     return True
 
 
