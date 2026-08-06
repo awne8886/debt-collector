@@ -53,7 +53,8 @@ def guild_cfg(guild_id: int):
 
 # ---------- bot ----------
 intents = discord.Intents.default()
-intents.message_content = True  # required for trigger detection
+intents.message_content = True  # Required for trigger detection
+intents.members = True          # REQUIRED for ban/kick/hierarchy checks
 
 def get_prefix(_bot, message):
     if message.guild:
@@ -73,21 +74,11 @@ next_fire: dict[str, float] = {}  # guild_id -> unix timestamp of next ping
 
 
 # ---------- permission helpers ----------
-def is_admin(interaction: discord.Interaction) -> bool:
-    return interaction.user.guild_permissions.administrator
 
-
-async def admin_gate(interaction: discord.Interaction) -> bool:
-    if not is_admin(interaction):
-        await interaction.response.send_message(
-            "You need Administrator permissions to use this.", ephemeral=True
-        )
-        return False
-    return True
-
-
+# 2. Fix the require_perm helper function
 async def require_perm(interaction: discord.Interaction, perm: str) -> bool:
-    if getattr(interaction.user.guild_permissions, perm):
+    # Use getattr properly to read the boolean value of the permission
+    if getattr(interaction.user.guild_permissions, perm, False):
         return True
     await interaction.response.send_message(
         "You don't have permission to use this command.", ephemeral=True
