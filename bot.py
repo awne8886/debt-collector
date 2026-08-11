@@ -53,8 +53,8 @@ def guild_cfg(guild_id: int):
 
 # ---------- bot ----------
 intents = discord.Intents.default()
-intents.message_content = True  # Required for trigger detection
-intents.members = True          # REQUIRED for ban/kick/hierarchy checks
+intents.message_content = True  # required for trigger detection
+intents.members = True          # must also be enabled in the developer portal
 
 def get_prefix(_bot, message):
     if message.guild:
@@ -74,52 +74,68 @@ next_fire: dict[str, float] = {}  # guild_id -> unix timestamp of next ping
 
 
 # ---------- permission helpers ----------
-
-# ---------- Hardened Permission Helpers ----------
 def is_admin(interaction: discord.Interaction) -> bool:
     return interaction.user.guild_permissions.administrator
+
 
 async def admin_gate(interaction: discord.Interaction) -> bool:
     if not is_admin(interaction):
         await interaction.response.send_message(
-            "❌ You need Administrator permissions to use this.", ephemeral=True
+            "You need Administrator permissions to use this.", ephemeral=True
         )
         return False
     return True
 
+
 async def require_perm(interaction: discord.Interaction, perm: str) -> bool:
-    # Safe fallback attribute fetch using getattr
-    if getattr(interaction.user.guild_permissions, perm, False):
+    if getattr(interaction.user.guild_permissions, perm):
         return True
     await interaction.response.send_message(
-        f"❌ You don't have the `{perm}` permission to use this.", ephemeral=True
+        "You don't have permission to use this command.", ephemeral=True
     )
     return False
 
-async def hierarchy_gate(interaction: discord.Interaction, target: discord.Member) -> bool:
-    if target.id == interaction.user.id:
-        await interaction.response.send_message("❌ You can't use that on yourself.", ephemeral=True)
-        return False
-        
-    # Owner exception safety check
-    if interaction.guild.owner_id == interaction.user.id:
-        return True
 
-    # Use .position value integers instead of comparing raw role objects directly
-    if interaction.user.top_role.position <= target.top_role.position:
-        await interaction.response.send_message(
-            "❌ You can't act on someone with an equal or higher role.", ephemeral=True
+# ---------- error log ----------
+error_log: list[dict] = []  # recent errors, newest last (in memory)
+
+
+def log_error(where: str, err) -> None:
+    error_log.append({"where": where, "error": str(err)[:300], "at": int(time.time())})
+    del error_log[:-25]  # keep the last 25
+
+
+async def send_any(interaction: discord.Interaction, content: str, ephemeral: bool = False):
+    """Reply safely whether or not the interaction was already responded to."""
+    if interaction.response.is_done():
+        await interaction.followup.send(content, ephemeral=ephemeral)
+    else:
+        await interaction.response.send_message(content, ephemeral=ephemeral)
+
+
+def mod_block_reason(actor: discord.Member, target: discord.Member, me: discord.Member) -> Optional[str]:
+    """Return a human-readable reason why the action is not allowed, or None if it is."""
+    if target.id == actor.id:
+        return "You can't use that on yourself."
+    if target.id == me.id:
+        return "I'm not moderating myself."
+    if target.id == actor.guild.owner_id:
+        return "That member is the server owner — nobody can moderate them."
+    if actor.id != actor.guild.owner_id and actor.top_role <= target.top_role:
+        return "You can't act on someone whose highest role is equal to or above yours."
+    if me.top_role <= target.top_role:
+        return (
+            "⚠️ **My highest role is not above that member's.** "
+            "Drag my role higher in **Server Settings → Roles**, then try again."
         )
+    return None
+
+
+async def hierarchy_gate(interaction: discord.Interaction, target: discord.Member) -> bool:
+    reason = mod_block_reason(interaction.user, target, interaction.guild.me)
+    if reason:
+        await send_any(interaction, reason, ephemeral=True)
         return False
-        
-    # Check the bot's own role position relative to the target
-    bot_member = interaction.guild.me
-    if bot_member.top_role.position <= target.top_role.position:
-        await interaction.response.send_message(
-            "❌ My role rank is lower or equal to that user. Drag my role higher in Server Settings.", ephemeral=True
-        )
-        return False
-        
     return True
 
 
@@ -347,15 +363,41 @@ SOLO_ACTIONS = {
 }
 
 
+GIF_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ReminderBot/1.0; Discord bot)"}
+WAIFU_API = "https://api.waifu.pics/sfw/{}"
+WAIFU_ACTIONS = {  # actions the fallback API also supports
+    "bite", "blush", "cry", "cuddle", "dance", "handhold", "highfive",
+    "hug", "kiss", "pat", "poke", "slap", "smile", "wave", "wink", "yeet",
+}
+
+
 async def fetch_gif(action: str) -> Optional[str]:
+    # primary source: nekos.best
     try:
         async with http_session.get(
-            NEKOS_API.format(action), timeout=aiohttp.ClientTimeout(total=10)
+            NEKOS_API.format(action), headers=GIF_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
-            data = await resp.json()
-            return data["results"][0]["url"]
-    except Exception:
-        return None
+            if resp.status == 200:
+                data = await resp.json()
+                return data["results"][0]["url"]
+            log_error(f"gif /{action}", f"nekos.best answered HTTP {resp.status}")
+    except Exception as e:
+        log_error(f"gif /{action}", e)
+    # fallback source: waifu.pics
+    if action in WAIFU_ACTIONS:
+        try:
+            async with http_session.get(
+                WAIFU_API.format(action), headers=GIF_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data["url"]
+                log_error(f"gif /{action} fallback", f"waifu.pics answered HTTP {resp.status}")
+        except Exception as e:
+            log_error(f"gif /{action} fallback", e)
+    return None
 
 
 def register_fun_commands():
@@ -436,6 +478,95 @@ def register_prefix_fun_commands():
 @bot.command(name="ping")
 async def ping_prefix(ctx: commands.Context):
     await ctx.send(f"🏓 Pong! Latency: **{round(bot.latency * 1000)}ms**")
+
+
+# ---- prefix versions of the main moderation commands (!ban, !kick, ...) ----
+@bot.command(name="ban")
+@commands.guild_only()
+@commands.has_permissions(ban_members=True)
+async def ban_prefix(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason given"):
+    block = mod_block_reason(ctx.author, member, ctx.guild.me)
+    if block:
+        return await ctx.send(block)
+    await member.ban(reason=f"{ctx.author}: {reason}")
+    await ctx.send(f"🔨 Banned **{member}** — {reason}.")
+
+
+@bot.command(name="kick")
+@commands.guild_only()
+@commands.has_permissions(kick_members=True)
+async def kick_prefix(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason given"):
+    block = mod_block_reason(ctx.author, member, ctx.guild.me)
+    if block:
+        return await ctx.send(block)
+    await member.kick(reason=f"{ctx.author}: {reason}")
+    await ctx.send(f"👢 Kicked **{member}** — {reason}.")
+
+
+@bot.command(name="timeout")
+@commands.guild_only()
+@commands.has_permissions(moderate_members=True)
+async def timeout_prefix(ctx: commands.Context, member: discord.Member, minutes: int = 10, *, reason: str = "No reason given"):
+    block = mod_block_reason(ctx.author, member, ctx.guild.me)
+    if block:
+        return await ctx.send(block)
+    minutes = max(1, min(minutes, 40320))
+    await member.timeout(timedelta(minutes=minutes), reason=f"{ctx.author}: {reason}")
+    await ctx.send(f"🔇 Timed out **{member}** for {minutes} minute(s).")
+
+
+@bot.command(name="warn")
+@commands.guild_only()
+@commands.has_permissions(moderate_members=True)
+async def warn_prefix(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason given"):
+    warns = guild_cfg(ctx.guild.id)["warns"].setdefault(str(member.id), [])
+    warns.append({"reason": reason, "by": str(ctx.author), "at": int(time.time())})
+    save_settings()
+    await ctx.send(f"⚠️ Warned **{member}** — {reason} (warning #{len(warns)}).")
+
+
+@bot.command(name="purge")
+@commands.guild_only()
+@commands.has_permissions(manage_messages=True)
+async def purge_prefix(ctx: commands.Context, amount: int = 10):
+    amount = max(1, min(amount, 100))
+    deleted = await ctx.channel.purge(limit=amount + 1)  # +1 for the command message itself
+    await ctx.send(f"🧹 Deleted {len(deleted) - 1} message(s).", delete_after=5)
+
+
+# ---- error reporting ----
+@bot.tree.command(name="errors", description="Show the bot's recent errors (admin)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def errors_cmd(interaction: discord.Interaction):
+    if not await admin_gate(interaction):
+        return
+    if not error_log:
+        return await interaction.response.send_message(
+            "✅ No errors recorded since the last restart.", ephemeral=True
+        )
+    lines = [
+        f"<t:{e['at']}:R> · **{e['where']}** — `{e['error']}`"
+        for e in reversed(error_log)
+    ]
+    embed = discord.Embed(
+        title="Recent errors (newest first)",
+        description="\n".join(lines)[:4000],
+        color=0xE74C3C,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    original = getattr(error, "original", error)
+    cmd = interaction.command.qualified_name if interaction.command else "unknown"
+    log_error(f"/{cmd}", original)
+    text = f"⚠️ `/{cmd}` failed: `{str(original)[:200]}`\nAn admin can check `/errors` for details."
+    try:
+        await send_any(interaction, text, ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 
 # ================= moderation =================
@@ -768,6 +899,7 @@ CONFIG_CMDS = [
     "/autoreact set trigger <trigger> <emoji> · /autoreact remove · /autoreact list",
     "/autorespond set trigger <trigger> <response> · /autorespond remove · /autorespond list",
     "/set prefix <prefix>",
+    "/errors — show recent bot errors",
 ]
 MOD_CMDS = [
     "/ban <user> [reason]", "/unban <user_id>", "/kick <user> [reason]",
@@ -776,6 +908,7 @@ MOD_CMDS = [
     "/purge <amount>", "/lock [channel]", "/unlock [channel]",
     "/slowmode <seconds> [channel]", "/nickname <user> [name]",
     "/role add <user> <role>", "/role remove <user> <role>",
+    "Prefix versions also work: !ban, !kick, !timeout, !warn, !purge",
 ]
 INFO_CMDS = [
     "/ping", "/uptime", "/userinfo [user]", "/serverinfo",
@@ -848,8 +981,8 @@ async def reminder_loop():
                 continue
             try:
                 await channel.send(f"<@&{cfg['role_id']}> {cfg['message']}")
-            except (discord.Forbidden, discord.HTTPException):
-                pass
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log_error("reminder", e)
 
 
 @reminder_loop.before_loop
@@ -869,15 +1002,15 @@ async def on_message(message: discord.Message):
         if trigger in content:
             try:
                 await message.add_reaction(emoji)
-            except discord.HTTPException:
-                pass  # invalid emoji or missing permission
+            except discord.HTTPException as e:
+                log_error(f"autoreact “{trigger}”", f"{e} (is the emoji valid / do I have Add Reactions?)")
 
     for trigger, response in g["autorespond"].items():
         if trigger in content:
             try:
                 await message.channel.send(response)
-            except discord.HTTPException:
-                pass
+            except discord.HTTPException as e:
+                log_error(f"autorespond “{trigger}”", e)
             break  # only one auto-response per message
 
     await bot.process_commands(message)
@@ -887,10 +1020,21 @@ async def on_message(message: discord.Message):
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
         return  # not every prefixed message is a command
+    if isinstance(error, commands.MissingPermissions):
+        return await ctx.send("You don't have permission to use this command.")
+    if isinstance(error, commands.BotMissingPermissions):
+        return await ctx.send("I'm missing the server permission needed for that.")
     if isinstance(error, (commands.MissingRequiredArgument, commands.MemberNotFound, commands.BadArgument)):
-        await ctx.send("You need to mention a valid member, e.g. `hug @someone`.")
-        return
-    raise error
+        name = ctx.command.name if ctx.command else "command"
+        return await ctx.send(f"Usage: `{ctx.prefix}{name} @someone` — mention a valid member.")
+    original = getattr(error, "original", error)
+    log_error(f"{ctx.prefix}{ctx.command.name if ctx.command else '?'}", original)
+    if isinstance(original, discord.Forbidden):
+        return await ctx.send(
+            "Discord refused that action — my role is probably below the target's, or I'm missing "
+            "a permission. Check **Server Settings → Roles** and see `/errors`."
+        )
+    await ctx.send(f"⚠️ That failed: `{str(original)[:200]}` — an admin can check `/errors`.")
 
 
 # ================= keep-alive web server (for Render) =================
