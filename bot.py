@@ -349,6 +349,113 @@ async def set_prefix(interaction: discord.Interaction, prefix: str):
     )
 
 
+# ================= /autopurge =================
+autopurge = app_commands.Group(
+    name="autopurge",
+    description="Auto-delete every new message in selected channels",
+    default_permissions=discord.Permissions(administrator=True),
+    guild_only=True,
+)
+
+
+def autopurge_cfg(guild_id: int):
+    return guild_cfg(guild_id).setdefault("autopurge", {"channels": {}, "exempt_roles": []})
+
+
+@autopurge.command(name="on", description="Start auto-deleting every new message in a channel")
+@app_commands.describe(
+    channel="Channel to auto-purge (default: this one)",
+    hours="Optional: automatically stop after this many hours",
+    days="Optional: automatically stop after this many days",
+)
+async def autopurge_on(
+    interaction: discord.Interaction,
+    channel: Optional[discord.TextChannel] = None,
+    hours: Optional[app_commands.Range[int, 1, 720]] = None,
+    days: Optional[app_commands.Range[int, 1, 365]] = None,
+):
+    if not await admin_gate(interaction):
+        return
+    channel = channel or interaction.channel
+    if not channel.permissions_for(interaction.guild.me).manage_messages:
+        return await interaction.response.send_message(
+            f"I need the **Manage Messages** permission in {channel.mention} to do that.",
+            ephemeral=True,
+        )
+    until = None
+    if hours or days:
+        until = int(time.time()) + (hours or 0) * 3600 + (days or 0) * 86400
+    autopurge_cfg(interaction.guild_id)["channels"][str(channel.id)] = {"until": until}
+    save_settings()
+    when = f"until <t:{until}:f>" if until else "until you run `/autopurge off`"
+    await interaction.response.send_message(
+        f"🧹 Auto-purge is now **on** in {channel.mention} {when}. "
+        "Every new message there will be deleted, except from exempt roles "
+        "(`/autopurge exempt add <role>`).",
+        ephemeral=True,
+    )
+
+
+@autopurge.command(name="off", description="Stop auto-deleting in a channel")
+@app_commands.describe(channel="Channel (default: this one)")
+async def autopurge_off(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    if not await admin_gate(interaction):
+        return
+    channel = channel or interaction.channel
+    removed = autopurge_cfg(interaction.guild_id)["channels"].pop(str(channel.id), None)
+    save_settings()
+    msg = (
+        f"✅ Auto-purge turned off in {channel.mention}."
+        if removed else f"Auto-purge wasn't active in {channel.mention}."
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@autopurge.command(name="exempt", description="Add/remove a role whose messages are never auto-deleted")
+@app_commands.describe(action="add or remove", role="The role to exempt")
+async def autopurge_exempt(
+    interaction: discord.Interaction,
+    action: Literal["add", "remove"],
+    role: discord.Role,
+):
+    if not await admin_gate(interaction):
+        return
+    exempt = autopurge_cfg(interaction.guild_id)["exempt_roles"]
+    if action == "add":
+        if role.id not in exempt:
+            exempt.append(role.id)
+        msg = f"✅ Messages from {role.mention} will be left alone."
+    elif role.id in exempt:
+        exempt.remove(role.id)
+        msg = f"✅ {role.mention} is no longer exempt."
+    else:
+        msg = f"{role.mention} wasn't exempt."
+    save_settings()
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@autopurge.command(name="status", description="Where auto-purge is active and which roles are exempt")
+async def autopurge_status(interaction: discord.Interaction):
+    if not await admin_gate(interaction):
+        return
+    ap = autopurge_cfg(interaction.guild_id)
+    now = time.time()
+    lines = []
+    for cid, c in ap["channels"].items():
+        until = c.get("until")
+        if until and now > until:
+            continue  # expired, will be cleaned up automatically
+        lines.append(f"<#{cid}> — " + (f"until <t:{until}:f>" if until else "until turned off"))
+    embed = discord.Embed(title="Auto-purge status", color=EMBED_COLOR)
+    embed.add_field(name="Active channels", value="\n".join(lines)[:1024] or "Not active anywhere.", inline=False)
+    embed.add_field(
+        name="Exempt roles",
+        value=" ".join(f"<@&{r}>" for r in ap["exempt_roles"])[:1024] or "None",
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # ================= fun / roleplay =================
 TARGETED_ACTIONS = {
     "bite": "bit", "hug": "hugged", "kiss": "kissed", "slap": "slapped",
@@ -363,40 +470,47 @@ SOLO_ACTIONS = {
 }
 
 
-GIF_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ReminderBot/1.0; Discord bot)"}
-WAIFU_API = "https://api.waifu.pics/sfw/{}"
-WAIFU_ACTIONS = {  # actions the fallback API also supports
+GIF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Accept": "application/json",
+}
+WAIFU_ACTIONS = {
     "bite", "blush", "cry", "cuddle", "dance", "handhold", "highfive",
     "hug", "kiss", "pat", "poke", "slap", "smile", "wave", "wink", "yeet",
 }
+OTAKU_ACTIONS = {
+    "bite", "blush", "cry", "cuddle", "dance", "facepalm", "handhold", "hug",
+    "kiss", "laugh", "pat", "poke", "pout", "punch", "shrug", "slap",
+    "sleep", "smile", "tickle", "wave", "wink",
+}
+NEKOSLIFE_ACTIONS = {"hug", "kiss", "slap", "pat", "cuddle", "tickle", "feed", "poke"}
+GIF_SOURCES = [  # (name, url template, json path, supported actions or None = all)
+    ("nekos.best", "https://nekos.best/api/v2/{}", ("results", 0, "url"), None),
+    ("waifu.pics", "https://api.waifu.pics/sfw/{}", ("url",), WAIFU_ACTIONS),
+    ("otakugifs", "https://api.otakugifs.xyz/gif?reaction={}&format=gif", ("url",), OTAKU_ACTIONS),
+    ("nekos.life", "https://nekos.life/api/v2/img/{}", ("url",), NEKOSLIFE_ACTIONS),
+]
 
 
 async def fetch_gif(action: str) -> Optional[str]:
-    # primary source: nekos.best
-    try:
-        async with http_session.get(
-            NEKOS_API.format(action), headers=GIF_HEADERS,
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data["results"][0]["url"]
-            log_error(f"gif /{action}", f"nekos.best answered HTTP {resp.status}")
-    except Exception as e:
-        log_error(f"gif /{action}", e)
-    # fallback source: waifu.pics
-    if action in WAIFU_ACTIONS:
+    for name, template, path, supported in GIF_SOURCES:
+        if supported is not None and action not in supported:
+            continue
         try:
             async with http_session.get(
-                WAIFU_API.format(action), headers=GIF_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=10),
+                template.format(action), headers=GIF_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data["url"]
-                log_error(f"gif /{action} fallback", f"waifu.pics answered HTTP {resp.status}")
+                if resp.status != 200:
+                    log_error(f"gif /{action}", f"{name} answered HTTP {resp.status}")
+                    continue
+                data = await resp.json(content_type=None)
+                for key in path:
+                    data = data[key]
+                if data:
+                    return data
         except Exception as e:
-            log_error(f"gif /{action} fallback", e)
+            log_error(f"gif /{action}", f"{name}: {e}")
     return None
 
 
@@ -899,6 +1013,8 @@ CONFIG_CMDS = [
     "/autoreact set trigger <trigger> <emoji> · /autoreact remove · /autoreact list",
     "/autorespond set trigger <trigger> <response> · /autorespond remove · /autorespond list",
     "/set prefix <prefix>",
+    "/autopurge on [channel] [hours] [days] · /autopurge off [channel]",
+    "/autopurge exempt <add|remove> <role> · /autopurge status",
     "/errors — show recent bot errors",
 ]
 MOD_CMDS = [
@@ -993,9 +1109,27 @@ async def before_reminder_loop():
 # ================= trigger detection =================
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or message.guild is None:
+    if message.guild is None:
         return
     g = guild_cfg(message.guild.id)
+
+    # auto-purge: delete every new message in active channels (exempt roles excluded)
+    ap = g.setdefault("autopurge", {"channels": {}, "exempt_roles": []})
+    entry = ap["channels"].get(str(message.channel.id))
+    if entry and message.author.id != bot.user.id:
+        until = entry.get("until")
+        if until and time.time() > until:
+            ap["channels"].pop(str(message.channel.id), None)
+            save_settings()
+        elif not any(r.id in ap["exempt_roles"] for r in getattr(message.author, "roles", [])):
+            try:
+                await message.delete()
+            except discord.HTTPException as e:
+                log_error("autopurge", e)
+            return  # deleted messages don't trigger anything else
+
+    if message.author.bot:
+        return
     content = message.content.lower()
 
     for trigger, emoji in g["autoreact"].items():
@@ -1063,6 +1197,7 @@ async def setup_hook():
     bot.tree.add_command(autorespond)
     bot.tree.add_command(role_group)
     bot.tree.add_command(set_group)
+    bot.tree.add_command(autopurge)
     register_fun_commands()
     register_prefix_fun_commands()
     await bot.tree.sync()
