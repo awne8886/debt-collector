@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
@@ -30,6 +31,12 @@ log: logging.Logger = logging.getLogger("debt-collector")
 # --------------------------------------------------------------------------- #
 # Global constants
 # --------------------------------------------------------------------------- #
+
+@dataclass
+class AfkRecord:
+    reason: str
+    since: float
+    pings: List[Dict[str, str]] = field(default_factory=list)
 
 COMMAND_PREFIX: str = "!"
 MONGO_DB_NAME: str = "debt_collector"
@@ -154,6 +161,7 @@ class DebtCollectorBot(commands.Bot):
         self.settings: MultiTenantSettingsManager = settings_manager
         self.http_session: Optional[aiohttp.ClientSession] = None
         self.start_time: float = time.time()
+        self.afk_state: Dict[int, "AfkRecord"] = {}
         self.sniped_messages: Dict[int, discord.Message] = {}
         self.next_fire: Dict[str, float] = {}
         self.error_log: List[Dict[str, Any]] = []
@@ -288,6 +296,9 @@ _register_reaction_commands(bot)
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
+def sanitize_mass_pings(text: str) -> str:
+    return text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
 
 def member_has_perms(member: discord.Member, **perms: bool) -> bool:
     if is_superuser(member):
@@ -450,6 +461,37 @@ async def on_message(message: discord.Message) -> None:
         return
     settings = bot.settings.get_settings(message.guild.id)
     content = message.content.lower()
+
+    # AFK system logic
+    if message.author.id in bot.afk_state:
+        record = bot.afk_state.pop(message.author.id)
+        duration = int(time.time() - record.since)
+        mins, secs = divmod(duration, 60)
+        hours, mins = divmod(mins, 60)
+        dur_str = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s" if mins else f"{secs}s"
+
+        reply = f"👋 Welcome back {message.author.mention}! You were AFK for {dur_str}."
+        if record.pings:
+            reply += f" You received {len(record.pings)} ping(s) while you were away."
+        try:
+            await message.channel.send(reply, allowed_mentions=discord.AllowedMentions(users=[message.author]))
+        except discord.HTTPException:
+            pass
+
+    if message.mentions:
+        for user in message.mentions:
+            if user.id in bot.afk_state and user.id != message.author.id:
+                record = bot.afk_state[user.id]
+                record.pings.append({
+                    "author": str(message.author),
+                    "url": message.jump_url,
+                    "content": message.content[:50]
+                })
+                try:
+                    await message.channel.send(f"💤 {user.mention} is currently AFK: **{discord.utils.escape_mentions(record.reason)}**", allowed_mentions=discord.AllowedMentions.none())
+                except discord.HTTPException:
+                    pass
+
 
     # auto-purge
     ap = settings.get("autopurge", {"channels": {}, "exempt_roles": []})
@@ -925,8 +967,111 @@ async def commands_cmd(
 
 
 # --------------------------------------------------------------------------- #
-# Error Handling
+@bot.hybrid_command(name="echoset", description="Enable or disable the echo feature guild-wide.")
+@commands.guild_only()
+@app_commands.describe(state="Turn echo on or off for this server.")
+async def echoset(ctx: commands.Context, state: Literal["on", "off"]) -> None:
+    if not isinstance(ctx.author, discord.Member) or not member_has_perms(
+        ctx.author, manage_guild=True
+    ):
+        await ctx.send(
+            "❌ You need the **Manage Server** permission to change echo settings.",
+            ephemeral=True,
+        )
+        return
+    enabled: bool = state == "on"
+    saved: bool = await bot.settings.push_settings(ctx.guild.id, {"echoset": enabled})  # type: ignore[union-attr]
+    if saved:
+        await ctx.send(f"📢 Echo is now **{'enabled' if enabled else 'disabled'}** for this server.")
+    else:
+        await ctx.send(
+            "⚠️ Echo setting could not be persisted to the database — please try again.",
+            ephemeral=True,
+        )
+
+@bot.hybrid_command(name="echo", description="Make the bot say something, optionally in another channel.")
+@commands.guild_only()
+@app_commands.describe(
+    channel="Target channel (defaults to the current channel).",
+    message="What the bot should say.",
+)
+async def echo(
+    ctx: commands.Context,
+    channel: Optional[discord.TextChannel] = None,
+    *,
+    message: Optional[str] = None,
+) -> None:
+    guild: Optional[discord.Guild] = ctx.guild
+    if guild is None or not isinstance(ctx.author, discord.Member):
+        await ctx.send("❌ This command only works inside a server.", ephemeral=True)
+        return
+    if not message or not message.strip():
+        await ctx.send("❌ You must provide a message to echo.", ephemeral=True)
+        return
+
+    settings: Dict[str, Any] = await bot.settings.fetch_settings(guild.id)
+    if not settings.get("echoset", False):
+        await ctx.send(
+            "❌ Echo is disabled on this server. An admin can enable it with `/echoset on`.",
+            ephemeral=True,
+        )
+        return
+
+    actor: discord.Member = ctx.author
+    target: discord.TextChannel = channel or ctx.channel  # type: ignore[assignment]
+    if not isinstance(target, discord.TextChannel):
+        await ctx.send("❌ Echo only works in text channels.", ephemeral=True)
+        return
+
+    if not is_superuser(actor) and not target.permissions_for(actor).send_messages:
+        await ctx.send(
+            f"❌ You can't send messages in {target.mention}, so you can't echo there.",
+            ephemeral=True,
+        )
+        return
+
+    # Anti-ping logic: strip @everyone/@here unless the invoker is privileged.
+    privileged: bool = (
+        is_superuser(actor)
+        or actor.guild_permissions.administrator
+        or actor.guild_permissions.mention_everyone
+    )
+    payload: str = message if privileged else sanitize_mass_pings(message)
+    allowed: discord.AllowedMentions = discord.AllowedMentions(
+        everyone=privileged, roles=privileged, users=True
+    )
+
+    try:
+        await target.send(payload[:2000], allowed_mentions=allowed)
+    except discord.Forbidden:
+        await ctx.send(f"❌ I don't have permission to send messages in {target.mention}.", ephemeral=True)
+        return
+    except discord.HTTPException as exc:
+        log.error("Echo send failed: %s", exc)
+        await ctx.send("⚠️ Echo failed due to a Discord API error.", ephemeral=True)
+        return
+
+    if ctx.interaction is not None:
+        await ctx.send(f"✅ Echoed to {target.mention}.", ephemeral=True)
+    else:
+        # Prefix invocation: delete the triggering message after execution.
+        try:
+            await ctx.message.delete()
+        except (discord.Forbidden, discord.NotFound):
+            pass
+
+@bot.hybrid_command(name="afk", description="Mark yourself AFK; pings are collected until you return.")
+@commands.guild_only()
+@app_commands.describe(reason="Why you are going AFK (optional).")
+async def afk(ctx: commands.Context, *, reason: str = "AFK") -> None:
+    bot.afk_state[ctx.author.id] = AfkRecord(reason=reason[:300], since=time.time())
+    await ctx.send(
+        f"💤 {ctx.author.mention} is now AFK: **{discord.utils.escape_mentions(reason[:300])}**",
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
 # --------------------------------------------------------------------------- #
+# Error Handling
 
 async def _report_error(ctx: commands.Context, error: commands.CommandError) -> None:
     if isinstance(error, commands.CommandNotFound):
