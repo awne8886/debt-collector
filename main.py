@@ -324,7 +324,7 @@ def mod_block_reason(actor: discord.Member, target: discord.Member, me: discord.
         return "I'm not moderating myself."
     if target.id == actor.guild.owner_id:
         return "That member is the server owner — nobody can moderate them."
-    if actor.id != actor.guild.owner_id and actor.top_role <= target.top_role:
+    if not is_superuser(actor) and actor.id != actor.guild.owner_id and actor.top_role <= target.top_role:
         return "You can't act on someone whose highest role is equal to or above yours."
     if me.top_role <= target.top_role:
         return (

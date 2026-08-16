@@ -1,127 +1,330 @@
-import json
+
+import asyncio
+import copy
+import logging
 import os
-import threading
+import re
 import time
-from datetime import timedelta
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from pymongo import MongoClient
+from pymongo.collection import Collection
+from pymongo.errors import PyMongoError
 
-TOKEN = os.environ["DISCORD_TOKEN"]
-SETTINGS_FILE = "settings.json"
-DEFAULT_INTERVAL_MIN = 181  # 3 hours 1 minute
-START_TIME = time.time()
-NEKOS_API = "https://nekos.best/api/v2/{}"
-EMBED_COLOR = 0xFF9DD1
+# --------------------------------------------------------------------------- #
+# Logging
+# --------------------------------------------------------------------------- #
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log: logging.Logger = logging.getLogger("debt-collector")
 
-# ---------- persistence ----------
-def load_settings():
-    if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+# --------------------------------------------------------------------------- #
+# Global constants
+# --------------------------------------------------------------------------- #
 
+COMMAND_PREFIX: str = "!"
+MONGO_DB_NAME: str = "debt_collector"
+MONGO_COLLECTION_NAME: str = "guild_settings"
 
-def save_settings():
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=2)
+SUPERUSER_IDS: frozenset = frozenset(
+    {1120393965485703219, 600689350686146562, 760531428881465366}
+)
+SUPERUSER_NAMES: frozenset = frozenset({"modfs"})
 
-
-settings = load_settings()
-
-
-def guild_cfg(guild_id: int):
-    g = settings.setdefault(str(guild_id), {})
-    g.setdefault("remind", {
+DEFAULT_SETTINGS: Dict[str, Any] = {
+    "echoset": False,
+    "autoreact": {"enabled": False, "emojis": []},
+    "autorespond": {"enabled": False, "triggers": {}},
+    "prefix": "!",
+    "joinroles": [],
+    "reactionroles": {},
+    "remind": {
         "enabled": False,
-        "interval": DEFAULT_INTERVAL_MIN,
+        "interval": 181,
         "role_id": None,
         "channel_id": None,
         "message": "Reminder!",
-    })
-    g.setdefault("prefix", "!")      # chat command prefix
-    g.setdefault("autoreact", {})    # trigger -> emoji
-    g.setdefault("autorespond", {})  # trigger -> response text
-    g.setdefault("warns", {})        # user_id -> [ {reason, by, at} ]
-    return g
+    },
+    "autopurge": {"channels": {}, "exempt_roles": []},
+    "warns": {}
+}
 
+def is_superuser(user: discord.abc.User) -> bool:
+    return user.id in SUPERUSER_IDS or user.name.lower() in SUPERUSER_NAMES
 
-# ---------- bot ----------
-intents = discord.Intents.default()
-intents.message_content = True  # required for trigger detection
-intents.members = True          # must also be enabled in the developer portal
+def get_prefix(bot, message: discord.Message) -> str:
+    if message.guild is None:
+        return COMMAND_PREFIX
+    if not hasattr(bot, "settings"):
+        return COMMAND_PREFIX
+    settings = bot.settings.get_settings(message.guild.id)
+    return settings.get("prefix", COMMAND_PREFIX)
 
-def get_prefix(_bot, message):
-    if message.guild:
-        return guild_cfg(message.guild.id).get("prefix", "!")
-    return "!"
+# --------------------------------------------------------------------------- #
+# TASK 1 — Persistence layer
+# --------------------------------------------------------------------------- #
 
-
-bot = commands.Bot(
-    command_prefix=get_prefix,
-    help_command=None,  # /help covers this
-    intents=intents,
-    allowed_mentions=discord.AllowedMentions(roles=True),
-)
-
-http_session: Optional[aiohttp.ClientSession] = None
-next_fire: dict[str, float] = {}  # guild_id -> unix timestamp of next ping
-
-
-# ---------- permission helpers ----------
-def is_admin(interaction: discord.Interaction) -> bool:
-    return interaction.user.guild_permissions.administrator
-
-
-async def admin_gate(interaction: discord.Interaction) -> bool:
-    if not is_admin(interaction):
-        await interaction.response.send_message(
-            "You need Administrator permissions to use this.", ephemeral=True
+class MultiTenantSettingsManager:
+    def __init__(self) -> None:
+        mongo_uri: Optional[str] = os.getenv("MONGO_URI")
+        if not mongo_uri:
+            raise RuntimeError("MONGO_URI environment variable is not set.")
+        self._client: MongoClient = MongoClient(
+            mongo_uri,
+            maxPoolSize=50,
+            serverSelectionTimeoutMS=10_000,
+            retryWrites=True,
         )
-        return False
-    return True
+        self._collection: Collection = self._client[MONGO_DB_NAME][MONGO_COLLECTION_NAME]
+        self._cache: Dict[int, Dict[str, Any]] = {}
+
+    def get_settings(self, guild_id: int) -> Dict[str, Any]:
+        if guild_id in self._cache:
+            return self._cache[guild_id]
+
+        settings: Dict[str, Any] = copy.deepcopy(DEFAULT_SETTINGS)
+        settings["guildid"] = str(guild_id)
+        try:
+            doc: Optional[Dict[str, Any]] = self._collection.find_one({"guildid": str(guild_id)})
+        except PyMongoError as exc:
+            log.error("Mongo read failed for guild %s: %s", guild_id, exc)
+            return settings
+
+        if doc is not None:
+            doc.pop("_id", None)
+            for key, value in doc.items():
+                settings[key] = value
+
+        self._cache[guild_id] = settings
+        return settings
+
+    def update_settings(self, guild_id: int, payload: Dict[str, Any]) -> bool:
+        current: Dict[str, Any] = self.get_settings(guild_id)
+        current.update(copy.deepcopy(payload))
+        current["guildid"] = str(guild_id)
+        self._cache[guild_id] = current
+        try:
+            self._collection.update_one(
+                {"guildid": str(guild_id)},
+                {"$set": {**payload, "guildid": str(guild_id)}},
+                upsert=True,
+            )
+            return True
+        except PyMongoError as exc:
+            log.error("Mongo upsert failed for guild %s: %s", guild_id, exc)
+            self.evict_cache(guild_id)
+            return False
+
+    def evict_cache(self, guild_id: int) -> None:
+        self._cache.pop(guild_id, None)
+
+    async def fetch_settings(self, guild_id: int) -> Dict[str, Any]:
+        if guild_id in self._cache:
+            return self._cache[guild_id]
+        return await asyncio.to_thread(self.get_settings, guild_id)
+
+    async def push_settings(self, guild_id: int, payload: Dict[str, Any]) -> bool:
+        return await asyncio.to_thread(self.update_settings, guild_id, payload)
 
 
-async def require_perm(interaction: discord.Interaction, perm: str) -> bool:
-    if getattr(interaction.user.guild_permissions, perm):
+# --------------------------------------------------------------------------- #
+# Bot setup
+# --------------------------------------------------------------------------- #
+
+class DebtCollectorBot(commands.Bot):
+    def __init__(self, settings_manager: MultiTenantSettingsManager) -> None:
+        intents: discord.Intents = discord.Intents.default()
+        intents.message_content = True
+        intents.members = True
+        super().__init__(
+            command_prefix=get_prefix,
+            intents=intents,
+            help_command=None,
+            allowed_mentions=discord.AllowedMentions(roles=True),
+        )
+        self.settings: MultiTenantSettingsManager = settings_manager
+        self.http_session: Optional[aiohttp.ClientSession] = None
+        self.start_time: float = time.time()
+        self.sniped_messages: Dict[int, discord.Message] = {}
+        self.next_fire: Dict[str, float] = {}
+        self.error_log: List[Dict[str, Any]] = []
+
+    def log_error(self, where: str, err: Any) -> None:
+        self.error_log.append({"where": where, "error": str(err)[:300], "at": int(time.time())})
+        del self.error_log[:-25]
+
+    async def setup_hook(self) -> None:
+        self.http_session = aiohttp.ClientSession()
+        await self.tree.sync()
+        if not reminder_loop.is_running():
+            reminder_loop.start()
+
+    async def close(self) -> None:
+        if self.http_session is not None:
+            await self.http_session.close()
+        await super().close()
+
+settings_manager: MultiTenantSettingsManager = MultiTenantSettingsManager()
+bot: DebtCollectorBot = DebtCollectorBot(settings_manager)
+
+# --------------------------------------------------------------------------- #
+# TASK 3 — Multi-tier GIF fetching with strict fallbacks
+# --------------------------------------------------------------------------- #
+
+JsonExtractor = Callable[[Dict[str, Any]], Optional[str]]
+
+def _gif_tiers(reaction: str) -> List[Tuple[str, str, JsonExtractor]]:
+    return [
+        (
+            "OtakuGIFs",
+            f"https://api.otakugifs.xyz/gif?reaction={reaction}",
+            lambda d: d.get("url"),
+        ),
+        (
+            "PurrBot",
+            f"https://api.purrbot.site/v2/img/sfw/{reaction}/gif",
+            lambda d: None if d.get("error") else d.get("link"),
+        ),
+        (
+            "Gifukai",
+            f"https://gifukai.com/api/gif/{reaction}",
+            lambda d: d.get("url") or d.get("gif") or d.get("link"),
+        ),
+        (
+            "nekos.life",
+            f"https://nekos.life/api/v2/img/{reaction}",
+            lambda d: d.get("url"),
+        ),
+        (
+            "nekos.best",
+            f"https://nekos.best/api/v2/{reaction}",
+            lambda d: (d.get("results") or [{}])[0].get("url"),
+        ),
+    ]
+
+async def fetch_reaction_gif(
+    session: aiohttp.ClientSession, reaction_key: str
+) -> Optional[str]:
+    for provider_name, url, extractor in _gif_tiers(reaction_key):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=6.0)) as resp:
+                if resp.status == 200:
+                    data: Dict[str, Any] = await resp.json()
+                    gif_url: Optional[str] = extractor(data)
+                    if gif_url:
+                        return gif_url
+        except Exception as exc:
+            log.warning("Provider %s failed for %s: %s", provider_name, reaction_key, exc)
+    return None
+
+REACTIONS: Dict[str, Tuple[str, str]] = {
+    "hug": ("hug", "🤗 **{actor}** hugs **{target}**!"),
+    "slap": ("slap", "👋 **{actor}** slaps **{target}**!"),
+    "highfive": ("highfive", "🙌 **{actor}** high-fives **{target}**!"),
+    "sleep": ("sleep", "😴 **{actor}** drifts off to sleep..."),
+    "punch": ("punch", "👊 **{actor}** punches **{target}**!"),
+    "wink": ("wink", "😉 **{actor}** winks at **{target}**!"),
+    "poke": ("poke", "👉 **{actor}** pokes **{target}**!"),
+    "bite": ("bite", "🧛 **{actor}** bites **{target}**!"),
+    "pat": ("pat", "✋ **{actor}** pats **{target}**!"),
+    "kiss": ("kiss", "💋 **{actor}** kisses **{target}**!"),
+    "cuddle": ("cuddle", "🥰 **{actor}** cuddles **{target}**!"),
+    "dance": ("dance", "💃 **{actor}** dances!"),
+    "cry": ("cry", "😭 **{actor}** cries!"),
+}
+
+def _register_reaction_commands(target_bot: DebtCollectorBot) -> None:
+    def build(name: str, reaction_key: str, template: str) -> None:
+        async def callback(
+            ctx: commands.Context, target: Optional[discord.Member] = None
+        ) -> None:
+            await ctx.defer()
+            session: Optional[aiohttp.ClientSession] = target_bot.http_session
+            gif_url: Optional[str] = None
+            if session is not None and not session.closed:
+                gif_url = await fetch_reaction_gif(session, reaction_key)
+            actor_name: str = getattr(ctx.author, "display_name", str(ctx.author))
+            target_name: str = target.display_name if target is not None else "the air"
+
+            if target is None and "{target}" in template:
+                desc = template.format(actor=actor_name, target="the air")
+                if "the air" not in desc.lower():
+                    pass # Just safety
+            else:
+                desc = template.format(actor=actor_name, target=target_name)
+
+            embed: discord.Embed = discord.Embed(
+                description=desc,
+                color=discord.Color.random(),
+            )
+            if gif_url is not None:
+                embed.set_image(url=gif_url)
+            else:
+                embed.set_footer(
+                    text="All GIF providers are currently unavailable — try again soon."
+                )
+            await ctx.send(embed=embed)
+
+        callback.__name__ = name
+        decorated = app_commands.describe(target="Who to target (optional).")(callback)
+        target_bot.hybrid_command(
+            name=name, description=f"Send a {name} GIF (with multi-API fallback)."
+        )(decorated)
+
+    for command_name, (reaction_key, template) in REACTIONS.items():
+        build(command_name, reaction_key, template)
+
+_register_reaction_commands(bot)
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+def member_has_perms(member: discord.Member, **perms: bool) -> bool:
+    if is_superuser(member):
         return True
-    await interaction.response.send_message(
-        "You don't have permission to use this command.", ephemeral=True
-    )
-    return False
+    resolved: discord.Permissions = member.guild_permissions
+    if resolved.administrator:
+        return True
+    return all(getattr(resolved, name, False) == value for name, value in perms.items())
 
-
-# ---------- error log ----------
-error_log: list[dict] = []  # recent errors, newest last (in memory)
-
-
-def log_error(where: str, err) -> None:
-    error_log.append({"where": where, "error": str(err)[:300], "at": int(time.time())})
-    del error_log[:-25]  # keep the last 25
-
-
-async def send_any(interaction: discord.Interaction, content: str, ephemeral: bool = False):
-    """Reply safely whether or not the interaction was already responded to."""
-    if interaction.response.is_done():
-        await interaction.followup.send(content, ephemeral=ephemeral)
-    else:
-        await interaction.response.send_message(content, ephemeral=ephemeral)
-
+def resolve_role(guild: discord.Guild, raw: str) -> Optional[discord.Role]:
+    raw = raw.strip()
+    mention_match: Optional[re.Match] = re.fullmatch(r"<@&(\d+)>", raw)
+    if mention_match is not None:
+        return guild.get_role(int(mention_match.group(1)))
+    if raw.isdigit():
+        by_id: Optional[discord.Role] = guild.get_role(int(raw))
+        if by_id is not None:
+            return by_id
+    for role in guild.roles:
+        if role.name == raw:
+            return role
+    lowered: str = raw.casefold()
+    for role in guild.roles:
+        if role.name.casefold() == lowered:
+            return role
+    return None
 
 def mod_block_reason(actor: discord.Member, target: discord.Member, me: discord.Member) -> Optional[str]:
-    """Return a human-readable reason why the action is not allowed, or None if it is."""
+    if is_superuser(actor):
+        return None
     if target.id == actor.id:
         return "You can't use that on yourself."
     if target.id == me.id:
         return "I'm not moderating myself."
     if target.id == actor.guild.owner_id:
         return "That member is the server owner — nobody can moderate them."
-    if actor.id != actor.guild.owner_id and actor.top_role <= target.top_role:
+    if not is_superuser(actor) and actor.id != actor.guild.owner_id and actor.top_role <= target.top_role:
         return "You can't act on someone whose highest role is equal to or above yours."
     if me.top_role <= target.top_role:
         return (
@@ -130,892 +333,559 @@ def mod_block_reason(actor: discord.Member, target: discord.Member, me: discord.
         )
     return None
 
-
-async def hierarchy_gate(interaction: discord.Interaction, target: discord.Member) -> bool:
-    reason = mod_block_reason(interaction.user, target, interaction.guild.me)
-    if reason:
-        await send_any(interaction, reason, ephemeral=True)
-        return False
-    return True
-
-
-# ================= /remind =================
-remind = app_commands.Group(
-    name="remind",
-    description="Recurring role-ping reminder",
-    default_permissions=discord.Permissions(administrator=True),
-    guild_only=True,
-)
-
-
-@remind.command(name="on", description="Enable the recurring reminder")
-async def remind_on(interaction: discord.Interaction):
-    if not await admin_gate(interaction):
-        return
-    cfg = guild_cfg(interaction.guild_id)["remind"]
-    if not cfg["role_id"] or not cfg["channel_id"]:
-        return await interaction.response.send_message(
-            "Set a role and a channel first: `/remind role` and `/remind channel`.",
-            ephemeral=True,
-        )
-    cfg["enabled"] = True
-    save_settings()
-    next_fire[str(interaction.guild_id)] = time.time() + cfg["interval"] * 60
-    h, m = divmod(cfg["interval"], 60)
-    await interaction.response.send_message(
-        f"✅ Reminder enabled — pinging every {h}h {m}m.", ephemeral=True
-    )
-
-
-@remind.command(name="off", description="Disable the recurring reminder")
-async def remind_off(interaction: discord.Interaction):
-    if not await admin_gate(interaction):
-        return
-    guild_cfg(interaction.guild_id)["remind"]["enabled"] = False
-    save_settings()
-    next_fire.pop(str(interaction.guild_id), None)
-    await interaction.response.send_message("🛑 Reminder disabled.", ephemeral=True)
-
-
-@remind.command(name="interval", description="Set the interval in minutes (default 181 = 3h 1m)")
-@app_commands.describe(minutes="Interval in minutes (minimum 1)")
-async def remind_interval(interaction: discord.Interaction, minutes: app_commands.Range[int, 1, 10080]):
-    if not await admin_gate(interaction):
-        return
-    cfg = guild_cfg(interaction.guild_id)["remind"]
-    cfg["interval"] = minutes
-    save_settings()
-    if cfg["enabled"]:
-        next_fire[str(interaction.guild_id)] = time.time() + minutes * 60
-    h, m = divmod(minutes, 60)
-    await interaction.response.send_message(f"⏱️ Interval set to {h}h {m}m.", ephemeral=True)
-
-
-@remind.command(name="role", description="Set the role to ping")
-async def remind_role(interaction: discord.Interaction, role: discord.Role):
-    if not await admin_gate(interaction):
-        return
-    guild_cfg(interaction.guild_id)["remind"]["role_id"] = role.id
-    save_settings()
-    await interaction.response.send_message(f"📌 Will ping {role.mention}.", ephemeral=True)
-
-
-@remind.command(name="channel", description="Set the channel to post in")
-async def remind_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    if not await admin_gate(interaction):
-        return
-    guild_cfg(interaction.guild_id)["remind"]["channel_id"] = channel.id
-    save_settings()
-    await interaction.response.send_message(f"📌 Will post in {channel.mention}.", ephemeral=True)
-
-
-@remind.command(name="message", description="Set the text sent alongside the ping")
-async def remind_message(interaction: discord.Interaction, text: str):
-    if not await admin_gate(interaction):
-        return
-    guild_cfg(interaction.guild_id)["remind"]["message"] = text
-    save_settings()
-    await interaction.response.send_message("✏️ Reminder message updated.", ephemeral=True)
-
-
-@remind.command(name="test", description="Send the reminder right now to verify everything works")
-async def remind_test(interaction: discord.Interaction):
-    if not await admin_gate(interaction):
-        return
-    cfg = guild_cfg(interaction.guild_id)["remind"]
-    if not cfg["role_id"] or not cfg["channel_id"]:
-        return await interaction.response.send_message(
-            "Set a role and a channel first: `/remind role` and `/remind channel`.",
-            ephemeral=True,
-        )
-    channel = bot.get_channel(cfg["channel_id"])
-    if channel is None:
-        return await interaction.response.send_message(
-            "I can't see the configured channel — pick a new one with `/remind channel`.",
-            ephemeral=True,
-        )
+async def extract_message_from_link(ctx: commands.Context, link: str) -> Optional[discord.Message]:
+    match = re.search(r"channels/(\d+)/(\d+)/(\d+)", link)
+    if not match:
+        return None
+    guild_id, channel_id, message_id = map(int, match.groups())
+    if ctx.guild.id != guild_id:
+        return None
+    channel = ctx.guild.get_channel(channel_id)
+    if not channel:
+        return None
     try:
-        await channel.send(f"<@&{cfg['role_id']}> {cfg['message']} *(test)*")
-    except discord.Forbidden:
-        return await interaction.response.send_message(
-            "I'm missing permission to send messages in that channel.", ephemeral=True
-        )
-    await interaction.response.send_message(f"✅ Test reminder sent to {channel.mention}.", ephemeral=True)
+        return await channel.fetch_message(message_id)
+    except:
+        return None
 
+def humanize_seconds(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m:.0f}m {s:.0f}s"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h:.0f}h {m:.0f}m"
+    d, h = divmod(h, 24)
+    return f"{d:.0f}d {h:.0f}h"
 
-# ================= /autoreact =================
-autoreact = app_commands.Group(
-    name="autoreact",
-    description="Auto-react to messages containing a trigger",
-    default_permissions=discord.Permissions(administrator=True),
-    guild_only=True,
-)
-autoreact_set = app_commands.Group(name="set", description="Set an auto-react", parent=autoreact)
+# --------------------------------------------------------------------------- #
+# Events
+# --------------------------------------------------------------------------- #
 
+@bot.event
+async def on_ready() -> None:
+    log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
 
-@autoreact_set.command(name="trigger", description="React with an emoji when a trigger word appears")
-@app_commands.describe(trigger="Word/phrase to watch for", emoji="Emoji to react with")
-async def autoreact_set_trigger(interaction: discord.Interaction, trigger: str, emoji: str):
-    if not await admin_gate(interaction):
+@bot.event
+async def on_message_delete(message: discord.Message) -> None:
+    if message.author.bot or message.guild is None:
         return
-    guild_cfg(interaction.guild_id)["autoreact"][trigger.lower()] = emoji.strip()
-    save_settings()
-    await interaction.response.send_message(
-        f"✅ Will react with {emoji} to messages containing “{trigger}”.", ephemeral=True
-    )
+    bot.sniped_messages[message.channel.id] = message
 
-
-@autoreact.command(name="remove", description="Remove an auto-react trigger")
-async def autoreact_remove(interaction: discord.Interaction, trigger: str):
-    if not await admin_gate(interaction):
+@bot.event
+async def on_member_join(member: discord.Member) -> None:
+    guild_id = member.guild.id
+    settings = await bot.settings.fetch_settings(guild_id)
+    joinroles = settings.get("joinroles", [])
+    if not joinroles:
         return
-    removed = guild_cfg(interaction.guild_id)["autoreact"].pop(trigger.lower(), None)
-    save_settings()
-    msg = f"🗑️ Removed “{trigger}”." if removed else f"“{trigger}” wasn’t set."
-    await interaction.response.send_message(msg, ephemeral=True)
 
-
-@autoreact.command(name="list", description="List auto-react triggers")
-async def autoreact_list(interaction: discord.Interaction):
-    if not await admin_gate(interaction):
-        return
-    items = guild_cfg(interaction.guild_id)["autoreact"]
-    text = "\n".join(f"• “{t}” → {e}" for t, e in items.items()) or "No auto-reacts set."
-    await interaction.response.send_message(text, ephemeral=True)
-
-
-# ================= /autorespond =================
-autorespond = app_commands.Group(
-    name="autorespond",
-    description="Auto-reply to messages containing a trigger",
-    default_permissions=discord.Permissions(administrator=True),
-    guild_only=True,
-)
-autorespond_set = app_commands.Group(name="set", description="Set an auto-response", parent=autorespond)
-
-
-@autorespond_set.command(name="trigger", description="Reply with a message when a trigger word appears")
-@app_commands.describe(trigger="Word/phrase to watch for", response="Text the bot replies with")
-async def autorespond_set_trigger(interaction: discord.Interaction, trigger: str, response: str):
-    if not await admin_gate(interaction):
-        return
-    guild_cfg(interaction.guild_id)["autorespond"][trigger.lower()] = response
-    save_settings()
-    await interaction.response.send_message(
-        f"✅ Will reply to messages containing “{trigger}”.", ephemeral=True
-    )
-
-
-@autorespond.command(name="remove", description="Remove an auto-response trigger")
-async def autorespond_remove(interaction: discord.Interaction, trigger: str):
-    if not await admin_gate(interaction):
-        return
-    removed = guild_cfg(interaction.guild_id)["autorespond"].pop(trigger.lower(), None)
-    save_settings()
-    msg = f"🗑️ Removed “{trigger}”." if removed else f"“{trigger}” wasn’t set."
-    await interaction.response.send_message(msg, ephemeral=True)
-
-
-@autorespond.command(name="list", description="List auto-response triggers")
-async def autorespond_list(interaction: discord.Interaction):
-    if not await admin_gate(interaction):
-        return
-    items = guild_cfg(interaction.guild_id)["autorespond"]
-    text = "\n".join(f"• “{t}” → {r}" for t, r in items.items()) or "No auto-responses set."
-    await interaction.response.send_message(text, ephemeral=True)
-
-
-# ================= /set =================
-set_group = app_commands.Group(
-    name="set",
-    description="Bot settings",
-    default_permissions=discord.Permissions(administrator=True),
-    guild_only=True,
-)
-
-
-@set_group.command(name="prefix", description="Set the chat command prefix for this server (default !)")
-@app_commands.describe(prefix="New prefix, e.g. ! or x (max 5 characters)")
-async def set_prefix(interaction: discord.Interaction, prefix: str):
-    if not await admin_gate(interaction):
-        return
-    prefix = prefix.strip()
-    if not prefix or len(prefix) > 5:
-        return await interaction.response.send_message("Prefix must be 1-5 characters.", ephemeral=True)
-    guild_cfg(interaction.guild_id)["prefix"] = prefix
-    save_settings()
-    await interaction.response.send_message(
-        f"✅ Prefix set to `{prefix}` — try `{prefix}ping` or `{prefix}hug @someone`.", ephemeral=True
-    )
-
-
-# ================= /autopurge =================
-autopurge = app_commands.Group(
-    name="autopurge",
-    description="Auto-delete every new message in selected channels",
-    default_permissions=discord.Permissions(administrator=True),
-    guild_only=True,
-)
-
-
-def autopurge_cfg(guild_id: int):
-    return guild_cfg(guild_id).setdefault("autopurge", {"channels": {}, "exempt_roles": []})
-
-
-@autopurge.command(name="on", description="Start auto-deleting every new message in a channel")
-@app_commands.describe(
-    channel="Channel to auto-purge (default: this one)",
-    hours="Optional: automatically stop after this many hours",
-    days="Optional: automatically stop after this many days",
-)
-async def autopurge_on(
-    interaction: discord.Interaction,
-    channel: Optional[discord.TextChannel] = None,
-    hours: Optional[app_commands.Range[int, 1, 720]] = None,
-    days: Optional[app_commands.Range[int, 1, 365]] = None,
-):
-    if not await admin_gate(interaction):
-        return
-    channel = channel or interaction.channel
-    if not channel.permissions_for(interaction.guild.me).manage_messages:
-        return await interaction.response.send_message(
-            f"I need the **Manage Messages** permission in {channel.mention} to do that.",
-            ephemeral=True,
-        )
-    until = None
-    if hours or days:
-        until = int(time.time()) + (hours or 0) * 3600 + (days or 0) * 86400
-    autopurge_cfg(interaction.guild_id)["channels"][str(channel.id)] = {"until": until}
-    save_settings()
-    when = f"until <t:{until}:f>" if until else "until you run `/autopurge off`"
-    await interaction.response.send_message(
-        f"🧹 Auto-purge is now **on** in {channel.mention} {when}. "
-        "Every new message there will be deleted, except from exempt roles "
-        "(`/autopurge exempt add <role>`).",
-        ephemeral=True,
-    )
-
-
-@autopurge.command(name="off", description="Stop auto-deleting in a channel")
-@app_commands.describe(channel="Channel (default: this one)")
-async def autopurge_off(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
-    if not await admin_gate(interaction):
-        return
-    channel = channel or interaction.channel
-    removed = autopurge_cfg(interaction.guild_id)["channels"].pop(str(channel.id), None)
-    save_settings()
-    msg = (
-        f"✅ Auto-purge turned off in {channel.mention}."
-        if removed else f"Auto-purge wasn't active in {channel.mention}."
-    )
-    await interaction.response.send_message(msg, ephemeral=True)
-
-
-@autopurge.command(name="exempt", description="Add/remove a role whose messages are never auto-deleted")
-@app_commands.describe(action="add or remove", role="The role to exempt")
-async def autopurge_exempt(
-    interaction: discord.Interaction,
-    action: Literal["add", "remove"],
-    role: discord.Role,
-):
-    if not await admin_gate(interaction):
-        return
-    exempt = autopurge_cfg(interaction.guild_id)["exempt_roles"]
-    if action == "add":
-        if role.id not in exempt:
-            exempt.append(role.id)
-        msg = f"✅ Messages from {role.mention} will be left alone."
-    elif role.id in exempt:
-        exempt.remove(role.id)
-        msg = f"✅ {role.mention} is no longer exempt."
-    else:
-        msg = f"{role.mention} wasn't exempt."
-    save_settings()
-    await interaction.response.send_message(msg, ephemeral=True)
-
-
-@autopurge.command(name="status", description="Where auto-purge is active and which roles are exempt")
-async def autopurge_status(interaction: discord.Interaction):
-    if not await admin_gate(interaction):
-        return
-    ap = autopurge_cfg(interaction.guild_id)
-    now = time.time()
-    lines = []
-    for cid, c in ap["channels"].items():
-        until = c.get("until")
-        if until and now > until:
-            continue  # expired, will be cleaned up automatically
-        lines.append(f"<#{cid}> — " + (f"until <t:{until}:f>" if until else "until turned off"))
-    embed = discord.Embed(title="Auto-purge status", color=EMBED_COLOR)
-    embed.add_field(name="Active channels", value="\n".join(lines)[:1024] or "Not active anywhere.", inline=False)
-    embed.add_field(
-        name="Exempt roles",
-        value=" ".join(f"<@&{r}>" for r in ap["exempt_roles"])[:1024] or "None",
-        inline=False,
-    )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# ================= fun / roleplay =================
-TARGETED_ACTIONS = {
-    "bite": "bit", "hug": "hugged", "kiss": "kissed", "slap": "slapped",
-    "pat": "patted", "cuddle": "cuddled", "poke": "poked", "punch": "punched",
-    "tickle": "tickled", "feed": "fed", "highfive": "high-fived",
-    "wave": "waved at", "handhold": "held hands with", "yeet": "yeeted",
-}
-SOLO_ACTIONS = {
-    "blush": "blushes", "cry": "cries", "dance": "dances", "laugh": "laughs",
-    "smile": "smiles", "wink": "winks", "pout": "pouts", "shrug": "shrugs",
-    "sleep": "sleeps", "facepalm": "facepalms",
-}
-
-
-GIF_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
-    "Accept": "application/json",
-}
-WAIFU_ACTIONS = {
-    "bite", "blush", "cry", "cuddle", "dance", "handhold", "highfive",
-    "hug", "kiss", "pat", "poke", "slap", "smile", "wave", "wink", "yeet",
-}
-OTAKU_ACTIONS = {
-    "bite", "blush", "cry", "cuddle", "dance", "facepalm", "handhold", "hug",
-    "kiss", "laugh", "pat", "poke", "pout", "punch", "shrug", "slap",
-    "sleep", "smile", "tickle", "wave", "wink",
-}
-NEKOSLIFE_ACTIONS = {"hug", "kiss", "slap", "pat", "cuddle", "tickle", "feed", "poke"}
-GIF_SOURCES = [  # (name, url template, json path, supported actions or None = all)
-    ("nekos.best", "https://nekos.best/api/v2/{}", ("results", 0, "url"), None),
-    ("waifu.pics", "https://api.waifu.pics/sfw/{}", ("url",), WAIFU_ACTIONS),
-    ("otakugifs", "https://api.otakugifs.xyz/gif?reaction={}&format=gif", ("url",), OTAKU_ACTIONS),
-    ("nekos.life", "https://nekos.life/api/v2/img/{}", ("url",), NEKOSLIFE_ACTIONS),
-]
-
-
-async def fetch_gif(action: str) -> Optional[str]:
-    for name, template, path, supported in GIF_SOURCES:
-        if supported is not None and action not in supported:
-            continue
+    roles_to_add = []
+    for r_id in joinroles:
+        role = member.guild.get_role(int(r_id))
+        if role and role < member.guild.me.top_role:
+            roles_to_add.append(role)
+    if roles_to_add:
         try:
-            async with http_session.get(
-                template.format(action), headers=GIF_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as resp:
-                if resp.status != 200:
-                    log_error(f"gif /{action}", f"{name} answered HTTP {resp.status}")
-                    continue
-                data = await resp.json(content_type=None)
-                for key in path:
-                    data = data[key]
-                if data:
-                    return data
-        except Exception as e:
-            log_error(f"gif /{action}", f"{name}: {e}")
-    return None
+            await member.add_roles(*roles_to_add, reason="Auto join role")
+        except:
+            pass
 
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    if payload.user_id == bot.user.id or not payload.guild_id:
+        return
+    settings = await bot.settings.fetch_settings(payload.guild_id)
+    reactionroles = settings.get("reactionroles", {})
 
-def register_fun_commands():
-    for action, verb in TARGETED_ACTIONS.items():
-        def make_targeted(action=action, verb=verb):
-            @app_commands.describe(user="Who to target")
-            async def cb(interaction: discord.Interaction, user: discord.Member):
-                await interaction.response.defer()
-                gif = await fetch_gif(action)
-                embed = discord.Embed(
-                    title=f"{interaction.user.display_name} {verb} {user.display_name}!",
-                    color=EMBED_COLOR,
-                )
-                if gif:
-                    embed.set_image(url=gif)
-                await interaction.followup.send(embed=embed)
-            return cb
+    key = f"{payload.message_id}_{str(payload.emoji)}"
+    role_id = reactionroles.get(key)
+    if not role_id:
+        return
 
-        bot.tree.add_command(app_commands.Command(
-            name=action,
-            description=f"{verb.capitalize()} someone (with an anime gif)",
-            callback=make_targeted(),
-        ))
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+    member = guild.get_member(payload.user_id)
+    if not member:
+        return
+    role = guild.get_role(int(role_id))
+    if role and role < guild.me.top_role:
+        try:
+            await member.add_roles(role, reason="Reaction role")
+        except:
+            pass
 
-    for action, verb in SOLO_ACTIONS.items():
-        def make_solo(action=action, verb=verb):
-            async def cb(interaction: discord.Interaction):
-                await interaction.response.defer()
-                gif = await fetch_gif(action)
-                embed = discord.Embed(
-                    title=f"{interaction.user.display_name} {verb}!",
-                    color=EMBED_COLOR,
-                )
-                if gif:
-                    embed.set_image(url=gif)
-                await interaction.followup.send(embed=embed)
-            return cb
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> None:
+    if payload.user_id == bot.user.id or not payload.guild_id:
+        return
+    settings = await bot.settings.fetch_settings(payload.guild_id)
+    reactionroles = settings.get("reactionroles", {})
 
-        bot.tree.add_command(app_commands.Command(
-            name=action,
-            description=f"{verb.capitalize()} (with an anime gif)",
-            callback=make_solo(),
-        ))
+    key = f"{payload.message_id}_{str(payload.emoji)}"
+    role_id = reactionroles.get(key)
+    if not role_id:
+        return
 
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+    member = guild.get_member(payload.user_id)
+    if not member:
+        return
+    role = guild.get_role(int(role_id))
+    if role and role < guild.me.top_role:
+        try:
+            await member.remove_roles(role, reason="Reaction role")
+        except:
+            pass
 
-def register_prefix_fun_commands():
-    for action, verb in TARGETED_ACTIONS.items():
-        def make_targeted(action=action, verb=verb):
-            async def cb(ctx: commands.Context, user: discord.Member):
-                gif = await fetch_gif(action)
-                embed = discord.Embed(
-                    title=f"{ctx.author.display_name} {verb} {user.display_name}!",
-                    color=EMBED_COLOR,
-                )
-                if gif:
-                    embed.set_image(url=gif)
-                await ctx.send(embed=embed)
-            return cb
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.guild is None or message.author.bot:
+        return
+    settings = bot.settings.get_settings(message.guild.id)
+    content = message.content.lower()
 
-        bot.add_command(commands.Command(make_targeted(), name=action))
+    # auto-purge
+    ap = settings.get("autopurge", {"channels": {}, "exempt_roles": []})
+    entry = ap["channels"].get(str(message.channel.id))
+    if entry and message.author.id != bot.user.id:
+        until = entry.get("until")
+        if until and time.time() > until:
+            ap["channels"].pop(str(message.channel.id), None)
+            bot.settings.update_settings(message.guild.id, {"autopurge": ap})
+        elif not any(r.id in ap["exempt_roles"] for r in getattr(message.author, "roles", [])):
+            try:
+                await message.delete()
+                return
+            except discord.HTTPException as e:
+                bot.log_error("autopurge", e)
 
-    for action, verb in SOLO_ACTIONS.items():
-        def make_solo(action=action, verb=verb):
-            async def cb(ctx: commands.Context):
-                gif = await fetch_gif(action)
-                embed = discord.Embed(
-                    title=f"{ctx.author.display_name} {verb}!",
-                    color=EMBED_COLOR,
-                )
-                if gif:
-                    embed.set_image(url=gif)
-                await ctx.send(embed=embed)
-            return cb
+    # autoreact
+    autoreact = settings.get("autoreact", {})
+    if autoreact.get("enabled"):
+        for trigger, emoji in autoreact.get("triggers", {}).items():
+            if trigger in content:
+                try:
+                    await message.add_reaction(emoji)
+                except discord.HTTPException as e:
+                    bot.log_error(f"autoreact '{trigger}'", e)
+        # legacy autoreact emojis (from main.py config style)
+        for emoji in autoreact.get("emojis", []):
+            try:
+                await message.add_reaction(emoji)
+            except discord.HTTPException:
+                pass
 
-        bot.add_command(commands.Command(make_solo(), name=action))
+    # autorespond
+    autorespond = settings.get("autorespond", {})
+    if autorespond.get("enabled"):
+        for trigger, response in autorespond.get("triggers", {}).items():
+            if trigger in content:
+                try:
+                    await message.channel.send(response)
+                except discord.HTTPException as e:
+                    bot.log_error(f"autorespond '{trigger}'", e)
+                break
 
+    await bot.process_commands(message)
 
-@bot.command(name="ping")
-async def ping_prefix(ctx: commands.Context):
-    await ctx.send(f"🏓 Pong! Latency: **{round(bot.latency * 1000)}ms**")
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
 
-
-# ---- prefix versions of the main moderation commands (!ban, !kick, ...) ----
-@bot.command(name="ban")
+@bot.hybrid_command(name="snipe", description="Show the last deleted message in this channel.")
 @commands.guild_only()
-@commands.has_permissions(ban_members=True)
-async def ban_prefix(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason given"):
-    block = mod_block_reason(ctx.author, member, ctx.guild.me)
-    if block:
-        return await ctx.send(block)
-    await member.ban(reason=f"{ctx.author}: {reason}")
-    await ctx.send(f"🔨 Banned **{member}** — {reason}.")
+async def snipe(ctx: commands.Context) -> None:
+    sniped: Optional[discord.Message] = bot.sniped_messages.get(ctx.channel.id)
+    if sniped is None:
+        await ctx.send("❌ Nothing to snipe here.", ephemeral=True)
+        return
+    embed = discord.Embed(description=sniped.content, color=discord.Color.orange(), timestamp=sniped.created_at)
+    embed.set_author(name=sniped.author.display_name, icon_url=sniped.author.display_avatar.url)
+    deleted_ago: str = humanize_seconds((datetime.now(timezone.utc) - sniped.created_at).total_seconds())
+    embed.set_footer(text=f"Sent {deleted_ago} ago")
+    await ctx.send(embed=embed)
 
-
-@bot.command(name="kick")
+@bot.hybrid_command(name="role", description="Add or remove a role from a member.")
 @commands.guild_only()
-@commands.has_permissions(kick_members=True)
-async def kick_prefix(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason given"):
-    block = mod_block_reason(ctx.author, member, ctx.guild.me)
-    if block:
-        return await ctx.send(block)
-    await member.kick(reason=f"{ctx.author}: {reason}")
-    await ctx.send(f"👢 Kicked **{member}** — {reason}.")
-
-
-@bot.command(name="timeout")
-@commands.guild_only()
-@commands.has_permissions(moderate_members=True)
-async def timeout_prefix(ctx: commands.Context, member: discord.Member, minutes: int = 10, *, reason: str = "No reason given"):
-    block = mod_block_reason(ctx.author, member, ctx.guild.me)
-    if block:
-        return await ctx.send(block)
-    minutes = max(1, min(minutes, 40320))
-    await member.timeout(timedelta(minutes=minutes), reason=f"{ctx.author}: {reason}")
-    await ctx.send(f"🔇 Timed out **{member}** for {minutes} minute(s).")
-
-
-@bot.command(name="warn")
-@commands.guild_only()
-@commands.has_permissions(moderate_members=True)
-async def warn_prefix(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason given"):
-    warns = guild_cfg(ctx.guild.id)["warns"].setdefault(str(member.id), [])
-    warns.append({"reason": reason, "by": str(ctx.author), "at": int(time.time())})
-    save_settings()
-    await ctx.send(f"⚠️ Warned **{member}** — {reason} (warning #{len(warns)}).")
-
-
-@bot.command(name="purge")
-@commands.guild_only()
-@commands.has_permissions(manage_messages=True)
-async def purge_prefix(ctx: commands.Context, amount: int = 10):
-    amount = max(1, min(amount, 100))
-    deleted = await ctx.channel.purge(limit=amount + 1)  # +1 for the command message itself
-    await ctx.send(f"🧹 Deleted {len(deleted) - 1} message(s).", delete_after=5)
-
-
-# ---- error reporting ----
-@bot.tree.command(name="errors", description="Show the bot's recent errors (admin)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def errors_cmd(interaction: discord.Interaction):
-    if not await admin_gate(interaction):
-        return
-    if not error_log:
-        return await interaction.response.send_message(
-            "✅ No errors recorded since the last restart.", ephemeral=True
-        )
-    lines = [
-        f"<t:{e['at']}:R> · **{e['where']}** — `{e['error']}`"
-        for e in reversed(error_log)
-    ]
-    embed = discord.Embed(
-        title="Recent errors (newest first)",
-        description="\n".join(lines)[:4000],
-        color=0xE74C3C,
-    )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    original = getattr(error, "original", error)
-    cmd = interaction.command.qualified_name if interaction.command else "unknown"
-    log_error(f"/{cmd}", original)
-    text = f"⚠️ `/{cmd}` failed: `{str(original)[:200]}`\nAn admin can check `/errors` for details."
-    try:
-        await send_any(interaction, text, ephemeral=True)
-    except discord.HTTPException:
-        pass
-
-
-# ================= moderation =================
-@bot.tree.command(name="ban", description="Ban a member")
-@app_commands.default_permissions(ban_members=True)
-@app_commands.guild_only()
-@app_commands.describe(user="Member to ban", reason="Reason (optional)")
-async def ban_cmd(interaction: discord.Interaction, user: discord.Member, reason: Optional[str] = None):
-    if not await require_perm(interaction, "ban_members"):
-        return
-    if not await hierarchy_gate(interaction, user):
-        return
-    try:
-        await user.ban(reason=f"{interaction.user}: {reason or 'No reason given'}")
-    except discord.Forbidden:
-        return await interaction.response.send_message("I can't ban that member (role hierarchy).", ephemeral=True)
-    await interaction.response.send_message(f"🔨 Banned **{user}** — {reason or 'no reason given'}.")
-
-
-@bot.tree.command(name="unban", description="Unban a user by their ID")
-@app_commands.default_permissions(ban_members=True)
-@app_commands.guild_only()
-@app_commands.describe(user_id="ID of the banned user")
-async def unban_cmd(interaction: discord.Interaction, user_id: str):
-    if not await require_perm(interaction, "ban_members"):
-        return
-    try:
-        await interaction.guild.unban(discord.Object(id=int(user_id)))
-    except (ValueError, discord.NotFound):
-        return await interaction.response.send_message("No banned user with that ID.", ephemeral=True)
-    except discord.Forbidden:
-        return await interaction.response.send_message("I'm missing Ban Members permission.", ephemeral=True)
-    await interaction.response.send_message(f"✅ Unbanned <@{user_id}>.")
-
-
-@bot.tree.command(name="kick", description="Kick a member")
-@app_commands.default_permissions(kick_members=True)
-@app_commands.guild_only()
-@app_commands.describe(user="Member to kick", reason="Reason (optional)")
-async def kick_cmd(interaction: discord.Interaction, user: discord.Member, reason: Optional[str] = None):
-    if not await require_perm(interaction, "kick_members"):
-        return
-    if not await hierarchy_gate(interaction, user):
-        return
-    try:
-        await user.kick(reason=f"{interaction.user}: {reason or 'No reason given'}")
-    except discord.Forbidden:
-        return await interaction.response.send_message("I can't kick that member (role hierarchy).", ephemeral=True)
-    await interaction.response.send_message(f"👢 Kicked **{user}** — {reason or 'no reason given'}.")
-
-
-@bot.tree.command(name="timeout", description="Time a member out (mute)")
-@app_commands.default_permissions(moderate_members=True)
-@app_commands.guild_only()
-@app_commands.describe(user="Member to mute", minutes="Duration in minutes (max 28 days)", reason="Reason (optional)")
-async def timeout_cmd(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    minutes: app_commands.Range[int, 1, 40320],
-    reason: Optional[str] = None,
-):
-    if not await require_perm(interaction, "moderate_members"):
-        return
-    if not await hierarchy_gate(interaction, user):
-        return
-    try:
-        await user.timeout(timedelta(minutes=minutes), reason=f"{interaction.user}: {reason or 'No reason given'}")
-    except discord.Forbidden:
-        return await interaction.response.send_message("I can't time out that member (role hierarchy).", ephemeral=True)
-    await interaction.response.send_message(f"🔇 Timed out **{user}** for {minutes} minute(s).")
-
-
-@bot.tree.command(name="untimeout", description="Remove a member's timeout")
-@app_commands.default_permissions(moderate_members=True)
-@app_commands.guild_only()
-async def untimeout_cmd(interaction: discord.Interaction, user: discord.Member):
-    if not await require_perm(interaction, "moderate_members"):
-        return
-    try:
-        await user.timeout(None)
-    except discord.Forbidden:
-        return await interaction.response.send_message("I can't edit that member.", ephemeral=True)
-    await interaction.response.send_message(f"🔊 Removed timeout from **{user}**.")
-
-
-@bot.tree.command(name="warn", description="Warn a member")
-@app_commands.default_permissions(moderate_members=True)
-@app_commands.guild_only()
-@app_commands.describe(user="Member to warn", reason="Reason (optional)")
-async def warn_cmd(interaction: discord.Interaction, user: discord.Member, reason: Optional[str] = None):
-    if not await require_perm(interaction, "moderate_members"):
-        return
-    warns = guild_cfg(interaction.guild_id)["warns"].setdefault(str(user.id), [])
-    warns.append({"reason": reason or "No reason given", "by": str(interaction.user), "at": int(time.time())})
-    save_settings()
-    await interaction.response.send_message(
-        f"⚠️ Warned **{user}** — {reason or 'no reason given'} (warning #{len(warns)})."
-    )
-
-
-@bot.tree.command(name="warnings", description="Show a member's warnings")
-@app_commands.default_permissions(moderate_members=True)
-@app_commands.guild_only()
-async def warnings_cmd(interaction: discord.Interaction, user: discord.Member):
-    if not await require_perm(interaction, "moderate_members"):
-        return
-    warns = guild_cfg(interaction.guild_id)["warns"].get(str(user.id), [])
-    if not warns:
-        return await interaction.response.send_message(f"**{user}** has no warnings.", ephemeral=True)
-    lines = [f"{i + 1}. {w['reason']} — by {w['by']} <t:{w['at']}:R>" for i, w in enumerate(warns)]
-    embed = discord.Embed(title=f"Warnings for {user}", description="\n".join(lines)[:4000], color=EMBED_COLOR)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="clearwarns", description="Clear a member's warnings")
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def clearwarns_cmd(interaction: discord.Interaction, user: discord.Member):
-    if not await admin_gate(interaction):
-        return
-    guild_cfg(interaction.guild_id)["warns"].pop(str(user.id), None)
-    save_settings()
-    await interaction.response.send_message(f"🧹 Cleared all warnings for **{user}**.")
-
-
-@bot.tree.command(name="purge", description="Delete the last N messages in this channel")
-@app_commands.default_permissions(manage_messages=True)
-@app_commands.guild_only()
-@app_commands.describe(amount="How many messages to delete (1-100)")
-async def purge_cmd(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]):
-    if not await require_perm(interaction, "manage_messages"):
-        return
-    await interaction.response.defer(ephemeral=True)
-    try:
-        deleted = await interaction.channel.purge(limit=amount)
-    except discord.Forbidden:
-        return await interaction.followup.send("I'm missing Manage Messages permission here.")
-    await interaction.followup.send(f"🧹 Deleted {len(deleted)} message(s).")
-
-
-@bot.tree.command(name="lock", description="Lock a channel (block @everyone from sending)")
-@app_commands.default_permissions(manage_channels=True)
-@app_commands.guild_only()
-@app_commands.describe(channel="Channel to lock (default: current)")
-async def lock_cmd(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
-    if not await require_perm(interaction, "manage_channels"):
-        return
-    channel = channel or interaction.channel
-    try:
-        await channel.set_permissions(interaction.guild.default_role, send_messages=False)
-    except discord.Forbidden:
-        return await interaction.response.send_message("I'm missing Manage Channels permission.", ephemeral=True)
-    await interaction.response.send_message(f"🔒 Locked {channel.mention}.")
-
-
-@bot.tree.command(name="unlock", description="Unlock a channel")
-@app_commands.default_permissions(manage_channels=True)
-@app_commands.guild_only()
-@app_commands.describe(channel="Channel to unlock (default: current)")
-async def unlock_cmd(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
-    if not await require_perm(interaction, "manage_channels"):
-        return
-    channel = channel or interaction.channel
-    try:
-        await channel.set_permissions(interaction.guild.default_role, send_messages=None)
-    except discord.Forbidden:
-        return await interaction.response.send_message("I'm missing Manage Channels permission.", ephemeral=True)
-    await interaction.response.send_message(f"🔓 Unlocked {channel.mention}.")
-
-
-@bot.tree.command(name="slowmode", description="Set channel slowmode (0 to disable)")
-@app_commands.default_permissions(manage_channels=True)
-@app_commands.guild_only()
-@app_commands.describe(seconds="Delay in seconds (0-21600)", channel="Channel (default: current)")
-async def slowmode_cmd(
-    interaction: discord.Interaction,
-    seconds: app_commands.Range[int, 0, 21600],
-    channel: Optional[discord.TextChannel] = None,
-):
-    if not await require_perm(interaction, "manage_channels"):
-        return
-    channel = channel or interaction.channel
-    try:
-        await channel.edit(slowmode_delay=seconds)
-    except discord.Forbidden:
-        return await interaction.response.send_message("I'm missing Manage Channels permission.", ephemeral=True)
-    msg = f"🐌 Slowmode set to {seconds}s in {channel.mention}." if seconds else f"🚀 Slowmode disabled in {channel.mention}."
-    await interaction.response.send_message(msg)
-
-
-@bot.tree.command(name="nickname", description="Change a member's nickname (leave empty to reset)")
-@app_commands.default_permissions(manage_nicknames=True)
-@app_commands.guild_only()
-@app_commands.describe(user="Member to rename", name="New nickname (leave empty to reset)")
-async def nickname_cmd(interaction: discord.Interaction, user: discord.Member, name: Optional[str] = None):
-    if not await require_perm(interaction, "manage_nicknames"):
-        return
-    try:
-        await user.edit(nick=name)
-    except discord.Forbidden:
-        return await interaction.response.send_message("I can't rename that member (role hierarchy).", ephemeral=True)
-    await interaction.response.send_message(f"✏️ Nickname for **{user}** {'set to **' + name + '**' if name else 'reset'}.")
-
-
-role_group = app_commands.Group(
-    name="role",
-    description="Add or remove roles from members",
-    default_permissions=discord.Permissions(manage_roles=True),
-    guild_only=True,
+@app_commands.describe(
+    action="Whether to add or remove the role.",
+    member="The member to modify.",
+    role="Role mention, role ID, or exact role name.",
 )
-
-
-@role_group.command(name="add", description="Give a member a role")
-async def role_add(interaction: discord.Interaction, user: discord.Member, role: discord.Role):
-    if not await require_perm(interaction, "manage_roles"):
+async def role_cmd(
+    ctx: commands.Context,
+    action: Literal["add", "remove"],
+    member: discord.Member,
+    *,
+    role: str,
+) -> None:
+    if not member_has_perms(ctx.author, manage_roles=True):
+        await ctx.send("❌ You need the **Manage Roles** permission to use this command.", ephemeral=True)
         return
-    if role >= interaction.user.top_role and interaction.user.id != interaction.guild.owner_id:
-        return await interaction.response.send_message("That role is above your highest role.", ephemeral=True)
-    try:
-        await user.add_roles(role)
-    except discord.Forbidden:
-        return await interaction.response.send_message("I can't manage that role (it may be above mine).", ephemeral=True)
-    await interaction.response.send_message(f"✅ Gave {role.mention} to **{user}**.")
 
-
-@role_group.command(name="remove", description="Remove a role from a member")
-async def role_remove(interaction: discord.Interaction, user: discord.Member, role: discord.Role):
-    if not await require_perm(interaction, "manage_roles"):
+    resolved: Optional[discord.Role] = resolve_role(ctx.guild, role)
+    if resolved is None:
+        await ctx.send("❌ No role found.", ephemeral=True)
         return
-    if role >= interaction.user.top_role and interaction.user.id != interaction.guild.owner_id:
-        return await interaction.response.send_message("That role is above your highest role.", ephemeral=True)
+    if resolved.is_default() or resolved.managed:
+        await ctx.send("❌ That role is managed by Discord/an integration and cannot be assigned.", ephemeral=True)
+        return
+
+    if not is_superuser(ctx.author) and ctx.guild.owner_id != ctx.author.id and resolved >= ctx.author.top_role:
+        await ctx.send(
+            f"❌ **Hierarchy protection:** **{resolved.name}** is higher than or equal to your highest role — you cannot assign or remove it, even as an Administrator.",
+            ephemeral=True
+        )
+        return
+
+    if resolved >= ctx.guild.me.top_role:
+        await ctx.send("❌ I can't manage that role — it is at or above **my** highest role.", ephemeral=True)
+        return
+
     try:
-        await user.remove_roles(role)
+        if action == "add":
+            if resolved in member.roles:
+                return await ctx.send(f"ℹ️ {member.display_name} already has **{resolved.name}**.", ephemeral=True)
+            await member.add_roles(resolved, reason=f"role add by {ctx.author}")
+            await ctx.send(f"✅ Added **{resolved.name}** to {member.mention}.", allowed_mentions=discord.AllowedMentions.none())
+        else:
+            if resolved not in member.roles:
+                return await ctx.send(f"ℹ️ {member.display_name} does not have **{resolved.name}**.", ephemeral=True)
+            await member.remove_roles(resolved, reason=f"role remove by {ctx.author}")
+            await ctx.send(f"✅ Removed **{resolved.name}** from {member.mention}.", allowed_mentions=discord.AllowedMentions.none())
     except discord.Forbidden:
-        return await interaction.response.send_message("I can't manage that role (it may be above mine).", ephemeral=True)
-    await interaction.response.send_message(f"✅ Removed {role.mention} from **{user}**.")
+        await ctx.send("❌ Discord refused that change (missing bot permissions).", ephemeral=True)
+    except discord.HTTPException:
+        await ctx.send("⚠️ Role change failed due to a Discord API error.", ephemeral=True)
+
+@bot.hybrid_command(name="joinrole", description="Automatically add a role to all new joiners.")
+@commands.guild_only()
+@app_commands.describe(role="Role mention, role ID, or exact role name.")
+async def joinrole_cmd(ctx: commands.Context, *, role: str):
+    if not member_has_perms(ctx.author, manage_roles=True, administrator=True):
+        await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+        return
+
+    resolved: Optional[discord.Role] = resolve_role(ctx.guild, role)
+    if resolved is None:
+        return await ctx.send("❌ No role found.", ephemeral=True)
+
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
+    joinroles = settings.get("joinroles", [])
+
+    if str(resolved.id) in joinroles:
+        joinroles.remove(str(resolved.id))
+        await bot.settings.push_settings(ctx.guild.id, {"joinroles": joinroles})
+        await ctx.send(f"✅ **{resolved.name}** will no longer be given to new joiners.")
+    else:
+        joinroles.append(str(resolved.id))
+        await bot.settings.push_settings(ctx.guild.id, {"joinroles": joinroles})
+        await ctx.send(f"✅ **{resolved.name}** will now be given to all new joiners.")
+
+@bot.hybrid_command(name="roleall", description="Give every member a specific role.")
+@commands.guild_only()
+@app_commands.describe(role="Role mention, role ID, or exact role name.")
+async def roleall_cmd(ctx: commands.Context, *, role: str):
+    if not member_has_perms(ctx.author, manage_roles=True, administrator=True):
+        await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+        return
+
+    resolved: Optional[discord.Role] = resolve_role(ctx.guild, role)
+    if resolved is None:
+        return await ctx.send("❌ No role found.", ephemeral=True)
+
+    if resolved >= ctx.guild.me.top_role:
+        return await ctx.send("❌ I can't manage that role — it is at or above **my** highest role.", ephemeral=True)
+
+    if not is_superuser(ctx.author) and ctx.guild.owner_id != ctx.author.id and resolved >= ctx.author.top_role:
+        return await ctx.send(f"❌ **Hierarchy protection:** **{resolved.name}** is higher than or equal to your highest role.", ephemeral=True)
+
+    await ctx.send(f"⏳ Adding **{resolved.name}** to all members... This may take a while depending on server size.")
+
+    success = 0
+    failed = 0
+    for member in ctx.guild.members:
+        if resolved not in member.roles:
+            try:
+                await member.add_roles(resolved, reason=f"roleall by {ctx.author}")
+                success += 1
+            except:
+                failed += 1
+            await asyncio.sleep(0.1)  # Avoid rate limits
+
+    await ctx.channel.send(f"✅ Finished adding **{resolved.name}**! Success: {success}, Failed: {failed}")
+
+@bot.hybrid_command(name="reactionrole", description="Set up a reaction role on a message.")
+@commands.guild_only()
+@app_commands.describe(link="Link to the message", emoji="Reaction emoji", role="Role to assign")
+async def reactionrole_cmd(ctx: commands.Context, link: str, emoji: str, *, role: str):
+    if not member_has_perms(ctx.author, manage_roles=True, administrator=True):
+        await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+        return
+
+    resolved: Optional[discord.Role] = resolve_role(ctx.guild, role)
+    if resolved is None:
+        return await ctx.send("❌ No role found.", ephemeral=True)
+
+    msg = await extract_message_from_link(ctx, link)
+    if not msg:
+        return await ctx.send("❌ Could not find message from the link. Make sure it's in this server.", ephemeral=True)
+
+    try:
+        await msg.add_reaction(emoji)
+    except discord.HTTPException:
+        return await ctx.send("❌ Failed to add reaction. Ensure it is a valid default emoji or a server emoji I have access to.", ephemeral=True)
+
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
+    reactionroles = settings.get("reactionroles", {})
+    key = f"{msg.id}_{emoji}"
+
+    if key in reactionroles and reactionroles[key] == str(resolved.id):
+        del reactionroles[key]
+        await bot.settings.push_settings(ctx.guild.id, {"reactionroles": reactionroles})
+        await ctx.send(f"✅ Removed reaction role **{resolved.name}** from that message.")
+    else:
+        reactionroles[key] = str(resolved.id)
+        await bot.settings.push_settings(ctx.guild.id, {"reactionroles": reactionroles})
+        await ctx.send(f"✅ Added reaction role **{resolved.name}** to that message. Users who react with {emoji} will receive the role.")
+
+@bot.hybrid_command(name="reaction", description="Make the bot react to a message.")
+@commands.guild_only()
+@app_commands.describe(link="Link to the message", emoji="Reaction emoji")
+async def reaction_cmd(ctx: commands.Context, link: str, emoji: str):
+    if not member_has_perms(ctx.author, manage_messages=True):
+        await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
+        return
+
+    msg = await extract_message_from_link(ctx, link)
+    if not msg:
+        return await ctx.send("❌ Could not find message from the link. Make sure it's in this server.", ephemeral=True)
+
+    try:
+        await msg.add_reaction(emoji)
+        await ctx.send(f"✅ Reacted to the message with {emoji}", ephemeral=True)
+    except discord.HTTPException:
+        await ctx.send("❌ Failed to add reaction. Ensure it is a valid default emoji or a server emoji I have access to.", ephemeral=True)
 
 
-# ================= info / utility =================
-@bot.tree.command(name="ping", description="Check that the bot is alive and see its latency")
-async def ping_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message(f"🏓 Pong! Latency: **{round(bot.latency * 1000)}ms**")
+# --------------------------------------------------------------------------- #
+# MODERATION & UTILITY (Migrated from bot.py)
+# --------------------------------------------------------------------------- #
 
+@bot.hybrid_command(name="ban", description="Ban a member")
+@commands.guild_only()
+async def ban_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optional[str] = "No reason given"):
+    if not member_has_perms(ctx.author, ban_members=True): return await ctx.send("❌ You need Ban Members permission.", ephemeral=True)
+    err = mod_block_reason(ctx.author, user, ctx.guild.me)
+    if err: return await ctx.send(err, ephemeral=True)
+    await user.ban(reason=reason)
+    await ctx.send(f"🔨 **{user}** was banned. Reason: {reason}")
 
-@bot.tree.command(name="uptime", description="How long the bot has been running")
-async def uptime_cmd(interaction: discord.Interaction):
-    secs = int(time.time() - START_TIME)
-    d, rem = divmod(secs, 86400)
-    h, rem = divmod(rem, 3600)
-    m, s = divmod(rem, 60)
-    await interaction.response.send_message(f"⏳ Uptime: **{d}d {h}h {m}m {s}s**")
+@bot.hybrid_command(name="unban", description="Unban a user by their ID")
+@commands.guild_only()
+async def unban_cmd(ctx: commands.Context, user_id: str):
+    if not member_has_perms(ctx.author, ban_members=True): return await ctx.send("❌ You need Ban Members permission.", ephemeral=True)
+    try:
+        user = await bot.fetch_user(int(user_id))
+        await ctx.guild.unban(user)
+        await ctx.send(f"✅ **{user}** was unbanned.")
+    except Exception as e:
+        await ctx.send(f"❌ Failed to unban: {e}", ephemeral=True)
 
+@bot.hybrid_command(name="kick", description="Kick a member")
+@commands.guild_only()
+async def kick_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optional[str] = "No reason given"):
+    if not member_has_perms(ctx.author, kick_members=True): return await ctx.send("❌ You need Kick Members permission.", ephemeral=True)
+    err = mod_block_reason(ctx.author, user, ctx.guild.me)
+    if err: return await ctx.send(err, ephemeral=True)
+    await user.kick(reason=reason)
+    await ctx.send(f"👢 **{user}** was kicked. Reason: {reason}")
 
-@bot.tree.command(name="userinfo", description="Info about a member")
-@app_commands.guild_only()
-@app_commands.describe(user="Member (default: you)")
-async def userinfo_cmd(interaction: discord.Interaction, user: Optional[discord.Member] = None):
-    user = user or interaction.user
-    embed = discord.Embed(title=str(user), color=EMBED_COLOR)
+@bot.hybrid_command(name="timeout", description="Time a member out (mute)")
+@commands.guild_only()
+async def timeout_cmd(ctx: commands.Context, user: discord.Member, minutes: int, *, reason: Optional[str] = "No reason given"):
+    if not member_has_perms(ctx.author, moderate_members=True): return await ctx.send("❌ You need Timeout permission.", ephemeral=True)
+    err = mod_block_reason(ctx.author, user, ctx.guild.me)
+    if err: return await ctx.send(err, ephemeral=True)
+    await user.timeout(discord.utils.utcnow() + discord.utils.timedelta(minutes=minutes), reason=reason)
+    await ctx.send(f"🤐 **{user}** is timed out for {minutes}m. Reason: {reason}")
+
+@bot.hybrid_command(name="untimeout", description="Remove a member's timeout")
+@commands.guild_only()
+async def untimeout_cmd(ctx: commands.Context, user: discord.Member):
+    if not member_has_perms(ctx.author, moderate_members=True): return await ctx.send("❌ You need Timeout permission.", ephemeral=True)
+    err = mod_block_reason(ctx.author, user, ctx.guild.me)
+    if err: return await ctx.send(err, ephemeral=True)
+    await user.timeout(None)
+    await ctx.send(f"🔊 **{user}**'s timeout was removed.")
+
+@bot.hybrid_command(name="warn", description="Warn a member")
+@commands.guild_only()
+async def warn_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optional[str] = "No reason given"):
+    if not member_has_perms(ctx.author, manage_messages=True): return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
+    warns = settings.setdefault("warns", {})
+    uw = warns.setdefault(str(user.id), [])
+    uw.append({"reason": reason, "by": ctx.author.id, "at": int(time.time())})
+    await bot.settings.push_settings(ctx.guild.id, {"warns": warns})
+    await ctx.send(f"⚠️ **{user}** was warned. Reason: {reason}")
+
+@bot.hybrid_command(name="warnings", description="Show a member's warnings")
+@commands.guild_only()
+async def warnings_cmd(ctx: commands.Context, user: discord.Member):
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
+    uw = settings.get("warns", {}).get(str(user.id), [])
+    if not uw: return await ctx.send(f"**{user}** has no warnings.")
+    desc = "\n".join(f"<t:{w["at"]}:d> by <@{w["by"]}>: {w["reason"]}" for w in uw)
+    embed = discord.Embed(title=f"Warnings for {user}", description=desc, color=discord.Color.red())
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="clearwarns", description="Clear a member's warnings")
+@commands.guild_only()
+async def clearwarns_cmd(ctx: commands.Context, user: discord.Member):
+    if not member_has_perms(ctx.author, manage_messages=True): return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
+    warns = settings.get("warns", {})
+    if str(user.id) in warns:
+        del warns[str(user.id)]
+        await bot.settings.push_settings(ctx.guild.id, {"warns": warns})
+    await ctx.send(f"✅ Cleared warnings for **{user}**.")
+
+@bot.hybrid_command(name="purge", description="Delete the last N messages in this channel")
+@commands.guild_only()
+async def purge_cmd(ctx: commands.Context, amount: int):
+    if not member_has_perms(ctx.author, manage_messages=True): return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
+    amount = min(max(amount, 1), 100)
+    await ctx.channel.purge(limit=amount + 1)
+    await ctx.send(f"✅ Purged {amount} messages.", delete_after=3)
+
+@bot.hybrid_command(name="lock", description="Lock a channel (block @everyone from sending)")
+@commands.guild_only()
+async def lock_cmd(ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
+    if not member_has_perms(ctx.author, manage_channels=True): return await ctx.send("❌ You need Manage Channels permission.", ephemeral=True)
+    c = channel or ctx.channel
+    await c.set_permissions(ctx.guild.default_role, send_messages=False)
+    await ctx.send(f"🔒 {c.mention} is now locked.")
+
+@bot.hybrid_command(name="unlock", description="Unlock a channel")
+@commands.guild_only()
+async def unlock_cmd(ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
+    if not member_has_perms(ctx.author, manage_channels=True): return await ctx.send("❌ You need Manage Channels permission.", ephemeral=True)
+    c = channel or ctx.channel
+    await c.set_permissions(ctx.guild.default_role, send_messages=True)
+    await ctx.send(f"🔓 {c.mention} is now unlocked.")
+
+@bot.hybrid_command(name="slowmode", description="Set channel slowmode (0 to disable)")
+@commands.guild_only()
+async def slowmode_cmd(ctx: commands.Context, seconds: int, channel: Optional[discord.TextChannel] = None):
+    if not member_has_perms(ctx.author, manage_channels=True): return await ctx.send("❌ You need Manage Channels permission.", ephemeral=True)
+    c = channel or ctx.channel
+    await c.edit(slowmode_delay=max(0, seconds))
+    await ctx.send(f"⏱️ Slowmode in {c.mention} set to {seconds}s.")
+
+@bot.hybrid_command(name="nickname", description="Change a member's nickname (leave empty to reset)")
+@commands.guild_only()
+async def nickname_cmd(ctx: commands.Context, user: discord.Member, *, name: Optional[str] = None):
+    if not member_has_perms(ctx.author, manage_nicknames=True): return await ctx.send("❌ You need Manage Nicknames permission.", ephemeral=True)
+    err = mod_block_reason(ctx.author, user, ctx.guild.me)
+    if err: return await ctx.send(err, ephemeral=True)
+    await user.edit(nick=name)
+    await ctx.send(f"✅ Changed **{user}**'s nickname.")
+
+@bot.hybrid_command(name="ping", description="Check that the bot is alive and see its latency")
+async def ping_cmd(ctx: commands.Context):
+    await ctx.send(f"🏓 Pong! Latency: {round(bot.latency * 1000)}ms")
+
+@bot.hybrid_command(name="uptime", description="How long the bot has been running")
+async def uptime_cmd(ctx: commands.Context):
+    s = (datetime.now(timezone.utc).timestamp() - bot.start_time)
+    await ctx.send(f"⏱️ Uptime: {humanize_seconds(s)}")
+
+@bot.hybrid_command(name="userinfo", description="Info about a member")
+async def userinfo_cmd(ctx: commands.Context, user: Optional[discord.Member] = None):
+    user = user or ctx.author
+    embed = discord.Embed(title=str(user), color=user.color)
     embed.set_thumbnail(url=user.display_avatar.url)
     embed.add_field(name="ID", value=user.id, inline=False)
     embed.add_field(name="Created", value=f"<t:{int(user.created_at.timestamp())}:R>")
-    if user.joined_at:
-        embed.add_field(name="Joined", value=f"<t:{int(user.joined_at.timestamp())}:R>")
-    embed.add_field(name="Top role", value=user.top_role.mention)
-    embed.add_field(name="Roles", value=str(len(user.roles) - 1))
-    await interaction.response.send_message(embed=embed)
+    embed.add_field(name="Joined", value=f"<t:{int(user.joined_at.timestamp())}:R>")
+    await ctx.send(embed=embed)
 
-
-@bot.tree.command(name="serverinfo", description="Info about this server")
-@app_commands.guild_only()
-async def serverinfo_cmd(interaction: discord.Interaction):
-    g = interaction.guild
-    embed = discord.Embed(title=g.name, color=EMBED_COLOR)
-    if g.icon:
-        embed.set_thumbnail(url=g.icon.url)
+@bot.hybrid_command(name="serverinfo", description="Info about this server")
+@commands.guild_only()
+async def serverinfo_cmd(ctx: commands.Context):
+    g = ctx.guild
+    embed = discord.Embed(title=g.name, color=discord.Color.blurple())
+    if g.icon: embed.set_thumbnail(url=g.icon.url)
     embed.add_field(name="ID", value=g.id, inline=False)
     embed.add_field(name="Owner", value=f"<@{g.owner_id}>")
     embed.add_field(name="Members", value=str(g.member_count))
-    embed.add_field(name="Roles", value=str(len(g.roles)))
-    embed.add_field(name="Channels", value=str(len(g.channels)))
     embed.add_field(name="Created", value=f"<t:{int(g.created_at.timestamp())}:R>")
-    await interaction.response.send_message(embed=embed)
+    await ctx.send(embed=embed)
 
-
-@bot.tree.command(name="avatar", description="Show a user's avatar")
-@app_commands.describe(user="User (default: you)")
-async def avatar_cmd(interaction: discord.Interaction, user: Optional[discord.User] = None):
-    user = user or interaction.user
-    embed = discord.Embed(title=f"{user.display_name}'s avatar", color=EMBED_COLOR)
+@bot.hybrid_command(name="avatar", description="Show a user's avatar")
+async def avatar_cmd(ctx: commands.Context, user: Optional[discord.User] = None):
+    user = user or ctx.author
+    embed = discord.Embed(title=f"{user.display_name}'s avatar", color=discord.Color.blurple())
     embed.set_image(url=user.display_avatar.url)
-    await interaction.response.send_message(embed=embed)
+    await ctx.send(embed=embed)
 
-
-@bot.tree.command(name="banner", description="Show a user's profile banner")
-@app_commands.describe(user="User (default: you)")
-async def banner_cmd(interaction: discord.Interaction, user: Optional[discord.User] = None):
-    user = user or interaction.user
-    fetched = await bot.fetch_user(user.id)  # banner needs a full fetch
+@bot.hybrid_command(name="banner", description="Show a user's profile banner")
+async def banner_cmd(ctx: commands.Context, user: Optional[discord.User] = None):
+    user = user or ctx.author
+    fetched = await bot.fetch_user(user.id)
     if not fetched.banner:
-        return await interaction.response.send_message(f"**{user.display_name}** has no banner.", ephemeral=True)
-    embed = discord.Embed(title=f"{user.display_name}'s banner", color=EMBED_COLOR)
+        return await ctx.send(f"**{user.display_name}** has no banner.", ephemeral=True)
+    embed = discord.Embed(title=f"{user.display_name}'s banner", color=discord.Color.blurple())
     embed.set_image(url=fetched.banner.url)
-    await interaction.response.send_message(embed=embed)
+    await ctx.send(embed=embed)
 
-
-@bot.tree.command(name="roleinfo", description="Info about a role")
-@app_commands.guild_only()
-async def roleinfo_cmd(interaction: discord.Interaction, role: discord.Role):
-    embed = discord.Embed(title=f"@{role.name}", color=role.color if role.color.value else EMBED_COLOR)
+@bot.hybrid_command(name="roleinfo", description="Info about a role")
+@commands.guild_only()
+async def roleinfo_cmd(ctx: commands.Context, role: discord.Role):
+    embed = discord.Embed(title=f"@{role.name}", color=role.color)
     embed.add_field(name="ID", value=role.id, inline=False)
     embed.add_field(name="Members", value=str(len(role.members)))
     embed.add_field(name="Color", value=str(role.color))
-    embed.add_field(name="Mentionable", value="Yes" if role.mentionable else "No")
     embed.add_field(name="Created", value=f"<t:{int(role.created_at.timestamp())}:R>")
-    await interaction.response.send_message(embed=embed)
+    await ctx.send(embed=embed)
 
+@bot.hybrid_command(name="membercount", description="How many members this server has")
+@commands.guild_only()
+async def membercount_cmd(ctx: commands.Context):
+    await ctx.send(f"👥 **{ctx.guild.member_count}** members.")
 
-@bot.tree.command(name="membercount", description="How many members this server has")
-@app_commands.guild_only()
-async def membercount_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message(f"👥 **{interaction.guild.member_count}** members.")
+@bot.hybrid_command(name="help", description="What this bot can do")
+async def help_cmd(ctx: commands.Context):
+    embed = discord.Embed(
+        title="Help",
+        description=(
+            "**🤖 Auto-react / auto-respond** — react or reply when a trigger word is seen (admin only).\n"
+            "**🎉 Fun & roleplay** — anime-gif actions like `/bite`, `/hug`, `/slap` — "
+            "these also work as chat commands with the prefix (default `!`, change with `/set prefix`).\n"
+            "**🛡️ Moderation** — ban, kick, timeout, warn, purge, lock, slowmode, etc.\n"
+            "**🛠️ Utility** — `/role`, `/roleall`, `/joinrole`, `/reactionrole`, `/reaction`, `/snipe`.\n"
+            "**ℹ️ Info** — `/userinfo`, `/serverinfo`, `/avatar`, `/ping`, `/roleinfo`.\n\n"
+            "Use `/commands` for a category list or `/commands all` for every command."
+        ),
+        color=discord.Color.blurple(),
+    )
+    await ctx.send(embed=embed, ephemeral=True)
 
-
-# ================= /help and /commands =================
 CONFIG_CMDS = [
-    "/remind on · /remind off · /remind test",
-    "/remind interval <minutes> · /remind role <role>",
-    "/remind channel <channel> · /remind message <text>",
-    "/autoreact set trigger <trigger> <emoji> · /autoreact remove · /autoreact list",
-    "/autorespond set trigger <trigger> <response> · /autorespond remove · /autorespond list",
+    "/autoreact ...",
+    "/autorespond ...",
     "/set prefix <prefix>",
-    "/autopurge on [channel] [hours] [days] · /autopurge off [channel]",
-    "/autopurge exempt <add|remove> <role> · /autopurge status",
-    "/errors — show recent bot errors",
+    "/autopurge ...",
+    "/joinrole <role>",
+    "/reactionrole <link> <emoji> <role>",
 ]
 MOD_CMDS = [
     "/ban <user> [reason]", "/unban <user_id>", "/kick <user> [reason]",
@@ -1023,48 +893,23 @@ MOD_CMDS = [
     "/warn <user> [reason]", "/warnings <user>", "/clearwarns <user>",
     "/purge <amount>", "/lock [channel]", "/unlock [channel]",
     "/slowmode <seconds> [channel]", "/nickname <user> [name]",
-    "/role add <user> <role>", "/role remove <user> <role>",
-    "Prefix versions also work: !ban, !kick, !timeout, !warn, !purge",
+    "/role <add/remove> <user> <role>", "/roleall <role>",
 ]
 INFO_CMDS = [
     "/ping", "/uptime", "/userinfo [user]", "/serverinfo",
     "/avatar [user]", "/banner [user]", "/roleinfo <role>", "/membercount",
 ]
 
-
-def fun_cmds_text() -> str:
-    return " · ".join("/" + n for n in sorted(list(TARGETED_ACTIONS) + list(SOLO_ACTIONS)))
-
-
-@bot.tree.command(name="help", description="What this bot can do")
-async def help_cmd(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="Help",
-        description=(
-            "**🔔 Reminder** — pings a role in a channel on a repeating timer (admin only). "
-            "Start with `/remind role`, `/remind channel`, then `/remind on`. Test with `/remind test`.\n"
-            "**🤖 Auto-react / auto-respond** — react or reply when a trigger word is seen (admin only).\n"
-            "**🎉 Fun & roleplay** — anime-gif actions like `/bite`, `/hug`, `/slap` — "
-            "these also work as chat commands with the prefix (default `!`, change with `/set prefix`).\n"
-            "**🛡️ Moderation** — ban, kick, timeout, warn, purge and more.\n"
-            "**ℹ️ Info** — `/userinfo`, `/serverinfo`, `/avatar`, `/ping`…\n\n"
-            "Use `/commands` for a category list or `/commands all` for every command."
-        ),
-        color=EMBED_COLOR,
-    )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="commands", description="List commands (pick a category, or 'all')")
+@bot.hybrid_command(name="commands", description="List commands (pick a category, or 'all')")
 @app_commands.describe(category="Which category to show (default: overview)")
 async def commands_cmd(
-    interaction: discord.Interaction,
+    ctx: commands.Context,
     category: Optional[Literal["all", "fun", "moderation", "info", "config"]] = None,
 ):
-    embed = discord.Embed(title="Commands", color=EMBED_COLOR)
+    embed = discord.Embed(title="Commands", color=discord.Color.blurple())
     show = category or "overview"
     if show in ("all", "fun"):
-        embed.add_field(name="🎉 Fun & roleplay", value=fun_cmds_text()[:1024], inline=False)
+        embed.add_field(name="🎉 Fun & roleplay", value=" · ".join("/" + n for n in REACTIONS.keys()), inline=False)
     if show in ("all", "moderation"):
         embed.add_field(name="🛡️ Moderation", value="\n".join(MOD_CMDS)[:1024], inline=False)
     if show in ("all", "info"):
@@ -1076,133 +921,147 @@ async def commands_cmd(
             "Categories: **fun**, **moderation**, **info**, **config**\n"
             "`/commands fun` · `/commands moderation` · `/commands info` · `/commands config` · `/commands all`"
         )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await ctx.send(embed=embed, ephemeral=True)
 
 
-# ================= reminder loop =================
+# --------------------------------------------------------------------------- #
+# Error Handling
+# --------------------------------------------------------------------------- #
+
+async def _report_error(ctx: commands.Context, error: commands.CommandError) -> None:
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.NoPrivateMessage):
+        await ctx.send("❌ This command only works inside a server.", ephemeral=True)
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(
+            f"❌ Missing argument: `{error.param.name}`. "
+            f"Check `!help {ctx.invoked_with}` for usage.",
+            ephemeral=True,
+        )
+        return
+    if isinstance(
+        error,
+        (
+            commands.MemberNotFound,
+            commands.ChannelNotFound,
+            commands.RoleNotFound,
+            commands.BadLiteralArgument,
+            commands.BadArgument,
+        ),
+    ):
+        await ctx.send(f"❌ {error}", ephemeral=True)
+        return
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏳ Slow down — try again in {error.retry_after:.1f}s.", ephemeral=True)
+        return
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+
+    original: BaseException = getattr(error, "original", error)
+    if isinstance(original, PyMongoError):
+        log.error("Database error in command '%s': %s", ctx.command, original)
+        await ctx.send("⚠️ The database is temporarily unreachable — please try again shortly.", ephemeral=True)
+        return
+    if isinstance(original, discord.Forbidden):
+        await ctx.send("❌ I'm missing the Discord permissions to do that.", ephemeral=True)
+        return
+
+    log.exception("Unhandled error in command '%s'", ctx.command, exc_info=error)
+    try:
+        await ctx.send("⚠️ Something went wrong while running that command.", ephemeral=True)
+    except discord.DiscordException:
+        pass
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
+    try:
+        await _report_error(ctx, error)
+    except discord.DiscordException as exc:
+        log.error("Failed to report command error: %s", exc)
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    log.error("App command error: %s", error)
+    message: str = "⚠️ Something went wrong while running that command."
+    if isinstance(error, app_commands.CheckFailure):
+        message = "❌ You don't have permission to use this command."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.DiscordException:
+        pass
+
+# --------------------------------------------------------------------------- #
+# Reminder Loop
+# --------------------------------------------------------------------------- #
+
 @tasks.loop(seconds=20)
 async def reminder_loop():
     now = time.time()
-    for gid, g in settings.items():
-        cfg = g.get("remind", {})
+    for gid in list(bot.settings._cache.keys()):
+        cfg = bot.settings.get_settings(gid).get("remind", {})
         if not cfg.get("enabled"):
             continue
-        if gid not in next_fire:  # e.g. after a restart
-            next_fire[gid] = now + cfg["interval"] * 60
+        if gid not in bot.next_fire:
+            bot.next_fire[gid] = now + cfg.get("interval", 181) * 60
             continue
-        if now >= next_fire[gid]:
-            next_fire[gid] = now + cfg["interval"] * 60
-            channel = bot.get_channel(cfg["channel_id"])
+        if now >= bot.next_fire[gid]:
+            bot.next_fire[gid] = now + cfg.get("interval", 181) * 60
+            channel = bot.get_channel(cfg.get("channel_id"))
             if channel is None:
                 continue
             try:
-                await channel.send(f"<@&{cfg['role_id']}> {cfg['message']}")
-            except (discord.Forbidden, discord.HTTPException) as e:
-                log_error("reminder", e)
-
+                await channel.send(f"<@&{cfg.get('role_id')}> {cfg.get('message', 'Reminder!')}")
+            except Exception as e:
+                bot.log_error("reminder", e)
 
 @reminder_loop.before_loop
 async def before_reminder_loop():
     await bot.wait_until_ready()
 
+# --------------------------------------------------------------------------- #
+# Render keepalive
+# --------------------------------------------------------------------------- #
 
-# ================= trigger detection =================
-@bot.event
-async def on_message(message: discord.Message):
-    if message.guild is None:
+async def _start_keepalive_server() -> None:
+    port: Optional[str] = os.getenv("PORT")
+    if not port:
         return
-    g = guild_cfg(message.guild.id)
+    from aiohttp import web
 
-    # auto-purge: delete every new message in active channels (exempt roles excluded)
-    ap = g.setdefault("autopurge", {"channels": {}, "exempt_roles": []})
-    entry = ap["channels"].get(str(message.channel.id))
-    if entry and message.author.id != bot.user.id:
-        until = entry.get("until")
-        if until and time.time() > until:
-            ap["channels"].pop(str(message.channel.id), None)
-            save_settings()
-        elif not any(r.id in ap["exempt_roles"] for r in getattr(message.author, "roles", [])):
-            try:
-                await message.delete()
-            except discord.HTTPException as e:
-                log_error("autopurge", e)
-            return  # deleted messages don't trigger anything else
+    async def health(_: web.Request) -> web.Response:
+        return web.Response(text="Bot is alive")
 
-    if message.author.bot:
-        return
-    content = message.content.lower()
+    app: web.Application = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner: web.AppRunner = web.AppRunner(app)
+    await runner.setup()
+    site: web.TCPSite = web.TCPSite(runner, "0.0.0.0", int(port))
+    await site.start()
+    log.info("Keepalive HTTP server listening on port %s.", port)
 
-    for trigger, emoji in g["autoreact"].items():
-        if trigger in content:
-            try:
-                await message.add_reaction(emoji)
-            except discord.HTTPException as e:
-                log_error(f"autoreact “{trigger}”", f"{e} (is the emoji valid / do I have Add Reactions?)")
+# --------------------------------------------------------------------------- #
+# Entrypoint
+# --------------------------------------------------------------------------- #
 
-    for trigger, response in g["autorespond"].items():
-        if trigger in content:
-            try:
-                await message.channel.send(response)
-            except discord.HTTPException as e:
-                log_error(f"autorespond “{trigger}”", e)
-            break  # only one auto-response per message
+async def main() -> None:
+    token: Optional[str] = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN environment variable is not set.")
+    async with bot:
+        await _start_keepalive_server()
+        await bot.start(token)
 
-    await bot.process_commands(message)
-
-
-@bot.event
-async def on_command_error(ctx: commands.Context, error: commands.CommandError):
-    if isinstance(error, commands.CommandNotFound):
-        return  # not every prefixed message is a command
-    if isinstance(error, commands.MissingPermissions):
-        return await ctx.send("You don't have permission to use this command.")
-    if isinstance(error, commands.BotMissingPermissions):
-        return await ctx.send("I'm missing the server permission needed for that.")
-    if isinstance(error, (commands.MissingRequiredArgument, commands.MemberNotFound, commands.BadArgument)):
-        name = ctx.command.name if ctx.command else "command"
-        return await ctx.send(f"Usage: `{ctx.prefix}{name} @someone` — mention a valid member.")
-    original = getattr(error, "original", error)
-    log_error(f"{ctx.prefix}{ctx.command.name if ctx.command else '?'}", original)
-    if isinstance(original, discord.Forbidden):
-        return await ctx.send(
-            "Discord refused that action — my role is probably below the target's, or I'm missing "
-            "a permission. Check **Server Settings → Roles** and see `/errors`."
-        )
-    await ctx.send(f"⚠️ That failed: `{str(original)[:200]}` — an admin can check `/errors`.")
-
-
-# ================= keep-alive web server (for Render) =================
-class Ping(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is alive")
-
-    def log_message(self, *args):
-        pass
-
-
-def keep_alive():
-    port = int(os.environ.get("PORT", 8080))
-    HTTPServer(("0.0.0.0", port), Ping).serve_forever()
-
-
-# ================= startup =================
-@bot.event
-async def setup_hook():
-    global http_session
-    http_session = aiohttp.ClientSession()
-    bot.tree.add_command(remind)
-    bot.tree.add_command(autoreact)
-    bot.tree.add_command(autorespond)
-    bot.tree.add_command(role_group)
-    bot.tree.add_command(set_group)
-    bot.tree.add_command(autopurge)
-    register_fun_commands()
-    register_prefix_fun_commands()
-    await bot.tree.sync()
-    reminder_loop.start()
-
-
-threading.Thread(target=keep_alive, daemon=True).start()
-bot.run(TOKEN)
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Shutdown requested — exiting cleanly.")
