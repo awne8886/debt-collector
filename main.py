@@ -324,7 +324,7 @@ def mod_block_reason(actor: discord.Member, target: discord.Member, me: discord.
         return "I'm not moderating myself."
     if target.id == actor.guild.owner_id:
         return "That member is the server owner — nobody can moderate them."
-    if actor.id != actor.guild.owner_id and actor.top_role <= target.top_role:
+    if not is_superuser(actor) and actor.id != actor.guild.owner_id and actor.top_role <= target.top_role:
         return "You can't act on someone whose highest role is equal to or above yours."
     if me.top_role <= target.top_role:
         return (
@@ -743,7 +743,7 @@ async def warnings_cmd(ctx: commands.Context, user: discord.Member):
     settings = await bot.settings.fetch_settings(ctx.guild.id)
     uw = settings.get("warns", {}).get(str(user.id), [])
     if not uw: return await ctx.send(f"**{user}** has no warnings.")
-    desc = "\n".join(f"<t:{w["at"]}:d> by <@{w["by"]}>: {w["reason"]}" for w in uw)
+    desc = "\n".join(f"<t:{w['at']}:d> by <@{w['by']}>: {w['reason']}" for w in uw)
     embed = discord.Embed(title=f"Warnings for {user}", description=desc, color=discord.Color.red())
     await ctx.send(embed=embed)
 
