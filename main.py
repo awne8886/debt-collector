@@ -647,14 +647,22 @@ async def roleall_cmd(ctx: commands.Context, *, role: str):
 
     success = 0
     failed = 0
-    for member in ctx.guild.members:
-        if resolved not in member.roles:
-            try:
-                await member.add_roles(resolved, reason=f"roleall by {ctx.author}")
-                success += 1
-            except:
-                failed += 1
-            await asyncio.sleep(0.1)  # Avoid rate limits
+    members_to_update = [m for m in ctx.guild.members if resolved not in m.roles]
+
+    async def _add_role(m: discord.Member):
+        try:
+            await m.add_roles(resolved, reason=f"roleall by {ctx.author}")
+            return True
+        except:
+            return False
+
+    chunk_size = 10
+    for i in range(0, len(members_to_update), chunk_size):
+        chunk = members_to_update[i:i + chunk_size]
+        results = await asyncio.gather(*(_add_role(m) for m in chunk))
+        success += sum(1 for r in results if r)
+        failed += sum(1 for r in results if not r)
+        await asyncio.sleep(0.1)  # Avoid rate limits
 
     await ctx.channel.send(f"✅ Finished adding **{resolved.name}**! Success: {success}, Failed: {failed}")
 
