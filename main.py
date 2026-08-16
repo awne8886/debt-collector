@@ -32,12 +32,29 @@ log: logging.Logger = logging.getLogger("debt-collector")
 # Global constants
 # --------------------------------------------------------------------------- #
 
+
+@dataclass
+class SnipedMessage:
+    author: str
+    author_avatar: Optional[str]
+    content: str
+    created_at: datetime
+    deleted_at: datetime
+
+@dataclass
+class AfkPing:
+    author: str
+    content: str
+    timestamp: float
+    jump_url: str
+
 @dataclass
 class AfkRecord:
     reason: str
     since: float
-    pings: List[Dict[str, str]] = field(default_factory=list)
+    pings: List[AfkPing] = field(default_factory=list)
 
+AFK_GRACE_SECONDS: float = 15.0
 COMMAND_PREFIX: str = "!"
 MONGO_DB_NAME: str = "debt_collector"
 MONGO_COLLECTION_NAME: str = "guild_settings"
@@ -162,7 +179,7 @@ class DebtCollectorBot(commands.Bot):
         self.http_session: Optional[aiohttp.ClientSession] = None
         self.start_time: float = time.time()
         self.afk_state: Dict[int, "AfkRecord"] = {}
-        self.sniped_messages: Dict[int, discord.Message] = {}
+        self.snipes: Dict[int, SnipedMessage] = {}
         self.next_fire: Dict[str, float] = {}
         self.error_log: List[Dict[str, Any]] = []
 
@@ -380,16 +397,34 @@ def humanize_seconds(seconds: float) -> str:
 async def on_ready() -> None:
     log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
 
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild) -> None:
+    bot.settings._cache.pop(guild.id, None)
+
 @bot.event
 async def on_message_delete(message: discord.Message) -> None:
-    if message.author.bot or message.guild is None:
+    if message.guild is None or message.author.bot:
         return
-    bot.sniped_messages[message.channel.id] = message
+    try:
+        bot.snipes[message.channel.id] = SnipedMessage(
+            author=str(message.author),
+            author_avatar=(
+                message.author.display_avatar.url
+                if message.author.display_avatar
+                else None
+            ),
+            content=message.content or "",
+            created_at=message.created_at,
+            deleted_at=datetime.now(timezone.utc),
+        )
+    except discord.DiscordException as exc:
+        log.error("on_message_delete error: %s", exc)
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
     guild_id = member.guild.id
-    settings = await bot.settings.fetch_settings(guild_id)
+    settings = bot.settings.get_settings(guild_id)
     joinroles = settings.get("joinroles", [])
     if not joinroles:
         return
@@ -409,7 +444,7 @@ async def on_member_join(member: discord.Member) -> None:
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if payload.user_id == bot.user.id or not payload.guild_id:
         return
-    settings = await bot.settings.fetch_settings(payload.guild_id)
+    settings = bot.settings.get_settings(payload.guild_id)
     reactionroles = settings.get("reactionroles", {})
 
     key = f"{payload.message_id}_{str(payload.emoji)}"
@@ -434,7 +469,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> None:
     if payload.user_id == bot.user.id or not payload.guild_id:
         return
-    settings = await bot.settings.fetch_settings(payload.guild_id)
+    settings = bot.settings.get_settings(payload.guild_id)
     reactionroles = settings.get("reactionroles", {})
 
     key = f"{payload.message_id}_{str(payload.emoji)}"
@@ -457,84 +492,33 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if message.guild is None or message.author.bot:
+    if message.author.bot or message.guild is None:
         return
-    settings = bot.settings.get_settings(message.guild.id)
-    content = message.content.lower()
+    try:
+        await _handle_afk_return(message)
+        await _handle_afk_mentions(message)
 
-    # AFK system logic
-    if message.author.id in bot.afk_state:
-        record = bot.afk_state.pop(message.author.id)
-        duration = int(time.time() - record.since)
-        mins, secs = divmod(duration, 60)
-        hours, mins = divmod(mins, 60)
-        dur_str = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s" if mins else f"{secs}s"
-
-        reply = f"👋 Welcome back {message.author.mention}! You were AFK for {dur_str}."
-        if record.pings:
-            reply += f" You received {len(record.pings)} ping(s) while you were away."
-        try:
-            await message.channel.send(reply, allowed_mentions=discord.AllowedMentions(users=[message.author]))
-        except discord.HTTPException:
-            pass
-
-    if message.mentions:
-        for user in message.mentions:
-            if user.id in bot.afk_state and user.id != message.author.id:
-                record = bot.afk_state[user.id]
-                record.pings.append({
-                    "author": str(message.author),
-                    "url": message.jump_url,
-                    "content": message.content[:50]
-                })
+        # auto-purge
+        settings = bot.settings.get_settings(message.guild.id)
+        ap = settings.get("autopurge", {"channels": {}, "exempt_roles": []})
+        entry = ap["channels"].get(str(message.channel.id))
+        if entry and message.author.id != bot.user.id:
+            until = entry.get("until")
+            if until and time.time() > until:
+                ap["channels"].pop(str(message.channel.id), None)
+                bot.settings.update_settings(message.guild.id, {"autopurge": ap})
+            elif not any(r.id in ap["exempt_roles"] for r in getattr(message.author, "roles", [])):
                 try:
-                    await message.channel.send(f"💤 {user.mention} is currently AFK: **{discord.utils.escape_mentions(record.reason)}**", allowed_mentions=discord.AllowedMentions.none())
-                except discord.HTTPException:
-                    pass
-
-
-    # auto-purge
-    ap = settings.get("autopurge", {"channels": {}, "exempt_roles": []})
-    entry = ap["channels"].get(str(message.channel.id))
-    if entry and message.author.id != bot.user.id:
-        until = entry.get("until")
-        if until and time.time() > until:
-            ap["channels"].pop(str(message.channel.id), None)
-            bot.settings.update_settings(message.guild.id, {"autopurge": ap})
-        elif not any(r.id in ap["exempt_roles"] for r in getattr(message.author, "roles", [])):
-            try:
-                await message.delete()
-                return
-            except discord.HTTPException as e:
-                bot.log_error("autopurge", e)
-
-    # autoreact
-    autoreact = settings.get("autoreact", {})
-    if autoreact.get("enabled"):
-        for trigger, emoji in autoreact.get("triggers", {}).items():
-            if trigger in content:
-                try:
-                    await message.add_reaction(emoji)
+                    await message.delete()
+                    return
                 except discord.HTTPException as e:
-                    bot.log_error(f"autoreact '{trigger}'", e)
-        # legacy autoreact emojis (from main.py config style)
-        for emoji in autoreact.get("emojis", []):
-            try:
-                await message.add_reaction(emoji)
-            except discord.HTTPException:
-                pass
+                    bot.log_error("autopurge", e)
 
-    # autorespond
-    autorespond = settings.get("autorespond", {})
-    if autorespond.get("enabled"):
-        for trigger, response in autorespond.get("triggers", {}).items():
-            if trigger in content:
-                try:
-                    await message.channel.send(response)
-                except discord.HTTPException as e:
-                    bot.log_error(f"autorespond '{trigger}'", e)
-                break
-
+        await _apply_guild_automations(message)
+    except discord.DiscordException as exc:
+        log.error("on_message handler error: %s", exc)
+    except PyMongoError as exc:
+        log.error("on_message database error: %s", exc)
     await bot.process_commands(message)
 
 # --------------------------------------------------------------------------- #
@@ -544,12 +528,12 @@ async def on_message(message: discord.Message) -> None:
 @bot.hybrid_command(name="snipe", description="Show the last deleted message in this channel.")
 @commands.guild_only()
 async def snipe(ctx: commands.Context) -> None:
-    sniped: Optional[discord.Message] = bot.sniped_messages.get(ctx.channel.id)
+    sniped = bot.snipes.get(ctx.channel.id)
     if sniped is None:
         await ctx.send("❌ Nothing to snipe here.", ephemeral=True)
         return
     embed = discord.Embed(description=sniped.content, color=discord.Color.orange(), timestamp=sniped.created_at)
-    embed.set_author(name=sniped.author.display_name, icon_url=sniped.author.display_avatar.url)
+    embed.set_author(name=sniped.author, icon_url=sniped.author_avatar)
     deleted_ago: str = humanize_seconds((datetime.now(timezone.utc) - sniped.created_at).total_seconds())
     embed.set_footer(text=f"Sent {deleted_ago} ago")
     await ctx.send(embed=embed)
@@ -619,16 +603,16 @@ async def joinrole_cmd(ctx: commands.Context, *, role: str):
     if resolved is None:
         return await ctx.send("❌ No role found.", ephemeral=True)
 
-    settings = await bot.settings.fetch_settings(ctx.guild.id)
+    settings = bot.settings.get_settings(ctx.guild.id)
     joinroles = settings.get("joinroles", [])
 
     if str(resolved.id) in joinroles:
         joinroles.remove(str(resolved.id))
-        await bot.settings.push_settings(ctx.guild.id, {"joinroles": joinroles})
+        bot.settings.update_settings(ctx.guild.id, {"joinroles": joinroles})
         await ctx.send(f"✅ **{resolved.name}** will no longer be given to new joiners.")
     else:
         joinroles.append(str(resolved.id))
-        await bot.settings.push_settings(ctx.guild.id, {"joinroles": joinroles})
+        bot.settings.update_settings(ctx.guild.id, {"joinroles": joinroles})
         await ctx.send(f"✅ **{resolved.name}** will now be given to all new joiners.")
 
 @bot.hybrid_command(name="roleall", description="Give every member a specific role.")
@@ -685,17 +669,17 @@ async def reactionrole_cmd(ctx: commands.Context, link: str, emoji: str, *, role
     except discord.HTTPException:
         return await ctx.send("❌ Failed to add reaction. Ensure it is a valid default emoji or a server emoji I have access to.", ephemeral=True)
 
-    settings = await bot.settings.fetch_settings(ctx.guild.id)
+    settings = bot.settings.get_settings(ctx.guild.id)
     reactionroles = settings.get("reactionroles", {})
     key = f"{msg.id}_{emoji}"
 
     if key in reactionroles and reactionroles[key] == str(resolved.id):
         del reactionroles[key]
-        await bot.settings.push_settings(ctx.guild.id, {"reactionroles": reactionroles})
+        bot.settings.update_settings(ctx.guild.id, {"reactionroles": reactionroles})
         await ctx.send(f"✅ Removed reaction role **{resolved.name}** from that message.")
     else:
         reactionroles[key] = str(resolved.id)
-        await bot.settings.push_settings(ctx.guild.id, {"reactionroles": reactionroles})
+        bot.settings.update_settings(ctx.guild.id, {"reactionroles": reactionroles})
         await ctx.send(f"✅ Added reaction role **{resolved.name}** to that message. Users who react with {emoji} will receive the role.")
 
 @bot.hybrid_command(name="reaction", description="Make the bot react to a message.")
@@ -772,17 +756,17 @@ async def untimeout_cmd(ctx: commands.Context, user: discord.Member):
 @commands.guild_only()
 async def warn_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optional[str] = "No reason given"):
     if not member_has_perms(ctx.author, manage_messages=True): return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
-    settings = await bot.settings.fetch_settings(ctx.guild.id)
+    settings = bot.settings.get_settings(ctx.guild.id)
     warns = settings.setdefault("warns", {})
     uw = warns.setdefault(str(user.id), [])
     uw.append({"reason": reason, "by": ctx.author.id, "at": int(time.time())})
-    await bot.settings.push_settings(ctx.guild.id, {"warns": warns})
+    bot.settings.update_settings(ctx.guild.id, {"warns": warns})
     await ctx.send(f"⚠️ **{user}** was warned. Reason: {reason}")
 
 @bot.hybrid_command(name="warnings", description="Show a member's warnings")
 @commands.guild_only()
 async def warnings_cmd(ctx: commands.Context, user: discord.Member):
-    settings = await bot.settings.fetch_settings(ctx.guild.id)
+    settings = bot.settings.get_settings(ctx.guild.id)
     uw = settings.get("warns", {}).get(str(user.id), [])
     if not uw: return await ctx.send(f"**{user}** has no warnings.")
     desc = "\n".join(f"<t:{w['at']}:d> by <@{w['by']}>: {w['reason']}" for w in uw)
@@ -793,11 +777,11 @@ async def warnings_cmd(ctx: commands.Context, user: discord.Member):
 @commands.guild_only()
 async def clearwarns_cmd(ctx: commands.Context, user: discord.Member):
     if not member_has_perms(ctx.author, manage_messages=True): return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
-    settings = await bot.settings.fetch_settings(ctx.guild.id)
+    settings = bot.settings.get_settings(ctx.guild.id)
     warns = settings.get("warns", {})
     if str(user.id) in warns:
         del warns[str(user.id)]
-        await bot.settings.push_settings(ctx.guild.id, {"warns": warns})
+        bot.settings.update_settings(ctx.guild.id, {"warns": warns})
     await ctx.send(f"✅ Cleared warnings for **{user}**.")
 
 @bot.hybrid_command(name="purge", description="Delete the last N messages in this channel")
@@ -980,7 +964,7 @@ async def echoset(ctx: commands.Context, state: Literal["on", "off"]) -> None:
         )
         return
     enabled: bool = state == "on"
-    saved: bool = await bot.settings.push_settings(ctx.guild.id, {"echoset": enabled})  # type: ignore[union-attr]
+    saved: bool = bot.settings.update_settings(ctx.guild.id, {"echoset": enabled})  # type: ignore[union-attr]
     if saved:
         await ctx.send(f"📢 Echo is now **{'enabled' if enabled else 'disabled'}** for this server.")
     else:
@@ -1009,7 +993,7 @@ async def echo(
         await ctx.send("❌ You must provide a message to echo.", ephemeral=True)
         return
 
-    settings: Dict[str, Any] = await bot.settings.fetch_settings(guild.id)
+    settings: Dict[str, Any] = bot.settings.get_settings(guild.id)
     if not settings.get("echoset", False):
         await ctx.send(
             "❌ Echo is disabled on this server. An admin can enable it with `/echoset on`.",
@@ -1073,6 +1057,10 @@ async def afk(ctx: commands.Context, *, reason: str = "AFK") -> None:
 # --------------------------------------------------------------------------- #
 # Error Handling
 
+# Operational error trapping (prefix + slash, one funnel)
+# --------------------------------------------------------------------------- #
+
+
 async def _report_error(ctx: commands.Context, error: commands.CommandError) -> None:
     if isinstance(error, commands.CommandNotFound):
         return
@@ -1082,7 +1070,7 @@ async def _report_error(ctx: commands.Context, error: commands.CommandError) -> 
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(
             f"❌ Missing argument: `{error.param.name}`. "
-            f"Check `!help {ctx.invoked_with}` for usage.",
+            f"Check `{COMMAND_PREFIX}help {ctx.invoked_with}` for usage.",
             ephemeral=True,
         )
         return
@@ -1099,7 +1087,9 @@ async def _report_error(ctx: commands.Context, error: commands.CommandError) -> 
         await ctx.send(f"❌ {error}", ephemeral=True)
         return
     if isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f"⏳ Slow down — try again in {error.retry_after:.1f}s.", ephemeral=True)
+        await ctx.send(
+            f"⏳ Slow down — try again in {error.retry_after:.1f}s.", ephemeral=True
+        )
         return
     if isinstance(error, commands.CheckFailure):
         await ctx.send("❌ You don't have permission to use this command.", ephemeral=True)
@@ -1108,7 +1098,10 @@ async def _report_error(ctx: commands.Context, error: commands.CommandError) -> 
     original: BaseException = getattr(error, "original", error)
     if isinstance(original, PyMongoError):
         log.error("Database error in command '%s': %s", ctx.command, original)
-        await ctx.send("⚠️ The database is temporarily unreachable — please try again shortly.", ephemeral=True)
+        await ctx.send(
+            "⚠️ The database is temporarily unreachable — please try again shortly.",
+            ephemeral=True,
+        )
         return
     if isinstance(original, discord.Forbidden):
         await ctx.send("❌ I'm missing the Discord permissions to do that.", ephemeral=True)
@@ -1120,6 +1113,7 @@ async def _report_error(ctx: commands.Context, error: commands.CommandError) -> 
     except discord.DiscordException:
         pass
 
+
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
     try:
@@ -1127,10 +1121,12 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
     except discord.DiscordException as exc:
         log.error("Failed to report command error: %s", exc)
 
+
 @bot.tree.error
 async def on_app_command_error(
     interaction: discord.Interaction, error: app_commands.AppCommandError
 ) -> None:
+    # Hybrid commands funnel through on_command_error; this catches the rest.
     log.error("App command error: %s", error)
     message: str = "⚠️ Something went wrong while running that command."
     if isinstance(error, app_commands.CheckFailure):
@@ -1142,6 +1138,11 @@ async def on_app_command_error(
             await interaction.response.send_message(message, ephemeral=True)
     except discord.DiscordException:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Render keepalive (only when Render injects PORT, i.e. Web Service mode)
+# --------------------------------------------------------------------------- #
 
 # --------------------------------------------------------------------------- #
 # Reminder Loop
@@ -1182,7 +1183,7 @@ async def _start_keepalive_server() -> None:
     from aiohttp import web
 
     async def health(_: web.Request) -> web.Response:
-        return web.Response(text="Bot is alive")
+        return web.Response(text="OK")
 
     app: web.Application = web.Application()
     app.router.add_get("/", health)
@@ -1192,6 +1193,165 @@ async def _start_keepalive_server() -> None:
     site: web.TCPSite = web.TCPSite(runner, "0.0.0.0", int(port))
     await site.start()
     log.info("Keepalive HTTP server listening on port %s.", port)
+
+async def _apply_guild_automations(message: discord.Message) -> None:
+    """Cache-first settings lookup drives autoreact / autorespond."""
+    assert message.guild is not None
+    settings = bot.settings.get_settings(message.guild.id)
+
+    autoreact: Dict[str, Any] = settings.get("autoreact") or {}
+    if autoreact.get("enabled") and autoreact.get("emojis"):
+        for emoji in list(autoreact["emojis"])[:5]:
+            try:
+                await message.add_reaction(emoji)
+            except (discord.HTTPException, discord.Forbidden, TypeError):
+                continue
+
+    autorespond: Dict[str, Any] = settings.get("autorespond") or {}
+    if autorespond.get("enabled") and autorespond.get("triggers"):
+        lowered: str = message.content.casefold()
+        for trigger, response in dict(autorespond["triggers"]).items():
+            if trigger.casefold() in lowered:
+                await message.channel.send(
+                    str(response)[:2000],
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                break  # one response per message
+
+
+async def _handle_afk_return(message: discord.Message) -> None:
+    """Clear AFK only after the 15s grace window, then print the ping summary."""
+    record: Optional[AfkRecord] = bot.afk_state.get(message.author.id)
+    if record is None:
+        return
+    elapsed: float = time.time() - record.since
+    if elapsed < AFK_GRACE_SECONDS:
+        return  # inside the grace window — AFK status stays
+    bot.afk_state.pop(message.author.id, None)
+
+    embed: discord.Embed = discord.Embed(
+        title="👋 Welcome back!",
+        description=(
+            f"{message.author.mention}, your AFK status has been removed "
+            f"(away for {humanize_seconds(elapsed)})."
+        ),
+        color=discord.Color.green(),
+    )
+    if record.pings:
+        lines: List[str] = []
+        for ping in record.pings[-10:]:
+            ago: str = humanize_seconds(time.time() - ping.timestamp)
+            content_text: str = ping.content if len(ping.content) <= 80 else ping.content[:80] + "…"
+            lines.append(f"• **{ping.author}** — {ago} ago: {content_text or '*<no text>*'}")
+        overflow: str = (
+            f"\n…and {len(record.pings) - 10} more." if len(record.pings) > 10 else ""
+        )
+        embed.add_field(
+            name=f"📬 Pings while you were away ({len(record.pings)})",
+            value=("\n".join(lines) + overflow)[:1024],
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="📬 Pings",
+            value="Nobody pinged you while you were away.",
+            inline=False,
+        )
+    await message.channel.send(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+async def _handle_afk_mentions(message: discord.Message) -> None:
+    """Log pings against AFK users and announce their AFK status."""
+    notices: List[str] = []
+    for user in message.mentions:
+        record: Optional[AfkRecord] = bot.afk_state.get(user.id)
+        if record is None or user.id == message.author.id:
+            continue
+        record.pings.append(
+            AfkPing(
+                author=str(message.author),
+                content=message.content[:200],
+                timestamp=time.time(),
+                jump_url=message.jump_url,
+            )
+        )
+        notices.append(
+            f"💤 **{getattr(user, 'display_name', str(user))}** is AFK "
+            f"({humanize_seconds(time.time() - record.since)} ago): {record.reason}"
+        )
+    if notices:
+        await message.channel.send(
+            "\n".join(notices[:5]), allowed_mentions=discord.AllowedMentions.none()
+        )
+
+@bot.hybrid_command(name="autorespond", description="Manage autoresponses.")
+async def autorespond_cmd(
+    ctx: commands.Context,
+    action: Literal["on", "off", "add", "remove"],
+    trigger: Optional[str] = None,
+    *,
+    response: Optional[str] = None,
+) -> None:
+    if not isinstance(ctx.author, discord.Member) or not member_has_perms(
+        ctx.author, manage_guild=True
+    ):
+        await ctx.send("❌ You need the **Manage Server** permission for this.", ephemeral=True)
+        return
+    settings: Dict[str, Any] = bot.settings.get_settings(ctx.guild.id)  # type: ignore[union-attr]
+    conf: Dict[str, Any] = dict(settings.get("autorespond") or {"enabled": False, "triggers": {}})
+    triggers: Dict[str, str] = dict(conf.get("triggers") or {})
+
+    if action in ("on", "off"):
+        conf["enabled"] = action == "on"
+    elif action == "add":
+        if not trigger or not response:
+            await ctx.send("❌ `add` needs both a trigger and a response.", ephemeral=True)
+            return
+        triggers[trigger[:100]] = response[:500]
+        conf["triggers"] = triggers
+    else:  # remove
+        if not trigger or trigger not in triggers:
+            await ctx.send("❌ That trigger does not exist.", ephemeral=True)
+            return
+        triggers.pop(trigger, None)
+        conf["triggers"] = triggers
+
+    saved: bool = bot.settings.update_settings(ctx.guild.id, {"autorespond": conf})  # type: ignore[union-attr]
+    await ctx.send(
+        f"{'✅' if saved else '⚠️'} Autorespond is **{'enabled' if conf.get('enabled') else 'disabled'}** "
+        f"with **{len(triggers)}** trigger(s)."
+        + ("" if saved else " (database write failed)"),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.hybrid_command(name="autoreact", description="Manage autoreactions.")
+async def autoreact_cmd(
+    ctx: commands.Context, state: Literal["on", "off"], *, emojis: Optional[str] = None
+) -> None:
+    if not isinstance(ctx.author, discord.Member) or not member_has_perms(
+        ctx.author, manage_guild=True
+    ):
+        await ctx.send("❌ You need the **Manage Server** permission for this.", ephemeral=True)
+        return
+    settings: Dict[str, Any] = bot.settings.get_settings(ctx.guild.id)  # type: ignore[union-attr]
+    conf: Dict[str, Any] = dict(settings.get("autoreact") or {"enabled": False, "emojis": []})
+    conf["enabled"] = state == "on"
+    if emojis:
+        conf["emojis"] = emojis.split()[:5]
+    saved: bool = bot.settings.update_settings(ctx.guild.id, {"autoreact": conf})  # type: ignore[union-attr]
+    status: str = "enabled" if conf["enabled"] else "disabled"
+    emoji_list: str = " ".join(conf.get("emojis") or []) or "*(none set)*"
+    await ctx.send(
+        f"{'✅' if saved else '⚠️'} Autoreact **{status}** — emojis: {emoji_list}"
+        + ("" if saved else " (database write failed)"),
+    )
+
+
+
+
 
 # --------------------------------------------------------------------------- #
 # Entrypoint
