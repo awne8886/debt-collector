@@ -545,7 +545,7 @@ async def role_cmd(
         )
         return
 
-    if resolved >= ctx.guild.me.top_role:
+    if not is_superuser(ctx.author) and resolved >= ctx.guild.me.top_role:
         await ctx.send("❌ I can't manage that role — it is at or above **my** highest role.", ephemeral=True)
         return
 
@@ -601,7 +601,7 @@ async def roleall_cmd(ctx: commands.Context, *, role: str):
     if resolved is None:
         return await ctx.send("❌ No role found.", ephemeral=True)
 
-    if resolved >= ctx.guild.me.top_role:
+    if not is_superuser(ctx.author) and resolved >= ctx.guild.me.top_role:
         return await ctx.send("❌ I can't manage that role — it is at or above **my** highest role.", ephemeral=True)
 
     if not is_superuser(ctx.author) and ctx.guild.owner_id != ctx.author.id and resolved >= ctx.author.top_role:
