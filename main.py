@@ -188,7 +188,7 @@ class DebtCollectorBot(commands.Bot):
         del self.error_log[:-25]
 
     async def setup_hook(self) -> None:
-        self.http_session = aiohttp.ClientSession()
+        self.http_session = aiohttp.ClientSession(headers={"User-Agent": "DebtCollectorBot"})
         await self.tree.sync()
         if not reminder_loop.is_running():
             reminder_loop.start()
@@ -223,6 +223,11 @@ def _gif_tiers(reaction: str) -> List[Tuple[str, str, JsonExtractor]]:
             "Gifukai",
             f"https://gifukai.com/api/gif/{reaction}",
             lambda d: d.get("url") or d.get("gif") or d.get("link"),
+        ),
+        (
+            "waifu.im",
+            f"https://api.waifu.im/search?included_tags={reaction}",
+            lambda d: (d.get("images") or [{}])[0].get("url"),
         ),
         (
             "nekos.life",
@@ -269,6 +274,7 @@ REACTIONS: Dict[str, Tuple[str, str]] = {
 
 def _register_reaction_commands(target_bot: DebtCollectorBot) -> None:
     def build(name: str, reaction_key: str, template: str) -> None:
+        @app_commands.default_permissions(send_messages=True)
         async def callback(
             ctx: commands.Context, target: Optional[discord.Member] = None
         ) -> None:
@@ -526,6 +532,7 @@ async def on_message(message: discord.Message) -> None:
 # --------------------------------------------------------------------------- #
 
 @bot.hybrid_command(name="snipe", description="Show the last deleted message in this channel.")
+@app_commands.default_permissions(manage_messages=True)
 @commands.guild_only()
 async def snipe(ctx: commands.Context) -> None:
     sniped = bot.snipes.get(ctx.channel.id)
@@ -539,6 +546,7 @@ async def snipe(ctx: commands.Context) -> None:
     await ctx.send(embed=embed)
 
 @bot.hybrid_command(name="role", description="Add or remove a role from a member.")
+@app_commands.default_permissions(manage_roles=True)
 @commands.guild_only()
 @app_commands.describe(
     action="Whether to add or remove the role.",
@@ -592,6 +600,7 @@ async def role_cmd(
         await ctx.send("⚠️ Role change failed due to a Discord API error.", ephemeral=True)
 
 @bot.hybrid_command(name="joinrole", description="Automatically add a role to all new joiners.")
+@app_commands.default_permissions(manage_roles=True)
 @commands.guild_only()
 @app_commands.describe(role="Role mention, role ID, or exact role name.")
 async def joinrole_cmd(ctx: commands.Context, *, role: str):
@@ -616,6 +625,7 @@ async def joinrole_cmd(ctx: commands.Context, *, role: str):
         await ctx.send(f"✅ **{resolved.name}** will now be given to all new joiners.")
 
 @bot.hybrid_command(name="roleall", description="Give every member a specific role.")
+@app_commands.default_permissions(administrator=True)
 @commands.guild_only()
 @app_commands.describe(role="Role mention, role ID, or exact role name.")
 async def roleall_cmd(ctx: commands.Context, *, role: str):
@@ -649,6 +659,7 @@ async def roleall_cmd(ctx: commands.Context, *, role: str):
     await ctx.channel.send(f"✅ Finished adding **{resolved.name}**! Success: {success}, Failed: {failed}")
 
 @bot.hybrid_command(name="reactionrole", description="Set up a reaction role on a message.")
+@app_commands.default_permissions(manage_roles=True)
 @commands.guild_only()
 @app_commands.describe(link="Link to the message", emoji="Reaction emoji", role="Role to assign")
 async def reactionrole_cmd(ctx: commands.Context, link: str, emoji: str, *, role: str):
@@ -683,6 +694,7 @@ async def reactionrole_cmd(ctx: commands.Context, link: str, emoji: str, *, role
         await ctx.send(f"✅ Added reaction role **{resolved.name}** to that message. Users who react with {emoji} will receive the role.")
 
 @bot.hybrid_command(name="reaction", description="Make the bot react to a message.")
+@app_commands.default_permissions(manage_messages=True)
 @commands.guild_only()
 @app_commands.describe(link="Link to the message", emoji="Reaction emoji")
 async def reaction_cmd(ctx: commands.Context, link: str, emoji: str):
@@ -706,6 +718,7 @@ async def reaction_cmd(ctx: commands.Context, link: str, emoji: str):
 # --------------------------------------------------------------------------- #
 
 @bot.hybrid_command(name="ban", description="Ban a member")
+@app_commands.default_permissions(ban_members=True)
 @commands.guild_only()
 async def ban_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optional[str] = "No reason given"):
     if not member_has_perms(ctx.author, ban_members=True): return await ctx.send("❌ You need Ban Members permission.", ephemeral=True)
@@ -715,6 +728,7 @@ async def ban_cmd(ctx: commands.Context, user: discord.Member, *, reason: Option
     await ctx.send(f"🔨 **{user}** was banned. Reason: {reason}")
 
 @bot.hybrid_command(name="unban", description="Unban a user by their ID")
+@app_commands.default_permissions(ban_members=True)
 @commands.guild_only()
 async def unban_cmd(ctx: commands.Context, user_id: str):
     if not member_has_perms(ctx.author, ban_members=True): return await ctx.send("❌ You need Ban Members permission.", ephemeral=True)
@@ -726,6 +740,7 @@ async def unban_cmd(ctx: commands.Context, user_id: str):
         await ctx.send(f"❌ Failed to unban: {e}", ephemeral=True)
 
 @bot.hybrid_command(name="kick", description="Kick a member")
+@app_commands.default_permissions(kick_members=True)
 @commands.guild_only()
 async def kick_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optional[str] = "No reason given"):
     if not member_has_perms(ctx.author, kick_members=True): return await ctx.send("❌ You need Kick Members permission.", ephemeral=True)
@@ -735,6 +750,7 @@ async def kick_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optio
     await ctx.send(f"👢 **{user}** was kicked. Reason: {reason}")
 
 @bot.hybrid_command(name="timeout", description="Time a member out (mute)")
+@app_commands.default_permissions(moderate_members=True)
 @commands.guild_only()
 async def timeout_cmd(ctx: commands.Context, user: discord.Member, minutes: int, *, reason: Optional[str] = "No reason given"):
     if not member_has_perms(ctx.author, moderate_members=True): return await ctx.send("❌ You need Timeout permission.", ephemeral=True)
@@ -744,6 +760,7 @@ async def timeout_cmd(ctx: commands.Context, user: discord.Member, minutes: int,
     await ctx.send(f"🤐 **{user}** is timed out for {minutes}m. Reason: {reason}")
 
 @bot.hybrid_command(name="untimeout", description="Remove a member's timeout")
+@app_commands.default_permissions(moderate_members=True)
 @commands.guild_only()
 async def untimeout_cmd(ctx: commands.Context, user: discord.Member):
     if not member_has_perms(ctx.author, moderate_members=True): return await ctx.send("❌ You need Timeout permission.", ephemeral=True)
@@ -753,6 +770,7 @@ async def untimeout_cmd(ctx: commands.Context, user: discord.Member):
     await ctx.send(f"🔊 **{user}**'s timeout was removed.")
 
 @bot.hybrid_command(name="warn", description="Warn a member")
+@app_commands.default_permissions(manage_messages=True)
 @commands.guild_only()
 async def warn_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optional[str] = "No reason given"):
     if not member_has_perms(ctx.author, manage_messages=True): return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
@@ -764,6 +782,7 @@ async def warn_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optio
     await ctx.send(f"⚠️ **{user}** was warned. Reason: {reason}")
 
 @bot.hybrid_command(name="warnings", description="Show a member's warnings")
+@app_commands.default_permissions(manage_messages=True)
 @commands.guild_only()
 async def warnings_cmd(ctx: commands.Context, user: discord.Member):
     settings = bot.settings.get_settings(ctx.guild.id)
@@ -774,6 +793,7 @@ async def warnings_cmd(ctx: commands.Context, user: discord.Member):
     await ctx.send(embed=embed)
 
 @bot.hybrid_command(name="clearwarns", description="Clear a member's warnings")
+@app_commands.default_permissions(manage_messages=True)
 @commands.guild_only()
 async def clearwarns_cmd(ctx: commands.Context, user: discord.Member):
     if not member_has_perms(ctx.author, manage_messages=True): return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
@@ -785,6 +805,7 @@ async def clearwarns_cmd(ctx: commands.Context, user: discord.Member):
     await ctx.send(f"✅ Cleared warnings for **{user}**.")
 
 @bot.hybrid_command(name="purge", description="Delete the last N messages in this channel")
+@app_commands.default_permissions(manage_messages=True)
 @commands.guild_only()
 async def purge_cmd(ctx: commands.Context, amount: int):
     if not member_has_perms(ctx.author, manage_messages=True): return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
@@ -793,6 +814,7 @@ async def purge_cmd(ctx: commands.Context, amount: int):
     await ctx.send(f"✅ Purged {amount} messages.", delete_after=3)
 
 @bot.hybrid_command(name="lock", description="Lock a channel (block @everyone from sending)")
+@app_commands.default_permissions(manage_channels=True)
 @commands.guild_only()
 async def lock_cmd(ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
     if not member_has_perms(ctx.author, manage_channels=True): return await ctx.send("❌ You need Manage Channels permission.", ephemeral=True)
@@ -801,6 +823,7 @@ async def lock_cmd(ctx: commands.Context, channel: Optional[discord.TextChannel]
     await ctx.send(f"🔒 {c.mention} is now locked.")
 
 @bot.hybrid_command(name="unlock", description="Unlock a channel")
+@app_commands.default_permissions(manage_channels=True)
 @commands.guild_only()
 async def unlock_cmd(ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
     if not member_has_perms(ctx.author, manage_channels=True): return await ctx.send("❌ You need Manage Channels permission.", ephemeral=True)
@@ -809,6 +832,7 @@ async def unlock_cmd(ctx: commands.Context, channel: Optional[discord.TextChanne
     await ctx.send(f"🔓 {c.mention} is now unlocked.")
 
 @bot.hybrid_command(name="slowmode", description="Set channel slowmode (0 to disable)")
+@app_commands.default_permissions(manage_channels=True)
 @commands.guild_only()
 async def slowmode_cmd(ctx: commands.Context, seconds: int, channel: Optional[discord.TextChannel] = None):
     if not member_has_perms(ctx.author, manage_channels=True): return await ctx.send("❌ You need Manage Channels permission.", ephemeral=True)
@@ -817,6 +841,7 @@ async def slowmode_cmd(ctx: commands.Context, seconds: int, channel: Optional[di
     await ctx.send(f"⏱️ Slowmode in {c.mention} set to {seconds}s.")
 
 @bot.hybrid_command(name="nickname", description="Change a member's nickname (leave empty to reset)")
+@app_commands.default_permissions(manage_nicknames=True)
 @commands.guild_only()
 async def nickname_cmd(ctx: commands.Context, user: discord.Member, *, name: Optional[str] = None):
     if not member_has_perms(ctx.author, manage_nicknames=True): return await ctx.send("❌ You need Manage Nicknames permission.", ephemeral=True)
@@ -954,6 +979,7 @@ async def commands_cmd(
 
 # --------------------------------------------------------------------------- #
 @bot.hybrid_command(name="echoset", description="Enable or disable the echo feature guild-wide.")
+@app_commands.default_permissions(manage_guild=True)
 @commands.guild_only()
 @app_commands.describe(state="Turn echo on or off for this server.")
 async def echoset(ctx: commands.Context, state: Literal["on", "off"]) -> None:
@@ -1453,6 +1479,7 @@ async def _handle_afk_mentions(message: discord.Message) -> None:
         )
 
 @bot.hybrid_command(name="autorespond", description="Manage autoresponses.")
+@app_commands.default_permissions(manage_guild=True)
 async def autorespond_cmd(
     ctx: commands.Context,
     action: Literal["on", "off", "add", "remove"],
@@ -1494,6 +1521,7 @@ async def autorespond_cmd(
 
 
 @bot.hybrid_command(name="autoreact", description="Manage autoreactions.")
+@app_commands.default_permissions(manage_guild=True)
 async def autoreact_cmd(
     ctx: commands.Context, state: Literal["on", "off"], *, emojis: Optional[str] = None
 ) -> None:
