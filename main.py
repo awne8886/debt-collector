@@ -906,6 +906,8 @@ async def help_cmd(ctx: commands.Context):
     await ctx.send(embed=embed, ephemeral=True)
 
 CONFIG_CMDS = [
+    "/errors",
+
     "/autoreact ...",
     "/autorespond ...",
     "/set prefix <prefix>",
@@ -1056,6 +1058,170 @@ async def afk(ctx: commands.Context, *, reason: str = "AFK") -> None:
 
 # --------------------------------------------------------------------------- #
 # Error Handling
+
+
+# ================= /autopurge =================
+@bot.hybrid_group(name="autopurge", description="Auto-delete every new message in selected channels")
+@commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def autopurge_group(ctx: commands.Context):
+    if ctx.invoked_subcommand is None:
+        await ctx.send(f"Invalid subcommand. Try `{ctx.clean_prefix}help autopurge`.", ephemeral=True)
+
+@autopurge_group.command(name="on", description="Start auto-deleting every new message in a channel")
+@app_commands.describe(
+    channel="Channel to auto-purge (default: this one)",
+    hours="Optional: automatically stop after this many hours",
+    days="Optional: automatically stop after this many days",
+)
+async def autopurge_on(
+    ctx: commands.Context,
+    channel: Optional[discord.TextChannel] = None,
+    hours: Optional[app_commands.Range[int, 1, 720]] = None,
+    days: Optional[app_commands.Range[int, 1, 365]] = None,
+):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    channel = channel or ctx.channel
+    if not channel.permissions_for(ctx.guild.me).manage_messages:
+        return await ctx.send(
+            f"❌ I need the **Manage Messages** permission in {channel.mention} to do that.",
+            ephemeral=True,
+        )
+
+    until = None
+    if hours or days:
+        until = int(time.time()) + (hours or 0) * 3600 + (days or 0) * 86400
+
+    settings = bot.settings.get_settings(ctx.guild.id)
+    ap = settings.setdefault("autopurge", {"channels": {}, "exempt_roles": []})
+    ap["channels"][str(channel.id)] = {"until": until}
+    bot.settings.update_settings(ctx.guild.id, settings)
+
+    when = f"until <t:{until}:f>" if until else "until you run `/autopurge off`"
+    await ctx.send(
+        f"🧹 Auto-purge is now **on** in {channel.mention} {when}. "
+        "Every new message there will be deleted, except from exempt roles "
+        "(`/autopurge exempt add <role>`).",
+        ephemeral=True,
+    )
+
+@autopurge_group.command(name="off", description="Stop auto-deleting in a channel")
+@app_commands.describe(channel="Channel (default: this one)")
+async def autopurge_off(ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    channel = channel or ctx.channel
+    settings = bot.settings.get_settings(ctx.guild.id)
+    ap = settings.get("autopurge", {"channels": {}, "exempt_roles": []})
+    removed = ap["channels"].pop(str(channel.id), None)
+
+    if removed:
+        bot.settings.update_settings(ctx.guild.id, settings)
+
+    msg = (
+        f"✅ Auto-purge turned off in {channel.mention}."
+        if removed else f"Auto-purge wasn't active in {channel.mention}."
+    )
+    await ctx.send(msg, ephemeral=True)
+
+@autopurge_group.command(name="exempt", description="Add/remove a role whose messages are never auto-deleted")
+@app_commands.describe(action="add or remove", role="The role to exempt")
+async def autopurge_exempt(
+    ctx: commands.Context,
+    action: Literal["add", "remove"],
+    role: discord.Role,
+):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    settings = bot.settings.get_settings(ctx.guild.id)
+    ap = settings.setdefault("autopurge", {"channels": {}, "exempt_roles": []})
+    exempt = ap["exempt_roles"]
+
+    if action == "add":
+        if role.id not in exempt:
+            exempt.append(role.id)
+        msg = f"✅ Messages from {role.mention} will be left alone."
+    elif role.id in exempt:
+        exempt.remove(role.id)
+        msg = f"✅ {role.mention} is no longer exempt."
+    else:
+        msg = f"{role.mention} wasn't exempt."
+
+    bot.settings.update_settings(ctx.guild.id, settings)
+    await ctx.send(msg, ephemeral=True)
+
+@autopurge_group.command(name="status", description="Where auto-purge is active and which roles are exempt")
+async def autopurge_status(ctx: commands.Context):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    settings = bot.settings.get_settings(ctx.guild.id)
+    ap = settings.get("autopurge", {"channels": {}, "exempt_roles": []})
+    now = time.time()
+    lines = []
+
+    for cid, c in ap["channels"].items():
+        until = c.get("until")
+        if until and now > until:
+            continue  # expired, will be cleaned up automatically
+        lines.append(f"<#{cid}> — " + (f"until <t:{until}:f>" if until else "until turned off"))
+
+    embed = discord.Embed(title="Auto-purge status", color=discord.Color.blurple())
+    embed.add_field(name="Active channels", value="\n".join(lines)[:1024] or "Not active anywhere.", inline=False)
+    embed.add_field(
+        name="Exempt roles",
+        value=" ".join(f"<@&{r}>" for r in ap["exempt_roles"])[:1024] or "None",
+        inline=False,
+    )
+    await ctx.send(embed=embed, ephemeral=True)
+
+# ================= /set =================
+@bot.hybrid_group(name="set", description="Bot settings")
+@commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def set_group(ctx: commands.Context):
+    if ctx.invoked_subcommand is None:
+        await ctx.send(f"Invalid subcommand. Try `{ctx.clean_prefix}help set`.", ephemeral=True)
+
+@set_group.command(name="prefix", description="Set the chat command prefix for this server (default !)")
+@app_commands.describe(prefix="New prefix, e.g. ! or x (max 5 characters)")
+async def set_prefix_cmd(ctx: commands.Context, prefix: str):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+    prefix = prefix.strip()
+    if not prefix or len(prefix) > 5:
+        return await ctx.send("❌ Prefix must be 1-5 characters.", ephemeral=True)
+
+    settings = bot.settings.get_settings(ctx.guild.id)
+    settings["prefix"] = prefix
+    bot.settings.update_settings(ctx.guild.id, settings)
+    await ctx.send(f"✅ Prefix set to `{prefix}` — try `{prefix}ping` or `{prefix}hug @someone`.", ephemeral=True)
+
+@bot.hybrid_command(name="errors", description="Show the bot's recent errors (admin)")
+@app_commands.default_permissions(administrator=True)
+@commands.guild_only()
+async def errors_cmd(ctx: commands.Context):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    if not bot.error_log:
+        return await ctx.send("✅ No errors recorded since the last restart.", ephemeral=True)
+
+    lines = [
+        f"<t:{e['at']}:R> · **{e['where']}** — `{e['error']}`"
+        for e in reversed(bot.error_log)
+    ]
+    embed = discord.Embed(
+        title="Recent errors (newest first)",
+        description="\n".join(lines)[:4000],
+        color=0xE74C3C,
+    )
+    await ctx.send(embed=embed, ephemeral=True)
+
 
 # Operational error trapping (prefix + slash, one funnel)
 # --------------------------------------------------------------------------- #
