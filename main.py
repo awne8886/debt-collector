@@ -743,7 +743,7 @@ async def warnings_cmd(ctx: commands.Context, user: discord.Member):
     settings = await bot.settings.fetch_settings(ctx.guild.id)
     uw = settings.get("warns", {}).get(str(user.id), [])
     if not uw: return await ctx.send(f"**{user}** has no warnings.")
-    desc = "\n".join(f"<t:{w["at"]}:d> by <@{w["by"]}>: {w["reason"]}" for w in uw)
+    desc = "\n".join(f"<t:{w['at']}:d> by <@{w['by']}>: {w['reason']}" for w in uw)
     embed = discord.Embed(title=f"Warnings for {user}", description=desc, color=discord.Color.red())
     await ctx.send(embed=embed)
 
