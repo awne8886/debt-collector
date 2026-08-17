@@ -58,7 +58,7 @@ AFK_GRACE_SECONDS: float = 15.0
 COMMAND_PREFIX: str = "!"
 MONGO_DB_NAME: str = "debt_collector"
 MONGO_COLLECTION_NAME: str = "guild_settings"
-MARKOV_COLLECTION_NAME: str = "markov_chains"
+AI_HISTORY_COLLECTION_NAME: str = "ai_history"
 
 SUPERUSER_IDS: frozenset = frozenset(
     {1120393965485703219, 600689350686146562, 760531428881465366}
@@ -122,7 +122,7 @@ class MultiTenantSettingsManager:
             retryWrites=True,
         )
         self._collection: Collection = self._client[MONGO_DB_NAME][MONGO_COLLECTION_NAME]
-        self.markov: Collection = self._client[MONGO_DB_NAME][MARKOV_COLLECTION_NAME]
+        self.ai_history: Collection = self._client[MONGO_DB_NAME][AI_HISTORY_COLLECTION_NAME]
         self._cache: Dict[int, Dict[str, Any]] = {}
 
     def get_settings(self, guild_id: int) -> Dict[str, Any]:
@@ -178,6 +178,45 @@ class MultiTenantSettingsManager:
 # Bot setup
 # --------------------------------------------------------------------------- #
 
+
+# --------------------------------------------------------------------------- #
+# AI Flush Loop
+# --------------------------------------------------------------------------- #
+
+async def ai_flush() -> None:
+    """Flush pending AI history to MongoDB to save operations."""
+    if not bot.ai_history_dirty:
+        return
+
+    dirty_channels = list(bot.ai_history_dirty)
+    bot.ai_history_dirty.clear()
+
+    operations = []
+    for channel_id in dirty_channels:
+        history = bot.ai_history_buffer.get(channel_id, [])
+        if history:
+            operations.append(
+                UpdateOne(
+                    {"channel_id": str(channel_id)},
+                    {"$set": {"history": history}},
+                    upsert=True
+                )
+            )
+
+    if operations:
+        try:
+            await asyncio.to_thread(bot.settings.ai_history.bulk_write, operations, ordered=False)
+        except PyMongoError as exc:
+            bot.log_error("ai:flush", exc)
+
+@tasks.loop(seconds=60.0)
+async def ai_flush_loop() -> None:
+    await ai_flush()
+
+@ai_flush_loop.before_loop
+async def before_ai_flush_loop() -> None:
+    await bot.wait_until_ready()
+
 class DebtCollectorBot(commands.Bot):
     def __init__(self, settings_manager: MultiTenantSettingsManager) -> None:
         intents: discord.Intents = discord.Intents.default()
@@ -195,14 +234,11 @@ class DebtCollectorBot(commands.Bot):
         self.afk_state: Dict[int, "AfkRecord"] = {}
         self.snipes: Dict[int, SnipedMessage] = {}
         self.next_fire: Dict[str, float] = {}
-        self.markov_buffer: Dict[Tuple[int, str], Dict[str, int]] = {}
-        self.markov_starts: set = set()
-        self.markov_cache: Dict[Tuple[int, str], Dict[str, int]] = {}
-        self.markov_last: Dict[int, float] = {}
-        self.markov_ready: Dict[int, bool] = {}
-        self.markov_checked: Dict[int, float] = {}
         self.sticky_locks: Dict[int, asyncio.Lock] = {}
         self.sticky_last: Dict[int, float] = {}
+        self.ai_history_buffer: Dict[int, List[Dict[str, Any]]] = {}  # channel_id -> list of message dicts
+        self.ai_history_dirty: set[int] = set()  # set of channel_ids that need flushing
+        self.ai_active_conversations: Dict[int, float] = {}  # channel_id -> timestamp
         self.error_log: List[Dict[str, Any]] = []
 
     def log_error(self, where: str, err: Any) -> None:
@@ -214,15 +250,14 @@ class DebtCollectorBot(commands.Bot):
         await self.tree.sync()
         if not reminder_loop.is_running():
             reminder_loop.start()
-        await markov_ensure_indexes()
-        if not markov_flush_loop.is_running():
-            markov_flush_loop.start()
+        if not ai_flush_loop.is_running():
+            ai_flush_loop.start()
 
     async def close(self) -> None:
         try:
-            await markov_flush()
-        except Exception as exc:  # shutdown must never raise
-            log.warning("Markov flush on shutdown failed: %s", exc)
+            await ai_flush()
+        except Exception as exc:
+            log.warning("AI flush on shutdown failed: %s", exc)
         if self.http_session is not None:
             await self.http_session.close()
         await super().close()
@@ -707,7 +742,7 @@ async def on_message(message: discord.Message) -> None:
 
         await _apply_guild_automations(message)
         await _handle_sticky(message)
-        await _handle_markov(message)
+        await _handle_ai(message)
     except discord.DiscordException as exc:
         log.error("on_message handler error: %s", exc)
     except PyMongoError as exc:
@@ -1367,8 +1402,6 @@ CONFIG_CMDS = [
     "/joinrole <role>",
     "/reactionrole <set/list/remove>",
     "/sticky <set/off/list>",
-    "/markov <on/off/channel/probability/cooldown>",
-    "/markov <prune/reset>",
     "/errors",
 ]
 MOD_CMDS = [
@@ -1385,7 +1418,6 @@ INFO_CMDS = [
     "/ping", "/uptime", "/userinfo [user]", "/serverinfo",
     "/avatar [user]", "/banner [user]", "/roleinfo <role>", "/membercount",
     "/emojis", "/steal <emoji> [name]", "/afk [reason]", "/echo <message>",
-    "/markov status", "/markov talk [seed]", "/markov optout", "/markov optin",
 ]
 
 @bot.hybrid_command(name="commands", description="List commands (pick a category, or 'all')")
@@ -2009,6 +2041,107 @@ async def autoreact_cmd(
 STICKY_MIN_INTERVAL: float = 6.0
 
 
+
+async def _handle_ai(message: discord.Message) -> None:
+    """Process incoming messages for AI memory and potential response."""
+    assert message.guild is not None
+    config = ai_config(message.guild.id)
+    if not config["enabled"] or str(message.channel.id) not in config["channels"]:
+        return
+
+    # Skip commands and webhooks
+    if message.author.bot or message.content.startswith(COMMAND_PREFIX):
+        return
+
+    channel_id = message.channel.id
+    history = await _get_ai_history(channel_id)
+
+    # Add to history buffer
+    history.append({
+        "role": "user",
+        "author": message.author.display_name,
+        "author_id": message.author.id,
+        "content": message.content,
+        "timestamp": time.time()
+    })
+
+    # Cap history at 50 messages
+    if len(history) > 50:
+        history.pop(0)
+
+    bot.ai_history_dirty.add(channel_id)
+
+    is_mentioned = bot.user.mentioned_in(message)
+    now = time.time()
+
+    active_convo_last_msg = bot.ai_active_conversations.get(channel_id, 0.0)
+    convo_is_active = (now - active_convo_last_msg) < 600.0  # 10 minutes
+
+    should_reply = False
+    if is_mentioned:
+        should_reply = True
+        bot.ai_active_conversations[channel_id] = now
+    elif convo_is_active:
+        # If conversation is active, chance to reply is higher, or it might just naturally reply
+        # We will roll a higher probability if it's active
+        if random.random() < 0.5:  # 50% chance to continue an active conversation
+            should_reply = True
+            bot.ai_active_conversations[channel_id] = now
+    else:
+        # Roll base probability
+        prob = config["probability"] / 100.0
+        if prob > 0 and random.random() < prob:
+            should_reply = True
+            bot.ai_active_conversations[channel_id] = now
+
+    # Check cooldown
+    last_reply_time = bot.next_fire.get(f"ai_{channel_id}", 0.0)
+    if should_reply and now < last_reply_time:
+        should_reply = False
+
+    if should_reply:
+        async with message.channel.typing():
+            # Build system prompt with user personas
+            system_prompt = config["persona"] + "\n"
+
+            # Find unique authors in recent history
+            recent_authors = {msg["author_id"] for msg in history[-10:]}
+            personas = config.get("personas", {})
+            user_specifics = []
+
+            for author_id in recent_authors:
+                str_id = str(author_id)
+                if str_id in personas:
+                    # Try to get the member to use their name
+                    member = message.guild.get_member(int(author_id))
+                    name = member.display_name if member else f"User {author_id}"
+                    user_specifics.append(f"When interacting with {name}, follow this specific instruction: {personas[str_id]}")
+
+            if user_specifics:
+                system_prompt += "\nAdditionally:\n" + "\n".join(user_specifics)
+
+            reply = await ai_generate_reply(message.guild.id, message.channel, system_prompt, history)
+
+            if reply:
+                try:
+                    await message.reply(reply, mention_author=False)
+
+                    # Add AI's own reply to history
+                    history.append({
+                        "role": "model",
+                        "author": bot.user.display_name,
+                        "author_id": bot.user.id,
+                        "content": reply,
+                        "timestamp": time.time()
+                    })
+                    if len(history) > 50:
+                        history.pop(0)
+
+                    bot.ai_history_dirty.add(channel_id)
+                    bot.next_fire[f"ai_{channel_id}"] = time.time() + config["cooldown"]
+                except Exception as exc:
+                    bot.log_error("ai:send", exc)
+
 async def _handle_sticky(message: discord.Message) -> None:
     """Re-post the channel's sticky message underneath new chatter."""
     assert message.guild is not None
@@ -2275,741 +2408,3 @@ async def steal_cmd(ctx: commands.Context, emojis: str, name: Optional[str] = No
     await ctx.send("\n".join(results)[:2000], ephemeral=True)
 
 # --------------------------------------------------------------------------- #
-# Markov chain — learn from chat, occasionally speak
-# --------------------------------------------------------------------------- #
-
-MARKOV_ORDER: int = 2
-MARKOV_FLUSH_SECONDS: int = 60
-MARKOV_MAX_INPUT_WORDS: int = 60
-MARKOV_MIN_LEARN_WORDS: int = MARKOV_ORDER + 1
-MARKOV_MIN_STATES: int = 400
-MARKOV_CACHE_LIMIT: int = 20_000
-MARKOV_BULK_CHUNK: int = 1_000
-MARKOV_READY_RECHECK: float = 300.0
-# A token can never contain a space, so this sentinel can't collide with real text.
-MARKOV_END: str = "<| end |>"
-
-_MARKOV_MENTION_RE = re.compile(r"<(?:@[!&]?|#|a?:[A-Za-z0-9_]+:)\d+>")
-_MARKOV_URL_RE = re.compile(
-    r"(?:https?://|discord\.gg/|discordapp\.com/invite/)\S+", re.IGNORECASE
-)
-_MARKOV_SPACE_RE = re.compile(r"\s+")
-
-
-def _markov_escape(word: str) -> str:
-    """Mongo field names cannot contain '.' or start with '$'."""
-    return word.replace("%", "%25").replace(".", "%2E").replace("$", "%24")
-
-
-def _markov_unescape(key: str) -> str:
-    return key.replace("%24", "$").replace("%2E", ".").replace("%25", "%")
-
-
-def markov_tokenize(content: str) -> List[str]:
-    """Strip anything that shouldn't be learned, then split into words."""
-    text: str = _MARKOV_MENTION_RE.sub(" ", content)
-    text = _MARKOV_URL_RE.sub(" ", text)
-    text = text.replace("@everyone", " ").replace("@here", " ")
-    text = _MARKOV_SPACE_RE.sub(" ", text).strip()
-    if not text:
-        return []
-    return text.split(" ")[:MARKOV_MAX_INPUT_WORDS]
-
-
-def markov_config(guild_id: int) -> Dict[str, Any]:
-    raw: Dict[str, Any] = bot.settings.get_settings(guild_id).get("markov") or {}
-    return {
-        "enabled": bool(raw.get("enabled", False)),
-        "channels": [str(c) for c in raw.get("channels", [])],
-        "probability": float(raw.get("probability", 2.0)),
-        "cooldown": float(raw.get("cooldown", 45.0)),
-        "reply_on_mention": bool(raw.get("reply_on_mention", True)),
-        "optout": [str(u) for u in raw.get("optout", [])],
-    }
-
-
-async def markov_save_config(guild_id: int, changes: Dict[str, Any]) -> bool:
-    config: Dict[str, Any] = markov_config(guild_id)
-    config.update(changes)
-    return await bot.settings.push_settings(guild_id, {"markov": config})
-
-
-# --------------------------------------------------------------------------- #
-# Learning — buffered in memory, flushed to Mongo in bulk
-# --------------------------------------------------------------------------- #
-
-def markov_absorb(guild_id: int, words: List[str]) -> None:
-    """Add one message's transitions to the write buffer."""
-    if len(words) < MARKOV_MIN_LEARN_WORDS:
-        return
-    chain: List[str] = list(words) + [MARKOV_END]
-    for index in range(len(chain) - MARKOV_ORDER):
-        state: str = " ".join(chain[index : index + MARKOV_ORDER])
-        following: str = chain[index + MARKOV_ORDER]
-        counts: Dict[str, int] = bot.markov_buffer.setdefault((guild_id, state), {})
-        counts[following] = counts.get(following, 0) + 1
-    bot.markov_starts.add((guild_id, " ".join(words[:MARKOV_ORDER])))
-
-
-async def markov_flush() -> None:
-    """Collapse the buffer into one bulk upsert per batch of states."""
-    if not bot.markov_buffer:
-        return
-    buffered: Dict[Tuple[int, str], Dict[str, int]] = bot.markov_buffer
-    starts: set = bot.markov_starts
-    bot.markov_buffer = {}
-    bot.markov_starts = set()
-
-    operations: List[UpdateOne] = []
-    for (guild_id, state), counts in buffered.items():
-        increments: Dict[str, int] = {
-            f"n.{_markov_escape(word)}": count for word, count in counts.items()
-        }
-        increments["t"] = sum(counts.values())
-        update: Dict[str, Any] = {
-            "$inc": increments,
-            "$setOnInsert": {"g": str(guild_id), "k": state},
-        }
-        if (guild_id, state) in starts:
-            update["$set"] = {"s": True}
-        operations.append(
-            UpdateOne({"g": str(guild_id), "k": state}, update, upsert=True)
-        )
-
-    for start in range(0, len(operations), MARKOV_BULK_CHUNK):
-        chunk: List[UpdateOne] = operations[start : start + MARKOV_BULK_CHUNK]
-        try:
-            await asyncio.to_thread(
-                bot.settings.markov.bulk_write, chunk, ordered=False
-            )
-        except PyMongoError as exc:
-            bot.log_error("markov:flush", exc)
-            return
-    bot.markov_cache.clear()
-
-
-async def markov_ensure_indexes() -> None:
-    try:
-        await asyncio.to_thread(
-            bot.settings.markov.create_index, [("g", 1), ("k", 1)], unique=True
-        )
-        await asyncio.to_thread(bot.settings.markov.create_index, [("g", 1), ("s", 1)])
-    except PyMongoError as exc:
-        bot.log_error("markov:index", exc)
-
-
-@tasks.loop(seconds=MARKOV_FLUSH_SECONDS)
-async def markov_flush_loop() -> None:
-    await markov_flush()
-
-
-@markov_flush_loop.before_loop
-async def before_markov_flush_loop() -> None:
-    await bot.wait_until_ready()
-
-
-# --------------------------------------------------------------------------- #
-# Generation
-# --------------------------------------------------------------------------- #
-
-async def _markov_state(guild_id: int, state: str) -> Optional[Dict[str, int]]:
-    cached: Optional[Dict[str, int]] = bot.markov_cache.get((guild_id, state))
-    if cached is not None:
-        return cached
-    try:
-        doc = await asyncio.to_thread(
-            bot.settings.markov.find_one, {"g": str(guild_id), "k": state}, {"n": 1}
-        )
-    except PyMongoError as exc:
-        bot.log_error("markov:read", exc)
-        return None
-    if not doc or not doc.get("n"):
-        return None
-    counts: Dict[str, int] = {
-        _markov_unescape(key): int(value) for key, value in doc["n"].items()
-    }
-    if len(bot.markov_cache) >= MARKOV_CACHE_LIMIT:
-        bot.markov_cache.clear()
-    bot.markov_cache[(guild_id, state)] = counts
-    return counts
-
-
-async def _markov_seed(guild_id: int, seed: Optional[str]) -> Optional[str]:
-    collection = bot.settings.markov
-    if seed:
-        words: List[str] = markov_tokenize(seed)
-        if words:
-            prefix: str = " ".join(words[:MARKOV_ORDER])
-            try:
-                doc = await asyncio.to_thread(
-                    collection.find_one,
-                    {"g": str(guild_id), "k": {"$regex": f"^{re.escape(prefix)}"}},
-                    {"k": 1},
-                )
-            except PyMongoError as exc:
-                bot.log_error("markov:seed", exc)
-                doc = None
-            if doc:
-                return str(doc["k"])
-    try:
-        sample = await asyncio.to_thread(
-            lambda: list(
-                collection.aggregate(
-                    [
-                        {"$match": {"g": str(guild_id), "s": True}},
-                        {"$sample": {"size": 1}},
-                    ]
-                )
-            )
-        )
-    except PyMongoError as exc:
-        bot.log_error("markov:sample", exc)
-        return None
-    return str(sample[0]["k"]) if sample else None
-
-
-async def markov_generate(
-    guild_id: int, seed: Optional[str] = None, max_words: int = 40
-) -> Optional[str]:
-    state: Optional[str] = await _markov_seed(guild_id, seed)
-    if state is None:
-        return None
-
-    words: List[str] = state.split(" ")
-    for _ in range(max_words):
-        counts: Optional[Dict[str, int]] = await _markov_state(guild_id, state)
-        if not counts:
-            break
-        options: List[str] = list(counts.keys())
-        following: str = random.choices(
-            options, weights=[counts[option] for option in options], k=1
-        )[0]
-        if following == MARKOV_END:
-            break
-        words.append(following)
-        state = " ".join(words[-MARKOV_ORDER:])
-
-    text: str = sanitize_mass_pings(" ".join(words).strip())[:1900]
-    return text or None
-
-
-async def markov_ai_enhance(raw_text: str, guild_id: int) -> Optional[str]:
-    config: Dict[str, Any] = markov_config(guild_id)
-    personas: Dict[str, str] = config.get("personas", {})
-
-    persona_text = ""
-    if personas:
-        persona_text = "Here are some details about certain server members that you should keep in mind if relevant:\n"
-        for user_id, desc in personas.items():
-            persona_text += f"- User {user_id}: {desc}\n"
-
-    prompt = (
-        "You are an active member of a Discord server. I will give you a raw message generated by a Markov chain. "
-        "The message might be grammatically incorrect or nonsensical. Your job is to rewrite it to make it slightly more coherent and natural, "
-        "but YOU MUST strictly preserve its original vocabulary, tone, vibe, and chaos. Do not sound like an AI assistant. Do not use hashtags or emojis unless they were in the original text or fit the context perfectly. "
-        "It should sound like a casual message sent by a normal person on Discord. Do not add quotes around the message.\n\n"
-        f"{persona_text}\n"
-        f"Raw message: {raw_text}"
-    )
-
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    groq_key = os.getenv("GROQ_API_KEY")
-
-    import aiohttp
-    session: Optional[aiohttp.ClientSession] = bot.http_session
-    if not session:
-        return None
-
-    if gemini_key:
-        try:
-            async with session.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}",
-                json={"contents": [{"parts": [{"text": prompt}]}]},
-                timeout=aiohttp.ClientTimeout(total=8.0)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    candidates = data.get("candidates", [])
-                    if candidates:
-                        parts = candidates[0].get("content", {}).get("parts", [])
-                        if parts:
-                            return parts[0].get("text", "").strip()
-                else:
-                    bot.log_error("markov:ai_enhance_gemini", f"Status {resp.status}: {await resp.text()}")
-        except Exception as exc:
-            bot.log_error("markov:ai_enhance_gemini", exc)
-
-    if groq_key:
-        try:
-            async with session.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {groq_key}"},
-                json={"model": "llama3-8b-8192", "messages": [{"role": "user", "content": prompt}]},
-                timeout=aiohttp.ClientTimeout(total=8.0)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    choices = data.get("choices", [])
-                    if choices:
-                        return choices[0].get("message", {}).get("content", "").strip()
-                else:
-                    bot.log_error("markov:ai_enhance_groq", f"Status {resp.status}: {await resp.text()}")
-        except Exception as exc:
-            bot.log_error("markov:ai_enhance_groq", exc)
-
-    return None
-
-
-async def _markov_ready(guild_id: int) -> bool:
-    """Refuse to speak until the corpus is big enough to not parrot people."""
-    if bot.markov_ready.get(guild_id):
-        return True
-    now: float = time.time()
-    if now - bot.markov_checked.get(guild_id, 0.0) < MARKOV_READY_RECHECK:
-        return False
-    bot.markov_checked[guild_id] = now
-    try:
-        total: int = await asyncio.to_thread(
-            bot.settings.markov.count_documents,
-            {"g": str(guild_id)},
-            limit=MARKOV_MIN_STATES,
-        )
-    except PyMongoError as exc:
-        bot.log_error("markov:ready", exc)
-        return False
-    if total >= MARKOV_MIN_STATES:
-        bot.markov_ready[guild_id] = True
-        return True
-    return False
-
-
-async def _handle_markov(message: discord.Message) -> None:
-    """Learn from a watched channel, then sometimes answer in it."""
-    assert message.guild is not None
-    config: Dict[str, Any] = markov_config(message.guild.id)
-    if not config["enabled"] or not config["channels"]:
-        return
-    if str(message.channel.id) not in config["channels"]:
-        return
-    if str(message.author.id) in config["optout"]:
-        return
-    if message.content.startswith(get_prefix(bot, message)):
-        return
-
-    words: List[str] = markov_tokenize(message.content)
-    if words:
-        markov_absorb(message.guild.id, words)
-
-    now: float = time.time()
-    if now - bot.markov_last.get(message.channel.id, 0.0) < config["cooldown"]:
-        return
-
-    mentioned: bool = config["reply_on_mention"] and bot.user in message.mentions
-    if not mentioned and random.random() * 100.0 >= config["probability"]:
-        return
-    if not await _markov_ready(message.guild.id):
-        return
-
-    text: Optional[str] = await markov_generate(message.guild.id)
-    if not text:
-        return
-
-    if config.get("ai_enabled", False) and random.random() * 100.0 < config.get("ai_probability", 100.0):
-        ai_text = await markov_ai_enhance(text, message.guild.id)
-        if ai_text:
-            text = ai_text
-
-    bot.markov_last[message.channel.id] = now
-    try:
-        await message.channel.send(
-            text,
-            allowed_mentions=discord.AllowedMentions.none(),
-            reference=message if mentioned else None,
-        )
-    except discord.HTTPException as exc:
-        bot.log_error("markov:send", exc)
-
-
-# --------------------------------------------------------------------------- #
-# Markov commands
-# --------------------------------------------------------------------------- #
-
-class MarkovResetConfirm(discord.ui.View):
-    def __init__(self, author_id: int) -> None:
-        super().__init__(timeout=30.0)
-        self.author_id: int = author_id
-        self.confirmed: bool = False
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.author_id:
-            return True
-        await interaction.response.send_message(
-            "❌ That isn't your confirmation to give.", ephemeral=True
-        )
-        return False
-
-    @discord.ui.button(label="Delete everything", style=discord.ButtonStyle.danger)
-    async def confirm(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        self.confirmed = True
-        self.stop()
-        await interaction.response.edit_message(content="Wiping…", view=None)
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        self.stop()
-        await interaction.response.edit_message(content="Cancelled.", view=None)
-
-
-@bot.hybrid_group(
-    name="markov",
-    description="Let the bot learn from chat and occasionally talk",
-    fallback="status",
-    invoke_without_command=True,
-)
-@commands.guild_only()
-async def markov_group(ctx: commands.Context):
-    config: Dict[str, Any] = markov_config(ctx.guild.id)
-    channels: str = (
-        ", ".join(f"<#{c}>" for c in config["channels"]) if config["channels"] else "*none set*"
-    )
-    try:
-        states: int = await asyncio.to_thread(
-            bot.settings.markov.count_documents, {"g": str(ctx.guild.id)}
-        )
-    except PyMongoError:
-        states = -1
-
-    embed = discord.Embed(
-        title="Markov",
-        color=discord.Color.purple(),
-        description=(
-            f"**Status** — {'🟢 on' if config['enabled'] else '🔴 off'}\n"
-            f"**Learning from** — {channels}\n"
-            f"**Chance to speak** — {config['probability']:.1f}% per message\n"
-            f"**Cooldown** — {config['cooldown']:.0f}s per channel\n"
-            f"**Replies when pinged** — {'yes' if config['reply_on_mention'] else 'no'}\n"
-            f"**Learned phrases** — {'unavailable' if states < 0 else f'{states:,}'}"
-            + (
-                f" *(needs {MARKOV_MIN_STATES:,} to start talking)*"
-                if 0 <= states < MARKOV_MIN_STATES
-                else ""
-            )
-            + f"\n**Opted out** — {len(config['optout'])} member(s)"
-        ),
-    )
-    embed.set_footer(text="Members can exclude themselves with /markov optout")
-    await ctx.send(embed=embed, ephemeral=True)
-
-
-@markov_group.command(name="on", description="Turn Markov learning and chatter on")
-@app_commands.default_permissions(manage_guild=True)
-async def markov_on(ctx: commands.Context):
-    if not member_has_perms(ctx.author, manage_guild=True):
-        return await ctx.send("❌ You need Manage Server permission.", ephemeral=True)
-    config: Dict[str, Any] = markov_config(ctx.guild.id)
-    saved: bool = await markov_save_config(ctx.guild.id, {"enabled": True})
-    hint: str = (
-        ""
-        if config["channels"]
-        else "\n⚠️ No channels set yet — add one with `/markov channel add`, or nothing happens."
-    )
-    await ctx.send(
-        f"{'✅' if saved else '⚠️'} Markov is **on**."
-        + ("" if saved else " (database write failed)")
-        + hint,
-        ephemeral=True,
-    )
-
-
-@markov_group.command(name="off", description="Stop learning and stop talking")
-@app_commands.default_permissions(manage_guild=True)
-async def markov_off(ctx: commands.Context):
-    if not member_has_perms(ctx.author, manage_guild=True):
-        return await ctx.send("❌ You need Manage Server permission.", ephemeral=True)
-    saved: bool = await markov_save_config(ctx.guild.id, {"enabled": False})
-    await ctx.send(
-        f"{'✅' if saved else '⚠️'} Markov is **off**. Everything already learned is kept — "
-        "use `/markov reset` to erase it."
-        + ("" if saved else " (database write failed)"),
-        ephemeral=True,
-    )
-
-
-@markov_group.command(name="channel", description="Choose which channels are learned from")
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.describe(action="add, remove or list", channel="Channel (default: this one)")
-async def markov_channel(
-    ctx: commands.Context,
-    action: Literal["add", "remove", "list"],
-    channel: Optional[discord.TextChannel] = None,
-):
-    if not member_has_perms(ctx.author, manage_guild=True):
-        return await ctx.send("❌ You need Manage Server permission.", ephemeral=True)
-
-    config: Dict[str, Any] = markov_config(ctx.guild.id)
-    channels: List[str] = list(config["channels"])
-
-    if action == "list":
-        if not channels:
-            return await ctx.send(
-                "No channels are being learned from. Add one with `/markov channel add`.",
-                ephemeral=True,
-            )
-        listing: str = "\n".join(f"• <#{c}>" for c in channels)
-        return await ctx.send(f"**Learning from:**\n{listing}", ephemeral=True)
-
-    target = channel or ctx.channel
-    key: str = str(target.id)
-    if action == "add":
-        if key in channels:
-            return await ctx.send(
-                f"ℹ️ Already learning from {target.mention}.", ephemeral=True
-            )
-        channels.append(key)
-        note: str = (
-            f"✅ Now learning from {target.mention}. Everyone posting there should know "
-            "their messages are being stored — they can opt out with `/markov optout`."
-        )
-    else:
-        if key not in channels:
-            return await ctx.send(
-                f"ℹ️ Wasn't learning from {target.mention}.", ephemeral=True
-            )
-        channels.remove(key)
-        note = f"✅ Stopped learning from {target.mention}."
-
-    saved: bool = await markov_save_config(ctx.guild.id, {"channels": channels})
-    await ctx.send(note + ("" if saved else " (database write failed)"), ephemeral=True)
-
-
-@markov_group.command(name="probability", description="Chance of speaking after any message")
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.describe(percent="0 = never speak on its own, 100 = every message (0-100)")
-async def markov_probability(ctx: commands.Context, percent: float):
-    if not member_has_perms(ctx.author, manage_guild=True):
-        return await ctx.send("❌ You need Manage Server permission.", ephemeral=True)
-    value: float = min(max(percent, 0.0), 100.0)
-    saved: bool = await markov_save_config(ctx.guild.id, {"probability": value})
-    await ctx.send(
-        f"{'✅' if saved else '⚠️'} Chance to speak set to **{value:.1f}%** per message."
-        + ("" if saved else " (database write failed)"),
-        ephemeral=True,
-    )
-
-
-@markov_group.command(name="cooldown", description="Minimum gap between generated messages")
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.describe(seconds="Per-channel cooldown in seconds (0-3600)")
-async def markov_cooldown(ctx: commands.Context, seconds: int):
-    if not member_has_perms(ctx.author, manage_guild=True):
-        return await ctx.send("❌ You need Manage Server permission.", ephemeral=True)
-    value: float = float(min(max(seconds, 0), 3600))
-    saved: bool = await markov_save_config(ctx.guild.id, {"cooldown": value})
-    await ctx.send(
-        f"{'✅' if saved else '⚠️'} Cooldown set to **{value:.0f}s** per channel."
-        + ("" if saved else " (database write failed)"),
-        ephemeral=True,
-    )
-
-
-@markov_group.command(name="talk", description="Make the bot say something now")
-@app_commands.describe(seed="Optional word or two to start from")
-async def markov_talk(ctx: commands.Context, *, seed: Optional[str] = None):
-    config: Dict[str, Any] = markov_config(ctx.guild.id)
-    if not config["enabled"]:
-        return await ctx.send(
-            "❌ Markov is off here — an admin can enable it with `/markov on`.", ephemeral=True
-        )
-    await ctx.defer()
-    if not await _markov_ready(ctx.guild.id):
-        return await ctx.send(
-            f"📚 Still learning — it needs about {MARKOV_MIN_STATES:,} phrases before it "
-            "starts talking. Check progress with `/markov status`.",
-            ephemeral=True,
-        )
-    text: Optional[str] = await markov_generate(ctx.guild.id, seed=seed)
-    if not text:
-        return await ctx.send(
-            "🤔 Couldn't build anything from that — try a different seed, or none at all.",
-            ephemeral=True,
-        )
-    if config.get("ai_enabled", False) and random.random() * 100.0 < config.get("ai_probability", 100.0):
-        ai_text = await markov_ai_enhance(text, ctx.guild.id)
-        if ai_text:
-            text = ai_text
-    await ctx.send(text, allowed_mentions=discord.AllowedMentions.none())
-
-
-@markov_group.command(name="optout", description="Stop your messages being learned from")
-async def markov_optout(ctx: commands.Context):
-    config: Dict[str, Any] = markov_config(ctx.guild.id)
-    optout: List[str] = list(config["optout"])
-    if str(ctx.author.id) in optout:
-        return await ctx.send("ℹ️ You're already opted out here.", ephemeral=True)
-    optout.append(str(ctx.author.id))
-    saved: bool = await markov_save_config(ctx.guild.id, {"optout": optout})
-    await ctx.send(
-        f"{'✅' if saved else '⚠️'} Opted out — nothing you post here will be learned from now on.\n"
-        "⚠️ Anything already learned stays in the shared model and can't be picked back out. "
-        "Ask an admin to run `/markov reset` if that matters to you."
-        + ("" if saved else " (database write failed)"),
-        ephemeral=True,
-    )
-
-
-@markov_group.command(name="optin", description="Allow your messages to be learned from again")
-async def markov_optin(ctx: commands.Context):
-    config: Dict[str, Any] = markov_config(ctx.guild.id)
-    optout: List[str] = list(config["optout"])
-    if str(ctx.author.id) not in optout:
-        return await ctx.send("ℹ️ You weren't opted out.", ephemeral=True)
-    optout.remove(str(ctx.author.id))
-    saved: bool = await markov_save_config(ctx.guild.id, {"optout": optout})
-    await ctx.send(
-        f"{'✅' if saved else '⚠️'} Opted back in."
-        + ("" if saved else " (database write failed)"),
-        ephemeral=True,
-    )
-
-
-@markov_group.command(name="prune", description="Delete rarely-seen phrases to save space")
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(min_count="Drop phrases seen this many times or fewer (default 1)")
-async def markov_prune(ctx: commands.Context, min_count: int = 1):
-    if not member_has_perms(ctx.author, administrator=True):
-        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
-    threshold: int = min(max(min_count, 1), 20)
-    await ctx.defer(ephemeral=True)
-    await markov_flush()
-    try:
-        result = await asyncio.to_thread(
-            bot.settings.markov.delete_many,
-            {"g": str(ctx.guild.id), "t": {"$lte": threshold}},
-        )
-    except PyMongoError as exc:
-        bot.log_error("markov:prune", exc)
-        return await ctx.send("❌ Pruning failed — check `/errors`.", ephemeral=True)
-    bot.markov_cache.clear()
-    bot.markov_ready.pop(ctx.guild.id, None)
-    bot.markov_checked.pop(ctx.guild.id, None)
-    await ctx.send(
-        f"✅ Pruned **{result.deleted_count:,}** phrases seen {threshold} time(s) or fewer. "
-        "Output gets a little more repetitive, storage gets a lot smaller.",
-        ephemeral=True,
-    )
-
-
-@markov_group.command(name="reset", description="Erase everything the bot has learned here")
-@app_commands.default_permissions(administrator=True)
-async def markov_reset(ctx: commands.Context):
-    if not member_has_perms(ctx.author, administrator=True):
-        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
-
-    view: MarkovResetConfirm = MarkovResetConfirm(ctx.author.id)
-    prompt = await ctx.send(
-        "⚠️ This permanently deletes every phrase learned in this server. There is no undo.",
-        view=view,
-        ephemeral=True,
-    )
-    await view.wait()
-    if not view.confirmed:
-        return
-
-    bot.markov_buffer = {
-        key: value for key, value in bot.markov_buffer.items() if key[0] != ctx.guild.id
-    }
-    bot.markov_starts = {key for key in bot.markov_starts if key[0] != ctx.guild.id}
-    bot.markov_cache.clear()
-    bot.markov_ready.pop(ctx.guild.id, None)
-    bot.markov_checked.pop(ctx.guild.id, None)
-
-    try:
-        result = await asyncio.to_thread(
-            bot.settings.markov.delete_many, {"g": str(ctx.guild.id)}
-        )
-    except PyMongoError as exc:
-        bot.log_error("markov:reset", exc)
-        return await ctx.send("❌ Reset failed — check `/errors`.", ephemeral=True)
-
-    await ctx.send(
-        f"✅ Erased **{result.deleted_count:,}** learned phrases. Starting from nothing.",
-        ephemeral=True,
-    )
-
-
-@markov_group.command(name="ai", description="Toggle AI enhancement for Markov messages")
-@app_commands.default_permissions(manage_guild=True)
-async def markov_ai(ctx: commands.Context, enabled: bool):
-    saved: bool = await markov_save_config(ctx.guild.id, {"ai_enabled": enabled})
-    if saved:
-        state = "on" if enabled else "off"
-        await ctx.send(f"✅ AI enhancement is now **{state}**.")
-    else:
-        await ctx.send("❌ Failed to save configuration.")
-
-@markov_group.command(name="ai_probability", description="Set the chance (0-100) of using AI vs raw Markov")
-@app_commands.describe(percent="0 to 100")
-@app_commands.default_permissions(manage_guild=True)
-async def markov_ai_probability(ctx: commands.Context, percent: float):
-    value: float = max(0.0, min(100.0, percent))
-    saved: bool = await markov_save_config(ctx.guild.id, {"ai_probability": value})
-    if saved:
-        await ctx.send(f"✅ AI probability set to **{value:g}%**.")
-    else:
-        await ctx.send("❌ Failed to save configuration.")
-
-@markov_group.group(name="persona", description="Manage member personas for the AI")
-@app_commands.default_permissions(manage_guild=True)
-async def markov_persona_group(ctx: commands.Context):
-    if ctx.invoked_subcommand is None:
-        await ctx.send_help(ctx.command)
-
-@markov_persona_group.command(name="set", description="Set the AI persona description for a member")
-@app_commands.describe(member="The member to describe", description="How the AI should portray this member")
-async def markov_persona_set(ctx: commands.Context, member: discord.Member, *, description: str):
-    config: Dict[str, Any] = markov_config(ctx.guild.id)
-    personas: Dict[str, str] = config.get("personas", {})
-    personas[str(member.id)] = description
-    saved: bool = await markov_save_config(ctx.guild.id, {"personas": personas})
-    if saved:
-        await ctx.send(f"✅ Persona set for **{member.display_name}**.")
-    else:
-        await ctx.send("❌ Failed to save configuration.")
-
-@markov_persona_group.command(name="clear", description="Clear the AI persona description for a member")
-@app_commands.describe(member="The member to clear")
-async def markov_persona_clear(ctx: commands.Context, member: discord.Member):
-    config: Dict[str, Any] = markov_config(ctx.guild.id)
-    personas: Dict[str, str] = config.get("personas", {})
-    if str(member.id) in personas:
-        del personas[str(member.id)]
-        saved: bool = await markov_save_config(ctx.guild.id, {"personas": personas})
-        if saved:
-            await ctx.send(f"✅ Persona cleared for **{member.display_name}**.")
-        else:
-            await ctx.send("❌ Failed to save configuration.")
-    else:
-        await ctx.send(f"ℹ️ No persona was set for **{member.display_name}**.")
-
-
-# --------------------------------------------------------------------------- #
-# Entrypoint
-# --------------------------------------------------------------------------- #
-
-async def main() -> None:
-    token: Optional[str] = os.getenv("DISCORD_TOKEN")
-    if not token:
-        raise RuntimeError("DISCORD_TOKEN environment variable is not set.")
-    async with bot:
-        await _start_keepalive_server()
-        await bot.start(token)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Shutdown requested — exiting cleanly.")
