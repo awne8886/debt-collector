@@ -1561,23 +1561,23 @@ async def autopurge_on(
 ):
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
-    
+
     channel = channel or ctx.channel
     if not channel.permissions_for(ctx.guild.me).manage_messages:
         return await ctx.send(
             f"❌ I need the **Manage Messages** permission in {channel.mention} to do that.",
             ephemeral=True,
         )
-    
+
     until = None
     if hours or days:
         until = int(time.time()) + (hours or 0) * 3600 + (days or 0) * 86400
-    
+
     settings = bot.settings.get_settings(ctx.guild.id)
     ap = settings.setdefault("autopurge", {"channels": {}, "exempt_roles": []})
     ap["channels"][str(channel.id)] = {"until": until}
     bot.settings.update_settings(ctx.guild.id, settings)
-    
+
     when = f"until <t:{until}:f>" if until else "until you run `/autopurge off`"
     await ctx.send(
         f"🧹 Auto-purge is now **on** in {channel.mention} {when}. "
@@ -1591,15 +1591,15 @@ async def autopurge_on(
 async def autopurge_off(ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
-    
+
     channel = channel or ctx.channel
     settings = bot.settings.get_settings(ctx.guild.id)
     ap = settings.get("autopurge", {"channels": {}, "exempt_roles": []})
     removed = ap["channels"].pop(str(channel.id), None)
-    
+
     if removed:
         bot.settings.update_settings(ctx.guild.id, settings)
-    
+
     msg = (
         f"✅ Auto-purge turned off in {channel.mention}."
         if removed else f"Auto-purge wasn't active in {channel.mention}."
@@ -1615,11 +1615,11 @@ async def autopurge_exempt(
 ):
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
-    
+
     settings = bot.settings.get_settings(ctx.guild.id)
     ap = settings.setdefault("autopurge", {"channels": {}, "exempt_roles": []})
     exempt = ap["exempt_roles"]
-    
+
     if action == "add":
         if role.id not in exempt:
             exempt.append(role.id)
@@ -1629,7 +1629,7 @@ async def autopurge_exempt(
         msg = f"✅ {role.mention} is no longer exempt."
     else:
         msg = f"{role.mention} wasn't exempt."
-        
+
     bot.settings.update_settings(ctx.guild.id, settings)
     await ctx.send(msg, ephemeral=True)
 
@@ -1637,18 +1637,18 @@ async def autopurge_exempt(
 async def autopurge_status(ctx: commands.Context):
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
-    
+
     settings = bot.settings.get_settings(ctx.guild.id)
     ap = settings.get("autopurge", {"channels": {}, "exempt_roles": []})
     now = time.time()
     lines = []
-    
+
     for cid, c in ap["channels"].items():
         until = c.get("until")
         if until and now > until:
             continue  # expired, will be cleaned up automatically
         lines.append(f"<#{cid}> — " + (f"until <t:{until}:f>" if until else "until turned off"))
-        
+
     embed = discord.Embed(title="Auto-purge status", color=discord.Color.blurple())
     embed.add_field(name="Active channels", value="\n".join(lines)[:1024] or "Not active anywhere.", inline=False)
     embed.add_field(
@@ -1674,7 +1674,7 @@ async def set_prefix_cmd(ctx: commands.Context, prefix: str):
     prefix = prefix.strip()
     if not prefix or len(prefix) > 5:
         return await ctx.send("❌ Prefix must be 1-5 characters.", ephemeral=True)
-    
+
     settings = bot.settings.get_settings(ctx.guild.id)
     settings["prefix"] = prefix
     bot.settings.update_settings(ctx.guild.id, settings)
