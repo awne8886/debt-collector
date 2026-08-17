@@ -2408,3 +2408,18 @@ async def steal_cmd(ctx: commands.Context, emojis: str, name: Optional[str] = No
     await ctx.send("\n".join(results)[:2000], ephemeral=True)
 
 # --------------------------------------------------------------------------- #
+
+
+if __name__ == "__main__":
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        log.error("DISCORD_TOKEN environment variable not set.")
+    else:
+        async def runner() -> None:
+            await _start_keepalive_server()
+            await bot.start(token)
+
+        try:
+            asyncio.run(runner())
+        except KeyboardInterrupt:
+            pass
