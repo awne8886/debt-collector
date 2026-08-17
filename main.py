@@ -2043,7 +2043,6 @@ STICKY_MIN_INTERVAL: float = 6.0
 
 
 
-
 def ai_config(guild_id: int) -> dict:
     settings = bot.settings.get_settings(guild_id)
     return settings.get("markov", {
@@ -2489,3 +2488,10 @@ async def steal_cmd(ctx: commands.Context, emojis: str, name: Optional[str] = No
     await ctx.send("\n".join(results)[:2000], ephemeral=True)
 
 # --------------------------------------------------------------------------- #
+
+if __name__ == "__main__":
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        print("ERROR: DISCORD_TOKEN environment variable is missing.")
+    else:
+        bot.run(token)
