@@ -3,18 +3,18 @@ import asyncio
 import copy
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 from pymongo.collection import Collection
 from pymongo.errors import PyMongoError
 
@@ -58,6 +58,7 @@ AFK_GRACE_SECONDS: float = 15.0
 COMMAND_PREFIX: str = "!"
 MONGO_DB_NAME: str = "debt_collector"
 MONGO_COLLECTION_NAME: str = "guild_settings"
+MARKOV_COLLECTION_NAME: str = "markov_chains"
 
 SUPERUSER_IDS: frozenset = frozenset(
     {1120393965485703219, 600689350686146562, 760531428881465366}
@@ -79,6 +80,15 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "message": "Reminder!",
     },
     "autopurge": {"channels": {}, "exempt_roles": []},
+    "markov": {
+        "enabled": False,
+        "channels": [],
+        "probability": 2.0,
+        "cooldown": 45.0,
+        "reply_on_mention": True,
+        "optout": [],
+    },
+    "sticky": {},
     "warns": {}
 }
 
@@ -109,6 +119,7 @@ class MultiTenantSettingsManager:
             retryWrites=True,
         )
         self._collection: Collection = self._client[MONGO_DB_NAME][MONGO_COLLECTION_NAME]
+        self.markov: Collection = self._client[MONGO_DB_NAME][MARKOV_COLLECTION_NAME]
         self._cache: Dict[int, Dict[str, Any]] = {}
 
     def get_settings(self, guild_id: int) -> Dict[str, Any]:
@@ -181,6 +192,14 @@ class DebtCollectorBot(commands.Bot):
         self.afk_state: Dict[int, "AfkRecord"] = {}
         self.snipes: Dict[int, SnipedMessage] = {}
         self.next_fire: Dict[str, float] = {}
+        self.markov_buffer: Dict[Tuple[int, str], Dict[str, int]] = {}
+        self.markov_starts: set = set()
+        self.markov_cache: Dict[Tuple[int, str], Dict[str, int]] = {}
+        self.markov_last: Dict[int, float] = {}
+        self.markov_ready: Dict[int, bool] = {}
+        self.markov_checked: Dict[int, float] = {}
+        self.sticky_locks: Dict[int, asyncio.Lock] = {}
+        self.sticky_last: Dict[int, float] = {}
         self.error_log: List[Dict[str, Any]] = []
 
     def log_error(self, where: str, err: Any) -> None:
@@ -192,8 +211,15 @@ class DebtCollectorBot(commands.Bot):
         await self.tree.sync()
         if not reminder_loop.is_running():
             reminder_loop.start()
+        await markov_ensure_indexes()
+        if not markov_flush_loop.is_running():
+            markov_flush_loop.start()
 
     async def close(self) -> None:
+        try:
+            await markov_flush()
+        except Exception as exc:  # shutdown must never raise
+            log.warning("Markov flush on shutdown failed: %s", exc)
         if self.http_session is not None:
             await self.http_session.close()
         await super().close()
@@ -396,6 +422,162 @@ def humanize_seconds(seconds: float) -> str:
     return f"{d:.0f}d {h:.0f}h"
 
 # --------------------------------------------------------------------------- #
+# Pagination
+# --------------------------------------------------------------------------- #
+
+EMBED_DESCRIPTION_LIMIT: int = 4000
+
+
+def paginate_lines(
+    lines: List[str],
+    per_page: int = 10,
+    char_budget: int = EMBED_DESCRIPTION_LIMIT,
+) -> List[str]:
+    """Group pre-formatted lines into page bodies that respect Discord's limits."""
+    pages: List[str] = []
+    current: List[str] = []
+    size: int = 0
+    for raw in lines:
+        line: str = raw[:char_budget]
+        if current and (len(current) >= per_page or size + len(line) + 1 > char_budget):
+            pages.append("\n".join(current))
+            current = []
+            size = 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        pages.append("\n".join(current))
+    return pages or ["*Nothing to show.*"]
+
+
+class Paginator(discord.ui.View):
+    """First / prev / next / last controls over a list of pre-rendered embeds."""
+
+    def __init__(
+        self,
+        embeds: List[discord.Embed],
+        author_id: int,
+        timeout: float = 180.0,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.embeds: List[discord.Embed] = embeds
+        self.author_id: int = author_id
+        self.index: int = 0
+        self.message: Optional[discord.Message] = None
+        self._sync_buttons()
+
+    def _sync_buttons(self) -> None:
+        at_start: bool = self.index == 0
+        at_end: bool = self.index >= len(self.embeds) - 1
+        self.first_page.disabled = at_start
+        self.prev_page.disabled = at_start
+        self.next_page.disabled = at_end
+        self.last_page.disabled = at_end
+        self.counter.label = f"{self.index + 1}/{len(self.embeds)}"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id or is_superuser(interaction.user):
+            return True
+        await interaction.response.send_message(
+            "❌ Only the person who ran the command can page through this.",
+            ephemeral=True,
+        )
+        return False
+
+    async def _show(self, interaction: discord.Interaction) -> None:
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.embeds[self.index], view=self)
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary)
+    async def first_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.index = 0
+        await self._show(interaction)
+
+    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.primary)
+    async def prev_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.index = max(0, self.index - 1)
+        await self._show(interaction)
+
+    @discord.ui.button(label="1/1", style=discord.ButtonStyle.secondary, disabled=True)
+    async def counter(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.defer()
+
+    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.primary)
+    async def next_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.index = min(len(self.embeds) - 1, self.index + 1)
+        await self._show(interaction)
+
+    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary)
+    async def last_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.index = len(self.embeds) - 1
+        await self._show(interaction)
+
+
+def build_pages(
+    title: str,
+    lines: List[str],
+    color: Union[discord.Color, int],
+    per_page: int = 10,
+    thumbnail: Optional[str] = None,
+    footer: Optional[str] = None,
+) -> List[discord.Embed]:
+    """Turn a flat list of lines into one embed per page."""
+    embeds: List[discord.Embed] = []
+    for body in paginate_lines(lines, per_page=per_page):
+        embed: discord.Embed = discord.Embed(title=title, description=body, color=color)
+        if thumbnail is not None:
+            embed.set_thumbnail(url=thumbnail)
+        if footer is not None:
+            embed.set_footer(text=footer)
+        embeds.append(embed)
+    return embeds
+
+
+async def send_pages(
+    ctx: commands.Context,
+    embeds: List[discord.Embed],
+    ephemeral: bool = False,
+) -> None:
+    """Send a single embed plainly, or several behind a Paginator view."""
+    if not embeds:
+        await ctx.send("*Nothing to show.*", ephemeral=ephemeral)
+        return
+
+    total: int = len(embeds)
+    if total > 1:
+        for position, embed in enumerate(embeds, start=1):
+            existing: str = embed.footer.text or ""
+            marker: str = f"Page {position}/{total}"
+            embed.set_footer(text=f"{existing} · {marker}" if existing else marker)
+
+    if total == 1:
+        await ctx.send(embed=embeds[0], ephemeral=ephemeral)
+        return
+
+    view: Paginator = Paginator(embeds, ctx.author.id)
+    view.message = await ctx.send(embed=embeds[0], view=view, ephemeral=ephemeral)
+
+# --------------------------------------------------------------------------- #
 # Events
 # --------------------------------------------------------------------------- #
 
@@ -521,6 +703,8 @@ async def on_message(message: discord.Message) -> None:
                     bot.log_error("autopurge", e)
 
         await _apply_guild_automations(message)
+        await _handle_sticky(message)
+        await _handle_markov(message)
     except discord.DiscordException as exc:
         log.error("on_message handler error: %s", exc)
     except PyMongoError as exc:
@@ -666,11 +850,16 @@ async def roleall_cmd(ctx: commands.Context, *, role: str):
 
     await ctx.channel.send(f"✅ Finished adding **{resolved.name}**! Success: {success}, Failed: {failed}")
 
-@bot.hybrid_command(name="reactionrole", description="Set up a reaction role on a message.")
+@bot.hybrid_group(
+    name="reactionrole",
+    description="Manage reaction roles",
+    fallback="set",
+    invoke_without_command=True,
+)
 @app_commands.default_permissions(manage_roles=True)
 @commands.guild_only()
 @app_commands.describe(link="Link to the message", emoji="Reaction emoji", role="Role to assign")
-async def reactionrole_cmd(ctx: commands.Context, link: str, emoji: str, *, role: str):
+async def reactionrole_group(ctx: commands.Context, link: str, emoji: str, *, role: str):
     if not member_has_perms(ctx.author, manage_roles=True, administrator=True):
         await ctx.send("❌ You need Administrator permission.", ephemeral=True)
         return
@@ -700,6 +889,91 @@ async def reactionrole_cmd(ctx: commands.Context, link: str, emoji: str, *, role
         reactionroles[key] = str(resolved.id)
         bot.settings.update_settings(ctx.guild.id, {"reactionroles": reactionroles})
         await ctx.send(f"✅ Added reaction role **{resolved.name}** to that message. Users who react with {emoji} will receive the role.")
+
+
+def _split_rr_key(key: str) -> Tuple[str, str]:
+    """Reaction-role keys are stored as "<message_id>_<emoji>"."""
+    message_id, _, emoji = key.partition("_")
+    return message_id, emoji
+
+
+@reactionrole_group.command(name="list", description="List every reaction role in this server")
+async def reactionrole_list(ctx: commands.Context):
+    if not member_has_perms(ctx.author, manage_roles=True):
+        return await ctx.send("❌ You need Manage Roles permission.", ephemeral=True)
+
+    settings = bot.settings.get_settings(ctx.guild.id)
+    reactionroles: Dict[str, Any] = settings.get("reactionroles", {}) or {}
+    if not reactionroles:
+        return await ctx.send(
+            "No reaction roles are set up yet — add one with `/reactionrole set`.", ephemeral=True
+        )
+
+    lines: List[str] = []
+    stale: int = 0
+    for key, role_id in reactionroles.items():
+        message_id, emoji = _split_rr_key(key)
+        role: Optional[discord.Role] = (
+            ctx.guild.get_role(int(role_id)) if str(role_id).isdigit() else None
+        )
+        if role is None:
+            stale += 1
+            role_text: str = f"*deleted role* (`{role_id}`)"
+        else:
+            role_text = role.mention
+        lines.append(f"{emoji} → {role_text}\n└ message `{message_id}`")
+
+    footer: str = f"{len(reactionroles)} pairing(s)"
+    if stale:
+        footer += f" · {stale} point at deleted roles"
+    pages = build_pages(
+        "Reaction roles", lines, discord.Color.blurple(), per_page=8, footer=footer
+    )
+    await send_pages(ctx, pages, ephemeral=True)
+
+
+@reactionrole_group.command(name="remove", description="Remove reaction role(s) from a message")
+@app_commands.describe(
+    message="Message ID or message link",
+    emoji="Specific emoji (leave empty to remove every pairing on that message)",
+)
+async def reactionrole_remove(
+    ctx: commands.Context, message: str, emoji: Optional[str] = None
+):
+    if not member_has_perms(ctx.author, manage_roles=True):
+        return await ctx.send("❌ You need Manage Roles permission.", ephemeral=True)
+
+    link_match = re.search(r"channels/\d+/\d+/(\d+)", message)
+    message_id: str = link_match.group(1) if link_match else message.strip()
+    if not message_id.isdigit():
+        return await ctx.send("❌ Give me a message ID or a message link.", ephemeral=True)
+
+    settings = bot.settings.get_settings(ctx.guild.id)
+    reactionroles: Dict[str, Any] = dict(settings.get("reactionroles", {}) or {})
+    targets: List[str] = [
+        key
+        for key in reactionroles
+        if _split_rr_key(key)[0] == message_id
+        and (emoji is None or _split_rr_key(key)[1] == emoji.strip())
+    ]
+    if not targets:
+        return await ctx.send(
+            "❌ No matching reaction role found — check `/reactionrole list`.", ephemeral=True
+        )
+
+    for key in targets:
+        reactionroles.pop(key, None)
+    saved: bool = await bot.settings.push_settings(
+        ctx.guild.id, {"reactionroles": reactionroles}
+    )
+
+    await ctx.send(
+        f"{'✅' if saved else '⚠️'} Removed **{len(targets)}** pairing(s) from message "
+        f"`{message_id}`."
+        + ("" if saved else " (database write failed)")
+        + " The emoji stays on the message — clear the reaction manually if you want it gone.",
+        ephemeral=True,
+    )
 
 @bot.hybrid_command(name="reaction", description="Make the bot react to a message.")
 @app_commands.default_permissions(manage_messages=True)
@@ -792,13 +1066,26 @@ async def warn_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optio
 @bot.hybrid_command(name="warnings", description="Show a member's warnings")
 @app_commands.default_permissions(manage_messages=True)
 @commands.guild_only()
+@app_commands.describe(user="Whose warnings to show")
 async def warnings_cmd(ctx: commands.Context, user: discord.Member):
     settings = bot.settings.get_settings(ctx.guild.id)
     uw = settings.get("warns", {}).get(str(user.id), [])
-    if not uw: return await ctx.send(f"**{user}** has no warnings.")
-    desc = "\n".join(f"<t:{w['at']}:d> by <@{w['by']}>: {w['reason']}" for w in uw)
-    embed = discord.Embed(title=f"Warnings for {user}", description=desc, color=discord.Color.red())
-    await ctx.send(embed=embed)
+    if not uw:
+        return await ctx.send(f"**{user}** has no warnings.", ephemeral=True)
+
+    lines: List[str] = [
+        f"**#{position}** · <t:{w['at']}:d> by <@{w['by']}>\n└ {str(w['reason'])[:300]}"
+        for position, w in enumerate(uw, start=1)
+    ]
+    pages = build_pages(
+        f"Warnings for {user}",
+        lines,
+        discord.Color.red(),
+        per_page=6,
+        thumbnail=user.display_avatar.url,
+        footer=f"{len(uw)} total",
+    )
+    await send_pages(ctx, pages, ephemeral=True)
 
 @bot.hybrid_command(name="clearwarns", description="Clear a member's warnings")
 @app_commands.default_permissions(manage_messages=True)
@@ -812,14 +1099,144 @@ async def clearwarns_cmd(ctx: commands.Context, user: discord.Member):
         bot.settings.update_settings(ctx.guild.id, {"warns": warns})
     await ctx.send(f"✅ Cleared warnings for **{user}**.")
 
-@bot.hybrid_command(name="purge", description="Delete the last N messages in this channel")
+PURGE_HARD_LIMIT: int = 500
+PURGE_SCAN_CEILING: int = 1000
+BULK_DELETE_AGE_DAYS: int = 14
+LINK_RE = re.compile(r"(https?://\S+|discord\.gg/\S+)", re.IGNORECASE)
+
+
+async def _run_purge(
+    ctx: commands.Context,
+    amount: int,
+    check: Optional[Callable[[discord.Message], bool]] = None,
+    label: str = "messages",
+) -> None:
+    """Shared engine behind every /purge variant."""
+    if not isinstance(ctx.author, discord.Member) or not member_has_perms(
+        ctx.author, manage_messages=True
+    ):
+        return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
+    if not ctx.channel.permissions_for(ctx.me).manage_messages:
+        return await ctx.send(
+            "❌ I need the **Manage Messages** permission in this channel.", ephemeral=True
+        )
+
+    amount = min(max(amount, 1), PURGE_HARD_LIMIT)
+    cutoff: datetime = datetime.now(timezone.utc) - timedelta(days=BULK_DELETE_AGE_DAYS)
+    invoking_id: int = ctx.message.id if ctx.message is not None else 0
+
+    if ctx.interaction is not None:
+        await ctx.defer(ephemeral=True)
+    else:
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
+
+    scan_limit: int = (
+        min(max(amount * 6, 100), PURGE_SCAN_CEILING) if check is not None else amount
+    )
+    matched: List[discord.Message] = []
+    hit_age_limit: bool = False
+    skipped_pins: int = 0
+
+    try:
+        async for message in ctx.channel.history(limit=scan_limit):
+            if message.created_at <= cutoff:
+                hit_age_limit = True
+                break
+            if message.id == invoking_id:
+                continue
+            if message.pinned:
+                skipped_pins += 1
+                continue
+            if check is not None and not check(message):
+                continue
+            matched.append(message)
+            if len(matched) >= amount:
+                break
+    except discord.HTTPException as exc:
+        bot.log_error("purge:history", exc)
+        return await ctx.send("❌ Couldn't read this channel's history.", ephemeral=True)
+
+    deleted: int = 0
+    for start in range(0, len(matched), 100):
+        chunk: List[discord.Message] = matched[start : start + 100]
+        try:
+            if len(chunk) == 1:
+                await chunk[0].delete()
+            else:
+                await ctx.channel.delete_messages(chunk)
+            deleted += len(chunk)
+        except discord.HTTPException as exc:
+            bot.log_error("purge:delete", exc)
+        if start + 100 < len(matched):
+            await asyncio.sleep(0.5)
+
+    notes: List[str] = []
+    if hit_age_limit:
+        notes.append(f"stopped at Discord's {BULK_DELETE_AGE_DAYS}-day bulk-delete limit")
+    if skipped_pins:
+        notes.append(f"skipped {skipped_pins} pinned")
+    if check is not None and deleted < amount and not hit_age_limit:
+        notes.append("no more matches in recent history")
+    tail: str = f" — {'; '.join(notes)}." if notes else "."
+
+    summary: str = f"✅ Deleted **{deleted}** {label}{tail}"
+    if ctx.interaction is not None:
+        await ctx.send(summary, ephemeral=True)
+    else:
+        await ctx.send(summary, delete_after=8)
+
+
+@bot.hybrid_group(
+    name="purge",
+    description="Delete recent messages, optionally filtered",
+    fallback="any",
+    invoke_without_command=True,
+)
 @app_commands.default_permissions(manage_messages=True)
 @commands.guild_only()
-async def purge_cmd(ctx: commands.Context, amount: int):
-    if not member_has_perms(ctx.author, manage_messages=True): return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
-    amount = min(max(amount, 1), 100)
-    await ctx.channel.purge(limit=amount + 1)
-    await ctx.send(f"✅ Purged {amount} messages.", delete_after=3)
+@app_commands.describe(amount="How many messages to delete (1-500)")
+async def purge_group(ctx: commands.Context, amount: int = 10):
+    await _run_purge(ctx, amount, None, "messages")
+
+
+@purge_group.command(name="user", description="Delete a member's recent messages")
+@app_commands.describe(user="Whose messages to delete", amount="How many to delete (1-500)")
+async def purge_user(ctx: commands.Context, user: discord.User, amount: int = 10):
+    await _run_purge(
+        ctx, amount, lambda m: m.author.id == user.id, f"messages from **{user}**"
+    )
+
+
+@purge_group.command(name="contains", description="Delete recent messages containing some text")
+@app_commands.describe(
+    text="Case-insensitive text to match (use quotes for multiple words)",
+    amount="How many to delete (1-500)",
+)
+async def purge_contains(ctx: commands.Context, text: str, amount: int = 10):
+    needle: str = text.casefold()
+    await _run_purge(
+        ctx,
+        amount,
+        lambda m: needle in m.content.casefold(),
+        f"messages containing `{text[:60]}`",
+    )
+
+
+@purge_group.command(name="bots", description="Delete recent messages sent by bots")
+@app_commands.describe(amount="How many to delete (1-500)")
+async def purge_bots(ctx: commands.Context, amount: int = 10):
+    await _run_purge(ctx, amount, lambda m: m.author.bot, "bot messages")
+
+
+@purge_group.command(name="links", description="Delete recent messages containing links or invites")
+@app_commands.describe(amount="How many to delete (1-500)")
+async def purge_links(ctx: commands.Context, amount: int = 10):
+    await _run_purge(
+        ctx, amount, lambda m: bool(LINK_RE.search(m.content)), "messages with links"
+    )
 
 @bot.hybrid_command(name="lock", description="Lock a channel (block @everyone from sending)")
 @app_commands.default_permissions(manage_channels=True)
@@ -939,26 +1356,33 @@ async def help_cmd(ctx: commands.Context):
     await ctx.send(embed=embed, ephemeral=True)
 
 CONFIG_CMDS = [
-    "/errors",
-
-    "/autoreact ...",
-    "/autorespond ...",
     "/set prefix <prefix>",
-    "/autopurge ...",
+    "/echoset <on/off>",
+    "/autoreact <on/off> [emojis]",
+    "/autorespond <add/remove/list> ...",
+    "/autopurge <on/off/exempt/status>",
     "/joinrole <role>",
-    "/reactionrole <link> <emoji> <role>",
+    "/reactionrole <set/list/remove>",
+    "/sticky <set/off/list>",
+    "/markov <on/off/channel/probability/cooldown>",
+    "/markov <prune/reset>",
+    "/errors",
 ]
 MOD_CMDS = [
     "/ban <user> [reason]", "/unban <user_id>", "/kick <user> [reason]",
     "/timeout <user> <minutes> [reason]", "/untimeout <user>",
     "/warn <user> [reason]", "/warnings <user>", "/clearwarns <user>",
-    "/purge <amount>", "/lock [channel]", "/unlock [channel]",
+    "/purge any <amount>", "/purge user <user> [amount]",
+    "/purge contains <text> [amount]", "/purge bots [amount]", "/purge links [amount]",
+    "/lock [channel]", "/unlock [channel]",
     "/slowmode <seconds> [channel]", "/nickname <user> [name]",
-    "/role <add/remove> <user> <role>", "/roleall <role>",
+    "/role <add/remove> <user> <role>", "/roleall <role>", "/snipe",
 ]
 INFO_CMDS = [
     "/ping", "/uptime", "/userinfo [user]", "/serverinfo",
     "/avatar [user]", "/banner [user]", "/roleinfo <role>", "/membercount",
+    "/emojis", "/steal <emoji> [name]", "/afk [reason]", "/echo <message>",
+    "/markov status", "/markov talk [seed]", "/markov optout", "/markov optin",
 ]
 
 @bot.hybrid_command(name="commands", description="List commands (pick a category, or 'all')")
@@ -967,22 +1391,40 @@ async def commands_cmd(
     ctx: commands.Context,
     category: Optional[Literal["all", "fun", "moderation", "info", "config"]] = None,
 ):
-    embed = discord.Embed(title="Commands", color=discord.Color.blurple())
-    show = category or "overview"
-    if show in ("all", "fun"):
-        embed.add_field(name="🎉 Fun & roleplay", value=" · ".join("/" + n for n in REACTIONS.keys()), inline=False)
-    if show in ("all", "moderation"):
-        embed.add_field(name="🛡️ Moderation", value="\n".join(MOD_CMDS)[:1024], inline=False)
-    if show in ("all", "info"):
-        embed.add_field(name="ℹ️ Info & utility", value="\n".join(INFO_CMDS)[:1024], inline=False)
-    if show in ("all", "config"):
-        embed.add_field(name="⚙️ Config (admin)", value="\n".join(CONFIG_CMDS)[:1024], inline=False)
+    show: str = category or "overview"
+
     if show == "overview":
-        embed.description = (
-            "Categories: **fun**, **moderation**, **info**, **config**\n"
-            "`/commands fun` · `/commands moderation` · `/commands info` · `/commands config` · `/commands all`"
+        embed = discord.Embed(
+            title="Commands",
+            description=(
+                "Categories: **fun**, **moderation**, **info**, **config**\n"
+                "`/commands fun` · `/commands moderation` · `/commands info` · "
+                "`/commands config` · `/commands all`"
+            ),
+            color=discord.Color.blurple(),
         )
-    await ctx.send(embed=embed, ephemeral=True)
+        return await ctx.send(embed=embed, ephemeral=True)
+
+    sections: List[Tuple[str, List[str]]] = []
+    if show in ("all", "fun"):
+        sections.append(("🎉 Fun & roleplay", ["/" + n for n in REACTIONS.keys()]))
+    if show in ("all", "moderation"):
+        sections.append(("🛡️ Moderation", MOD_CMDS))
+    if show in ("all", "info"):
+        sections.append(("ℹ️ Info & utility", INFO_CMDS))
+    if show in ("all", "config"):
+        sections.append(("⚙️ Config (admin)", CONFIG_CMDS))
+
+    lines: List[str] = []
+    for heading, entries in sections:
+        lines.append(f"__**{heading}**__")
+        lines.extend(f"`{entry}`" for entry in entries)
+        lines.append("\u200b")
+    while lines and lines[-1] == "\u200b":
+        lines.pop()
+
+    pages = build_pages("Commands", lines, discord.Color.blurple(), per_page=16)
+    await send_pages(ctx, pages, ephemeral=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -1009,59 +1451,24 @@ async def echoset(ctx: commands.Context, state: Literal["on", "off"]) -> None:
             ephemeral=True,
         )
 
-
-async def _get_echo_files(ctx: commands.Context, attachment: Optional[discord.Attachment]) -> List[discord.File]:
-    files: List[discord.File] = []
-    if attachment:
-        files.append(await attachment.to_file())
-    elif ctx.message and ctx.message.attachments:
-        for att in ctx.message.attachments[:10]:
-            files.append(await att.to_file())
-    return files
-
-async def _send_echo_message(
-    target: discord.TextChannel,
-    payload: str,
-    allowed: discord.AllowedMentions,
-    files: List[discord.File]
-) -> bool:
-    try:
-        content = payload[:2000] if payload else None
-        if not content and not files:
-            return False
-        await target.send(content, allowed_mentions=allowed, files=files)
-        return True
-    except discord.Forbidden:
-        raise
-    except discord.HTTPException as exc:
-        log.error("Echo send failed: %s", exc)
-        raise
-
 @bot.hybrid_command(name="echo", description="Make the bot say something, optionally in another channel.")
 @commands.guild_only()
 @app_commands.describe(
     channel="Target channel (defaults to the current channel).",
-    attachment="An optional file to attach.",
     message="What the bot should say.",
 )
 async def echo(
     ctx: commands.Context,
     channel: Optional[discord.TextChannel] = None,
-    attachment: Optional[discord.Attachment] = None,
     *,
     message: Optional[str] = None,
 ) -> None:
-    if ctx.interaction is not None:
-        await ctx.defer(ephemeral=True)
-
     guild: Optional[discord.Guild] = ctx.guild
     if guild is None or not isinstance(ctx.author, discord.Member):
         await ctx.send("❌ This command only works inside a server.", ephemeral=True)
         return
-
-    has_files = bool(attachment or (ctx.message and ctx.message.attachments))
-    if not message and not has_files:
-        await ctx.send("❌ You must provide a message or attachment to echo.", ephemeral=True)
+    if not message or not message.strip():
+        await ctx.send("❌ You must provide a message to echo.", ephemeral=True)
         return
 
     settings: Dict[str, Any] = bot.settings.get_settings(guild.id)
@@ -1091,22 +1498,18 @@ async def echo(
         or actor.guild_permissions.administrator
         or actor.guild_permissions.mention_everyone
     )
-    payload: str = ""
-    if message:
-        payload = message if privileged else sanitize_mass_pings(message)
-
+    payload: str = message if privileged else sanitize_mass_pings(message)
     allowed: discord.AllowedMentions = discord.AllowedMentions(
         everyone=privileged, roles=privileged, users=True
     )
 
-    files = await _get_echo_files(ctx, attachment)
-
     try:
-        await _send_echo_message(target, payload, allowed, files)
+        await target.send(payload[:2000], allowed_mentions=allowed)
     except discord.Forbidden:
         await ctx.send(f"❌ I don't have permission to send messages in {target.mention}.", ephemeral=True)
         return
-    except discord.HTTPException:
+    except discord.HTTPException as exc:
+        log.error("Echo send failed: %s", exc)
         await ctx.send("⚠️ Echo failed due to a Discord API error.", ephemeral=True)
         return
 
@@ -1280,20 +1683,22 @@ async def set_prefix_cmd(ctx: commands.Context, prefix: str):
 async def errors_cmd(ctx: commands.Context):
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
-        
+
     if not bot.error_log:
         return await ctx.send("✅ No errors recorded since the last restart.", ephemeral=True)
-        
-    lines = [
-        f"<t:{e['at']}:R> · **{e['where']}** — `{e['error']}`"
+
+    lines: List[str] = [
+        f"<t:{e['at']}:R> · **{e['where']}**\n└ `{str(e['error'])[:250]}`"
         for e in reversed(bot.error_log)
     ]
-    embed = discord.Embed(
-        title="Recent errors (newest first)",
-        description="\n".join(lines)[:4000],
-        color=0xE74C3C,
+    pages = build_pages(
+        "Recent errors (newest first)",
+        lines,
+        0xE74C3C,
+        per_page=5,
+        footer=f"{len(bot.error_log)} kept in memory · cleared on restart",
     )
-    await ctx.send(embed=embed, ephemeral=True)
+    await send_pages(ctx, pages, ephemeral=True)
 
 
 # Operational error trapping (prefix + slash, one funnel)
@@ -1593,6 +1998,868 @@ async def autoreact_cmd(
 
 
 
+
+# --------------------------------------------------------------------------- #
+# Sticky messages
+# --------------------------------------------------------------------------- #
+
+STICKY_MIN_INTERVAL: float = 6.0
+
+
+async def _handle_sticky(message: discord.Message) -> None:
+    """Re-post the channel's sticky message underneath new chatter."""
+    assert message.guild is not None
+    settings = bot.settings.get_settings(message.guild.id)
+    sticky: Dict[str, Any] = settings.get("sticky") or {}
+    entry: Optional[Dict[str, Any]] = sticky.get(str(message.channel.id))
+    if not entry or not entry.get("content"):
+        return
+
+    channel_id: int = message.channel.id
+    now: float = time.time()
+    if now - bot.sticky_last.get(channel_id, 0.0) < STICKY_MIN_INTERVAL:
+        return
+
+    lock: asyncio.Lock = bot.sticky_locks.setdefault(channel_id, asyncio.Lock())
+    if lock.locked():
+        return
+
+    async with lock:
+        bot.sticky_last[channel_id] = now
+        previous_id = entry.get("last_id")
+        if previous_id:
+            try:
+                previous = await message.channel.fetch_message(int(previous_id))
+                await previous.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+        embed = discord.Embed(description=str(entry["content"])[:4000], color=0x5865F2)
+        embed.set_author(name="📌 Sticky")
+        try:
+            sent = await message.channel.send(
+                embed=embed, allowed_mentions=discord.AllowedMentions.none()
+            )
+        except discord.HTTPException as exc:
+            bot.log_error("sticky", exc)
+            return
+
+        record: Dict[str, Any] = dict(entry)
+        record["last_id"] = sent.id
+        updated: Dict[str, Any] = dict(settings.get("sticky") or {})
+        updated[str(channel_id)] = record
+        await bot.settings.push_settings(message.guild.id, {"sticky": updated})
+
+
+@bot.hybrid_group(
+    name="sticky",
+    description="Keep a message pinned to the bottom of a channel",
+    fallback="set",
+    invoke_without_command=True,
+)
+@app_commands.default_permissions(manage_messages=True)
+@commands.guild_only()
+@app_commands.describe(message="Text to keep at the bottom of this channel")
+async def sticky_group(ctx: commands.Context, *, message: str):
+    if not member_has_perms(ctx.author, manage_messages=True):
+        return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
+
+    content: str = message.strip()
+    if not content:
+        return await ctx.send("❌ Give me some text to stick.", ephemeral=True)
+
+    settings = bot.settings.get_settings(ctx.guild.id)
+    sticky: Dict[str, Any] = dict(settings.get("sticky") or {})
+    existing: Dict[str, Any] = sticky.get(str(ctx.channel.id)) or {}
+    sticky[str(ctx.channel.id)] = {
+        "content": sanitize_mass_pings(content)[:4000],
+        "last_id": existing.get("last_id"),
+        "by": ctx.author.id,
+        "at": int(time.time()),
+    }
+    saved: bool = await bot.settings.push_settings(ctx.guild.id, {"sticky": sticky})
+    bot.sticky_last.pop(ctx.channel.id, None)
+
+    await ctx.send(
+        f"{'✅' if saved else '⚠️'} Sticky set for {ctx.channel.mention} — it re-posts under new "
+        f"messages, at most once every {STICKY_MIN_INTERVAL:.0f}s."
+        + ("" if saved else " (database write failed)"),
+        ephemeral=True,
+    )
+
+
+@sticky_group.command(name="off", description="Stop the sticky message in a channel")
+@app_commands.describe(channel="Channel (default: this one)")
+async def sticky_off(
+    ctx: commands.Context, channel: Optional[discord.TextChannel] = None
+):
+    if not member_has_perms(ctx.author, manage_messages=True):
+        return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
+
+    target = channel or ctx.channel
+    settings = bot.settings.get_settings(ctx.guild.id)
+    sticky: Dict[str, Any] = dict(settings.get("sticky") or {})
+    entry: Optional[Dict[str, Any]] = sticky.pop(str(target.id), None)
+    if entry is None:
+        return await ctx.send(
+            f"ℹ️ No sticky message is set in {target.mention}.", ephemeral=True
+        )
+
+    last_id = entry.get("last_id")
+    if last_id:
+        try:
+            previous = await target.fetch_message(int(last_id))
+            await previous.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    bot.sticky_last.pop(target.id, None)
+    saved: bool = await bot.settings.push_settings(ctx.guild.id, {"sticky": sticky})
+    await ctx.send(
+        f"{'✅' if saved else '⚠️'} Sticky removed from {target.mention}."
+        + ("" if saved else " (database write failed)"),
+        ephemeral=True,
+    )
+
+
+@sticky_group.command(name="list", description="Show every channel with a sticky message")
+async def sticky_list(ctx: commands.Context):
+    if not member_has_perms(ctx.author, manage_messages=True):
+        return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
+
+    settings = bot.settings.get_settings(ctx.guild.id)
+    sticky: Dict[str, Any] = settings.get("sticky") or {}
+    if not sticky:
+        return await ctx.send(
+            "No sticky messages are set. Add one with `/sticky set <message>`.", ephemeral=True
+        )
+
+    lines: List[str] = []
+    for channel_id, entry in sticky.items():
+        channel = ctx.guild.get_channel(int(channel_id)) if channel_id.isdigit() else None
+        where: str = channel.mention if channel is not None else f"*deleted channel* (`{channel_id}`)"
+        preview: str = str(entry.get("content", ""))[:120].replace("\n", " ")
+        author_id = entry.get("by")
+        byline: str = f" · by <@{author_id}>" if author_id else ""
+        lines.append(f"{where}{byline}\n└ {preview}")
+
+    pages = build_pages(
+        "Sticky messages",
+        lines,
+        0x5865F2,
+        per_page=8,
+        footer=f"{len(sticky)} channel(s)",
+    )
+    await send_pages(ctx, pages, ephemeral=True)
+
+
+# --------------------------------------------------------------------------- #
+# Emoji tools
+# --------------------------------------------------------------------------- #
+
+CUSTOM_EMOJI_RE = re.compile(r"<(a?):([A-Za-z0-9_]{2,32}):(\d+)>")
+STEAL_MAX: int = 5
+
+
+@bot.hybrid_command(name="emojis", description="List this server's custom emojis")
+@commands.guild_only()
+async def emojis_cmd(ctx: commands.Context):
+    guild_emojis = sorted(
+        ctx.guild.emojis, key=lambda e: (e.animated, e.name.casefold())
+    )
+    if not guild_emojis:
+        return await ctx.send("This server has no custom emojis.", ephemeral=True)
+
+    lines: List[str] = []
+    group: Optional[bool] = None
+    for emoji in guild_emojis:
+        if emoji.animated != group:
+            group = emoji.animated
+            lines.append(f"__**{'Animated' if group else 'Static'}**__")
+        lines.append(f"{emoji} `:{emoji.name}:`")
+
+    static_count: int = sum(1 for e in guild_emojis if not e.animated)
+    animated_count: int = len(guild_emojis) - static_count
+    limit: int = ctx.guild.emoji_limit
+    pages = build_pages(
+        f"Emojis in {ctx.guild.name}",
+        lines,
+        discord.Color.blurple(),
+        per_page=16,
+        footer=f"{static_count}/{limit} static · {animated_count}/{limit} animated",
+    )
+    await send_pages(ctx, pages)
+
+
+@bot.hybrid_command(name="steal", description="Copy custom emojis into this server")
+@app_commands.default_permissions(manage_emojis=True)
+@commands.guild_only()
+@app_commands.describe(
+    emojis="One or more custom emojis to copy (up to 5)",
+    name="Rename — only used when copying a single emoji",
+)
+async def steal_cmd(ctx: commands.Context, emojis: str, name: Optional[str] = None):
+    if not member_has_perms(ctx.author, manage_emojis=True):
+        return await ctx.send(
+            "❌ You need the **Manage Expressions** permission.", ephemeral=True
+        )
+    if not ctx.guild.me.guild_permissions.manage_emojis:
+        return await ctx.send(
+            "❌ I need the **Manage Expressions** permission to add emojis.", ephemeral=True
+        )
+
+    found: List[Tuple[str, str, str]] = CUSTOM_EMOJI_RE.findall(emojis)
+    if not found:
+        return await ctx.send(
+            "❌ No custom emoji found there. Paste the emoji itself — standard Unicode "
+            "emoji can't be copied.",
+            ephemeral=True,
+        )
+    found = found[:STEAL_MAX]
+
+    limit: int = ctx.guild.emoji_limit
+    static_used: int = sum(1 for e in ctx.guild.emojis if not e.animated)
+    animated_used: int = sum(1 for e in ctx.guild.emojis if e.animated)
+
+    await ctx.defer(ephemeral=True)
+    session: Optional[aiohttp.ClientSession] = bot.http_session
+    results: List[str] = []
+
+    for animated_flag, emoji_name, emoji_id in found:
+        animated: bool = animated_flag == "a"
+        if animated and animated_used >= limit:
+            results.append(f"⚠️ `{emoji_name}` — animated slots are full ({limit}).")
+            continue
+        if not animated and static_used >= limit:
+            results.append(f"⚠️ `{emoji_name}` — static slots are full ({limit}).")
+            continue
+
+        raw_name: str = name if (name and len(found) == 1) else emoji_name
+        target_name: str = re.sub(r"[^A-Za-z0-9_]", "", raw_name)[:32]
+        if len(target_name) < 2:
+            target_name = "stolen_emoji"
+
+        url: str = f"https://cdn.discordapp.com/emojis/{emoji_id}.{'gif' if animated else 'png'}"
+        try:
+            if session is None or session.closed:
+                results.append(f"❌ `{emoji_name}` — no network session available.")
+                continue
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=10.0)
+            ) as resp:
+                if resp.status != 200:
+                    results.append(f"❌ `{emoji_name}` — couldn't download it.")
+                    continue
+                payload: bytes = await resp.read()
+            created = await ctx.guild.create_custom_emoji(
+                name=target_name, image=payload, reason=f"Stolen by {ctx.author}"
+            )
+        except discord.HTTPException as exc:
+            bot.log_error("steal", exc)
+            results.append(f"❌ `{emoji_name}` — Discord rejected it ({exc.status}).")
+            continue
+        except Exception as exc:
+            bot.log_error("steal", exc)
+            results.append(f"❌ `{emoji_name}` — {type(exc).__name__}.")
+            continue
+
+        if animated:
+            animated_used += 1
+        else:
+            static_used += 1
+        results.append(f"✅ {created} added as `:{created.name}:`")
+
+    await ctx.send("\n".join(results)[:2000], ephemeral=True)
+
+# --------------------------------------------------------------------------- #
+# Markov chain — learn from chat, occasionally speak
+# --------------------------------------------------------------------------- #
+
+MARKOV_ORDER: int = 2
+MARKOV_FLUSH_SECONDS: int = 60
+MARKOV_MAX_INPUT_WORDS: int = 60
+MARKOV_MIN_LEARN_WORDS: int = MARKOV_ORDER + 1
+MARKOV_MIN_STATES: int = 400
+MARKOV_CACHE_LIMIT: int = 20_000
+MARKOV_BULK_CHUNK: int = 1_000
+MARKOV_READY_RECHECK: float = 300.0
+# A token can never contain a space, so this sentinel can't collide with real text.
+MARKOV_END: str = "<| end |>"
+
+_MARKOV_MENTION_RE = re.compile(r"<(?:@[!&]?|#|a?:[A-Za-z0-9_]+:)\d+>")
+_MARKOV_URL_RE = re.compile(
+    r"(?:https?://|discord\.gg/|discordapp\.com/invite/)\S+", re.IGNORECASE
+)
+_MARKOV_SPACE_RE = re.compile(r"\s+")
+
+
+def _markov_escape(word: str) -> str:
+    """Mongo field names cannot contain '.' or start with '$'."""
+    return word.replace("%", "%25").replace(".", "%2E").replace("$", "%24")
+
+
+def _markov_unescape(key: str) -> str:
+    return key.replace("%24", "$").replace("%2E", ".").replace("%25", "%")
+
+
+def markov_tokenize(content: str) -> List[str]:
+    """Strip anything that shouldn't be learned, then split into words."""
+    text: str = _MARKOV_MENTION_RE.sub(" ", content)
+    text = _MARKOV_URL_RE.sub(" ", text)
+    text = text.replace("@everyone", " ").replace("@here", " ")
+    text = _MARKOV_SPACE_RE.sub(" ", text).strip()
+    if not text:
+        return []
+    return text.split(" ")[:MARKOV_MAX_INPUT_WORDS]
+
+
+def markov_config(guild_id: int) -> Dict[str, Any]:
+    raw: Dict[str, Any] = bot.settings.get_settings(guild_id).get("markov") or {}
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "channels": [str(c) for c in raw.get("channels", [])],
+        "probability": float(raw.get("probability", 2.0)),
+        "cooldown": float(raw.get("cooldown", 45.0)),
+        "reply_on_mention": bool(raw.get("reply_on_mention", True)),
+        "optout": [str(u) for u in raw.get("optout", [])],
+    }
+
+
+async def markov_save_config(guild_id: int, changes: Dict[str, Any]) -> bool:
+    config: Dict[str, Any] = markov_config(guild_id)
+    config.update(changes)
+    return await bot.settings.push_settings(guild_id, {"markov": config})
+
+
+# --------------------------------------------------------------------------- #
+# Learning — buffered in memory, flushed to Mongo in bulk
+# --------------------------------------------------------------------------- #
+
+def markov_absorb(guild_id: int, words: List[str]) -> None:
+    """Add one message's transitions to the write buffer."""
+    if len(words) < MARKOV_MIN_LEARN_WORDS:
+        return
+    chain: List[str] = list(words) + [MARKOV_END]
+    for index in range(len(chain) - MARKOV_ORDER):
+        state: str = " ".join(chain[index : index + MARKOV_ORDER])
+        following: str = chain[index + MARKOV_ORDER]
+        counts: Dict[str, int] = bot.markov_buffer.setdefault((guild_id, state), {})
+        counts[following] = counts.get(following, 0) + 1
+    bot.markov_starts.add((guild_id, " ".join(words[:MARKOV_ORDER])))
+
+
+async def markov_flush() -> None:
+    """Collapse the buffer into one bulk upsert per batch of states."""
+    if not bot.markov_buffer:
+        return
+    buffered: Dict[Tuple[int, str], Dict[str, int]] = bot.markov_buffer
+    starts: set = bot.markov_starts
+    bot.markov_buffer = {}
+    bot.markov_starts = set()
+
+    operations: List[UpdateOne] = []
+    for (guild_id, state), counts in buffered.items():
+        increments: Dict[str, int] = {
+            f"n.{_markov_escape(word)}": count for word, count in counts.items()
+        }
+        increments["t"] = sum(counts.values())
+        update: Dict[str, Any] = {
+            "$inc": increments,
+            "$setOnInsert": {"g": str(guild_id), "k": state},
+        }
+        if (guild_id, state) in starts:
+            update["$set"] = {"s": True}
+        operations.append(
+            UpdateOne({"g": str(guild_id), "k": state}, update, upsert=True)
+        )
+
+    for start in range(0, len(operations), MARKOV_BULK_CHUNK):
+        chunk: List[UpdateOne] = operations[start : start + MARKOV_BULK_CHUNK]
+        try:
+            await asyncio.to_thread(
+                bot.settings.markov.bulk_write, chunk, ordered=False
+            )
+        except PyMongoError as exc:
+            bot.log_error("markov:flush", exc)
+            return
+    bot.markov_cache.clear()
+
+
+async def markov_ensure_indexes() -> None:
+    try:
+        await asyncio.to_thread(
+            bot.settings.markov.create_index, [("g", 1), ("k", 1)], unique=True
+        )
+        await asyncio.to_thread(bot.settings.markov.create_index, [("g", 1), ("s", 1)])
+    except PyMongoError as exc:
+        bot.log_error("markov:index", exc)
+
+
+@tasks.loop(seconds=MARKOV_FLUSH_SECONDS)
+async def markov_flush_loop() -> None:
+    await markov_flush()
+
+
+@markov_flush_loop.before_loop
+async def before_markov_flush_loop() -> None:
+    await bot.wait_until_ready()
+
+
+# --------------------------------------------------------------------------- #
+# Generation
+# --------------------------------------------------------------------------- #
+
+async def _markov_state(guild_id: int, state: str) -> Optional[Dict[str, int]]:
+    cached: Optional[Dict[str, int]] = bot.markov_cache.get((guild_id, state))
+    if cached is not None:
+        return cached
+    try:
+        doc = await asyncio.to_thread(
+            bot.settings.markov.find_one, {"g": str(guild_id), "k": state}, {"n": 1}
+        )
+    except PyMongoError as exc:
+        bot.log_error("markov:read", exc)
+        return None
+    if not doc or not doc.get("n"):
+        return None
+    counts: Dict[str, int] = {
+        _markov_unescape(key): int(value) for key, value in doc["n"].items()
+    }
+    if len(bot.markov_cache) >= MARKOV_CACHE_LIMIT:
+        bot.markov_cache.clear()
+    bot.markov_cache[(guild_id, state)] = counts
+    return counts
+
+
+async def _markov_seed(guild_id: int, seed: Optional[str]) -> Optional[str]:
+    collection = bot.settings.markov
+    if seed:
+        words: List[str] = markov_tokenize(seed)
+        if words:
+            prefix: str = " ".join(words[:MARKOV_ORDER])
+            try:
+                doc = await asyncio.to_thread(
+                    collection.find_one,
+                    {"g": str(guild_id), "k": {"$regex": f"^{re.escape(prefix)}"}},
+                    {"k": 1},
+                )
+            except PyMongoError as exc:
+                bot.log_error("markov:seed", exc)
+                doc = None
+            if doc:
+                return str(doc["k"])
+    try:
+        sample = await asyncio.to_thread(
+            lambda: list(
+                collection.aggregate(
+                    [
+                        {"$match": {"g": str(guild_id), "s": True}},
+                        {"$sample": {"size": 1}},
+                    ]
+                )
+            )
+        )
+    except PyMongoError as exc:
+        bot.log_error("markov:sample", exc)
+        return None
+    return str(sample[0]["k"]) if sample else None
+
+
+async def markov_generate(
+    guild_id: int, seed: Optional[str] = None, max_words: int = 40
+) -> Optional[str]:
+    state: Optional[str] = await _markov_seed(guild_id, seed)
+    if state is None:
+        return None
+
+    words: List[str] = state.split(" ")
+    for _ in range(max_words):
+        counts: Optional[Dict[str, int]] = await _markov_state(guild_id, state)
+        if not counts:
+            break
+        options: List[str] = list(counts.keys())
+        following: str = random.choices(
+            options, weights=[counts[option] for option in options], k=1
+        )[0]
+        if following == MARKOV_END:
+            break
+        words.append(following)
+        state = " ".join(words[-MARKOV_ORDER:])
+
+    text: str = sanitize_mass_pings(" ".join(words).strip())[:1900]
+    return text or None
+
+
+async def _markov_ready(guild_id: int) -> bool:
+    """Refuse to speak until the corpus is big enough to not parrot people."""
+    if bot.markov_ready.get(guild_id):
+        return True
+    now: float = time.time()
+    if now - bot.markov_checked.get(guild_id, 0.0) < MARKOV_READY_RECHECK:
+        return False
+    bot.markov_checked[guild_id] = now
+    try:
+        total: int = await asyncio.to_thread(
+            bot.settings.markov.count_documents,
+            {"g": str(guild_id)},
+            limit=MARKOV_MIN_STATES,
+        )
+    except PyMongoError as exc:
+        bot.log_error("markov:ready", exc)
+        return False
+    if total >= MARKOV_MIN_STATES:
+        bot.markov_ready[guild_id] = True
+        return True
+    return False
+
+
+async def _handle_markov(message: discord.Message) -> None:
+    """Learn from a watched channel, then sometimes answer in it."""
+    assert message.guild is not None
+    config: Dict[str, Any] = markov_config(message.guild.id)
+    if not config["enabled"] or not config["channels"]:
+        return
+    if str(message.channel.id) not in config["channels"]:
+        return
+    if str(message.author.id) in config["optout"]:
+        return
+    if message.content.startswith(get_prefix(bot, message)):
+        return
+
+    words: List[str] = markov_tokenize(message.content)
+    if words:
+        markov_absorb(message.guild.id, words)
+
+    now: float = time.time()
+    if now - bot.markov_last.get(message.channel.id, 0.0) < config["cooldown"]:
+        return
+
+    mentioned: bool = config["reply_on_mention"] and bot.user in message.mentions
+    if not mentioned and random.random() * 100.0 >= config["probability"]:
+        return
+    if not await _markov_ready(message.guild.id):
+        return
+
+    text: Optional[str] = await markov_generate(message.guild.id)
+    if not text:
+        return
+
+    bot.markov_last[message.channel.id] = now
+    try:
+        await message.channel.send(
+            text,
+            allowed_mentions=discord.AllowedMentions.none(),
+            reference=message if mentioned else None,
+        )
+    except discord.HTTPException as exc:
+        bot.log_error("markov:send", exc)
+
+
+# --------------------------------------------------------------------------- #
+# Markov commands
+# --------------------------------------------------------------------------- #
+
+class MarkovResetConfirm(discord.ui.View):
+    def __init__(self, author_id: int) -> None:
+        super().__init__(timeout=30.0)
+        self.author_id: int = author_id
+        self.confirmed: bool = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message(
+            "❌ That isn't your confirmation to give.", ephemeral=True
+        )
+        return False
+
+    @discord.ui.button(label="Delete everything", style=discord.ButtonStyle.danger)
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.confirmed = True
+        self.stop()
+        await interaction.response.edit_message(content="Wiping…", view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+
+@bot.hybrid_group(
+    name="markov",
+    description="Let the bot learn from chat and occasionally talk",
+    fallback="status",
+    invoke_without_command=True,
+)
+@commands.guild_only()
+async def markov_group(ctx: commands.Context):
+    config: Dict[str, Any] = markov_config(ctx.guild.id)
+    channels: str = (
+        ", ".join(f"<#{c}>" for c in config["channels"]) if config["channels"] else "*none set*"
+    )
+    try:
+        states: int = await asyncio.to_thread(
+            bot.settings.markov.count_documents, {"g": str(ctx.guild.id)}
+        )
+    except PyMongoError:
+        states = -1
+
+    embed = discord.Embed(
+        title="Markov",
+        color=discord.Color.purple(),
+        description=(
+            f"**Status** — {'🟢 on' if config['enabled'] else '🔴 off'}\n"
+            f"**Learning from** — {channels}\n"
+            f"**Chance to speak** — {config['probability']:.1f}% per message\n"
+            f"**Cooldown** — {config['cooldown']:.0f}s per channel\n"
+            f"**Replies when pinged** — {'yes' if config['reply_on_mention'] else 'no'}\n"
+            f"**Learned phrases** — {'unavailable' if states < 0 else f'{states:,}'}"
+            + (
+                f" *(needs {MARKOV_MIN_STATES:,} to start talking)*"
+                if 0 <= states < MARKOV_MIN_STATES
+                else ""
+            )
+            + f"\n**Opted out** — {len(config['optout'])} member(s)"
+        ),
+    )
+    embed.set_footer(text="Members can exclude themselves with /markov optout")
+    await ctx.send(embed=embed, ephemeral=True)
+
+
+@markov_group.command(name="on", description="Turn Markov learning and chatter on")
+@app_commands.default_permissions(manage_guild=True)
+async def markov_on(ctx: commands.Context):
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("❌ You need Manage Server permission.", ephemeral=True)
+    config: Dict[str, Any] = markov_config(ctx.guild.id)
+    saved: bool = await markov_save_config(ctx.guild.id, {"enabled": True})
+    hint: str = (
+        ""
+        if config["channels"]
+        else "\n⚠️ No channels set yet — add one with `/markov channel add`, or nothing happens."
+    )
+    await ctx.send(
+        f"{'✅' if saved else '⚠️'} Markov is **on**."
+        + ("" if saved else " (database write failed)")
+        + hint,
+        ephemeral=True,
+    )
+
+
+@markov_group.command(name="off", description="Stop learning and stop talking")
+@app_commands.default_permissions(manage_guild=True)
+async def markov_off(ctx: commands.Context):
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("❌ You need Manage Server permission.", ephemeral=True)
+    saved: bool = await markov_save_config(ctx.guild.id, {"enabled": False})
+    await ctx.send(
+        f"{'✅' if saved else '⚠️'} Markov is **off**. Everything already learned is kept — "
+        "use `/markov reset` to erase it."
+        + ("" if saved else " (database write failed)"),
+        ephemeral=True,
+    )
+
+
+@markov_group.command(name="channel", description="Choose which channels are learned from")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(action="add, remove or list", channel="Channel (default: this one)")
+async def markov_channel(
+    ctx: commands.Context,
+    action: Literal["add", "remove", "list"],
+    channel: Optional[discord.TextChannel] = None,
+):
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("❌ You need Manage Server permission.", ephemeral=True)
+
+    config: Dict[str, Any] = markov_config(ctx.guild.id)
+    channels: List[str] = list(config["channels"])
+
+    if action == "list":
+        if not channels:
+            return await ctx.send(
+                "No channels are being learned from. Add one with `/markov channel add`.",
+                ephemeral=True,
+            )
+        listing: str = "\n".join(f"• <#{c}>" for c in channels)
+        return await ctx.send(f"**Learning from:**\n{listing}", ephemeral=True)
+
+    target = channel or ctx.channel
+    key: str = str(target.id)
+    if action == "add":
+        if key in channels:
+            return await ctx.send(
+                f"ℹ️ Already learning from {target.mention}.", ephemeral=True
+            )
+        channels.append(key)
+        note: str = (
+            f"✅ Now learning from {target.mention}. Everyone posting there should know "
+            "their messages are being stored — they can opt out with `/markov optout`."
+        )
+    else:
+        if key not in channels:
+            return await ctx.send(
+                f"ℹ️ Wasn't learning from {target.mention}.", ephemeral=True
+            )
+        channels.remove(key)
+        note = f"✅ Stopped learning from {target.mention}."
+
+    saved: bool = await markov_save_config(ctx.guild.id, {"channels": channels})
+    await ctx.send(note + ("" if saved else " (database write failed)"), ephemeral=True)
+
+
+@markov_group.command(name="probability", description="Chance of speaking after any message")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(percent="0 = never speak on its own, 100 = every message (0-100)")
+async def markov_probability(ctx: commands.Context, percent: float):
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("❌ You need Manage Server permission.", ephemeral=True)
+    value: float = min(max(percent, 0.0), 100.0)
+    saved: bool = await markov_save_config(ctx.guild.id, {"probability": value})
+    await ctx.send(
+        f"{'✅' if saved else '⚠️'} Chance to speak set to **{value:.1f}%** per message."
+        + ("" if saved else " (database write failed)"),
+        ephemeral=True,
+    )
+
+
+@markov_group.command(name="cooldown", description="Minimum gap between generated messages")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(seconds="Per-channel cooldown in seconds (0-3600)")
+async def markov_cooldown(ctx: commands.Context, seconds: int):
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("❌ You need Manage Server permission.", ephemeral=True)
+    value: float = float(min(max(seconds, 0), 3600))
+    saved: bool = await markov_save_config(ctx.guild.id, {"cooldown": value})
+    await ctx.send(
+        f"{'✅' if saved else '⚠️'} Cooldown set to **{value:.0f}s** per channel."
+        + ("" if saved else " (database write failed)"),
+        ephemeral=True,
+    )
+
+
+@markov_group.command(name="talk", description="Make the bot say something now")
+@app_commands.describe(seed="Optional word or two to start from")
+async def markov_talk(ctx: commands.Context, *, seed: Optional[str] = None):
+    config: Dict[str, Any] = markov_config(ctx.guild.id)
+    if not config["enabled"]:
+        return await ctx.send(
+            "❌ Markov is off here — an admin can enable it with `/markov on`.", ephemeral=True
+        )
+    await ctx.defer()
+    if not await _markov_ready(ctx.guild.id):
+        return await ctx.send(
+            f"📚 Still learning — it needs about {MARKOV_MIN_STATES:,} phrases before it "
+            "starts talking. Check progress with `/markov status`.",
+            ephemeral=True,
+        )
+    text: Optional[str] = await markov_generate(ctx.guild.id, seed=seed)
+    if not text:
+        return await ctx.send(
+            "🤔 Couldn't build anything from that — try a different seed, or none at all.",
+            ephemeral=True,
+        )
+    await ctx.send(text, allowed_mentions=discord.AllowedMentions.none())
+
+
+@markov_group.command(name="optout", description="Stop your messages being learned from")
+async def markov_optout(ctx: commands.Context):
+    config: Dict[str, Any] = markov_config(ctx.guild.id)
+    optout: List[str] = list(config["optout"])
+    if str(ctx.author.id) in optout:
+        return await ctx.send("ℹ️ You're already opted out here.", ephemeral=True)
+    optout.append(str(ctx.author.id))
+    saved: bool = await markov_save_config(ctx.guild.id, {"optout": optout})
+    await ctx.send(
+        f"{'✅' if saved else '⚠️'} Opted out — nothing you post here will be learned from now on.\n"
+        "⚠️ Anything already learned stays in the shared model and can't be picked back out. "
+        "Ask an admin to run `/markov reset` if that matters to you."
+        + ("" if saved else " (database write failed)"),
+        ephemeral=True,
+    )
+
+
+@markov_group.command(name="optin", description="Allow your messages to be learned from again")
+async def markov_optin(ctx: commands.Context):
+    config: Dict[str, Any] = markov_config(ctx.guild.id)
+    optout: List[str] = list(config["optout"])
+    if str(ctx.author.id) not in optout:
+        return await ctx.send("ℹ️ You weren't opted out.", ephemeral=True)
+    optout.remove(str(ctx.author.id))
+    saved: bool = await markov_save_config(ctx.guild.id, {"optout": optout})
+    await ctx.send(
+        f"{'✅' if saved else '⚠️'} Opted back in."
+        + ("" if saved else " (database write failed)"),
+        ephemeral=True,
+    )
+
+
+@markov_group.command(name="prune", description="Delete rarely-seen phrases to save space")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(min_count="Drop phrases seen this many times or fewer (default 1)")
+async def markov_prune(ctx: commands.Context, min_count: int = 1):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+    threshold: int = min(max(min_count, 1), 20)
+    await ctx.defer(ephemeral=True)
+    await markov_flush()
+    try:
+        result = await asyncio.to_thread(
+            bot.settings.markov.delete_many,
+            {"g": str(ctx.guild.id), "t": {"$lte": threshold}},
+        )
+    except PyMongoError as exc:
+        bot.log_error("markov:prune", exc)
+        return await ctx.send("❌ Pruning failed — check `/errors`.", ephemeral=True)
+    bot.markov_cache.clear()
+    bot.markov_ready.pop(ctx.guild.id, None)
+    bot.markov_checked.pop(ctx.guild.id, None)
+    await ctx.send(
+        f"✅ Pruned **{result.deleted_count:,}** phrases seen {threshold} time(s) or fewer. "
+        "Output gets a little more repetitive, storage gets a lot smaller.",
+        ephemeral=True,
+    )
+
+
+@markov_group.command(name="reset", description="Erase everything the bot has learned here")
+@app_commands.default_permissions(administrator=True)
+async def markov_reset(ctx: commands.Context):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    view: MarkovResetConfirm = MarkovResetConfirm(ctx.author.id)
+    prompt = await ctx.send(
+        "⚠️ This permanently deletes every phrase learned in this server. There is no undo.",
+        view=view,
+        ephemeral=True,
+    )
+    await view.wait()
+    if not view.confirmed:
+        return
+
+    bot.markov_buffer = {
+        key: value for key, value in bot.markov_buffer.items() if key[0] != ctx.guild.id
+    }
+    bot.markov_starts = {key for key in bot.markov_starts if key[0] != ctx.guild.id}
+    bot.markov_cache.clear()
+    bot.markov_ready.pop(ctx.guild.id, None)
+    bot.markov_checked.pop(ctx.guild.id, None)
+
+    try:
+        result = await asyncio.to_thread(
+            bot.settings.markov.delete_many, {"g": str(ctx.guild.id)}
+        )
+    except PyMongoError as exc:
+        bot.log_error("markov:reset", exc)
+        return await ctx.send("❌ Reset failed — check `/errors`.", ephemeral=True)
+
+    await ctx.send(
+        f"✅ Erased **{result.deleted_count:,}** learned phrases. Starting from nothing.",
+        ephemeral=True,
+    )
 
 # --------------------------------------------------------------------------- #
 # Entrypoint
