@@ -2042,7 +2042,88 @@ STICKY_MIN_INTERVAL: float = 6.0
 
 
 
+
+
+def ai_config(guild_id: int) -> dict:
+    settings = bot.settings.get_settings(guild_id)
+    return settings.get("markov", {
+        "enabled": False,
+        "channels": [],
+        "probability": 2.0,
+        "cooldown": 45.0,
+        "reply_on_mention": True,
+        "optout": [],
+        "ai_enabled": False,
+        "ai_probability": 100.0,
+        "personas": {},
+    })
+
+async def _get_ai_history(channel_id: int) -> list:
+    if not hasattr(bot, "ai_history_buffer"):
+        bot.ai_history_buffer = {}
+    if channel_id in bot.ai_history_buffer:
+        return bot.ai_history_buffer[channel_id]
+
+    try:
+        # ai_history is a pymongo Collection
+        doc = bot.settings.ai_history.find_one({"channel_id": str(channel_id)})
+        if doc and "history" in doc:
+            history = doc["history"]
+        else:
+            history = []
+    except Exception as exc:
+        bot.log_error("ai:history:read", exc)
+        history = []
+
+    bot.ai_history_buffer[channel_id] = history
+    return history
+
+async def ai_generate_reply(guild_id: int, channel: discord.TextChannel, system_prompt: str, history: list) -> str:
+    # Router API key
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        bot.log_error("ai:generate", RuntimeError("OPENROUTER_API_KEY environment variable is missing"))
+        return ""
+
+    # OpenRouter API (from context: https://openrouter.ai/api/v1/chat/completions)
+    url = "https://openrouter.ai/api/v1/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    # Map discord history to OpenAI-compatible messages format
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in history[-10:]:  # take the last 10 messages for context
+        role = "assistant" if msg["role"] == "model" else "user"
+        content = f"{msg['author']}: {msg['content']}" if role == "user" else msg['content']
+        messages.append({"role": role, "content": content})
+
+    payload = {
+        "model": "openai/gpt-4o-mini", # using a standard cheap fast model
+        "messages": messages
+    }
+
+    try:
+        if not hasattr(bot, "http_session") or bot.http_session is None or bot.http_session.closed:
+            bot.http_session = aiohttp.ClientSession()
+
+        async with bot.http_session.post(url, headers=headers, json=payload) as response:
+            if response.status == 200:
+                data = await response.json()
+                if "choices" in data and len(data["choices"]) > 0:
+                    return data["choices"][0]["message"]["content"]
+            else:
+                text = await response.text()
+                bot.log_error("ai:generate", RuntimeError(f"API Error {response.status}: {text}"))
+    except Exception as exc:
+        bot.log_error("ai:generate", exc)
+
+    return ""
+
 async def _handle_ai(message: discord.Message) -> None:
+
     """Process incoming messages for AI memory and potential response."""
     assert message.guild is not None
     config = ai_config(message.guild.id)
