@@ -1009,24 +1009,59 @@ async def echoset(ctx: commands.Context, state: Literal["on", "off"]) -> None:
             ephemeral=True,
         )
 
+
+async def _get_echo_files(ctx: commands.Context, attachment: Optional[discord.Attachment]) -> List[discord.File]:
+    files: List[discord.File] = []
+    if attachment:
+        files.append(await attachment.to_file())
+    elif ctx.message and ctx.message.attachments:
+        for att in ctx.message.attachments[:10]:
+            files.append(await att.to_file())
+    return files
+
+async def _send_echo_message(
+    target: discord.TextChannel,
+    payload: str,
+    allowed: discord.AllowedMentions,
+    files: List[discord.File]
+) -> bool:
+    try:
+        content = payload[:2000] if payload else None
+        if not content and not files:
+            return False
+        await target.send(content, allowed_mentions=allowed, files=files)
+        return True
+    except discord.Forbidden:
+        raise
+    except discord.HTTPException as exc:
+        log.error("Echo send failed: %s", exc)
+        raise
+
 @bot.hybrid_command(name="echo", description="Make the bot say something, optionally in another channel.")
 @commands.guild_only()
 @app_commands.describe(
     channel="Target channel (defaults to the current channel).",
+    attachment="An optional file to attach.",
     message="What the bot should say.",
 )
 async def echo(
     ctx: commands.Context,
     channel: Optional[discord.TextChannel] = None,
+    attachment: Optional[discord.Attachment] = None,
     *,
     message: Optional[str] = None,
 ) -> None:
+    if ctx.interaction is not None:
+        await ctx.defer(ephemeral=True)
+
     guild: Optional[discord.Guild] = ctx.guild
     if guild is None or not isinstance(ctx.author, discord.Member):
         await ctx.send("❌ This command only works inside a server.", ephemeral=True)
         return
-    if not message or not message.strip():
-        await ctx.send("❌ You must provide a message to echo.", ephemeral=True)
+
+    has_files = bool(attachment or (ctx.message and ctx.message.attachments))
+    if not message and not has_files:
+        await ctx.send("❌ You must provide a message or attachment to echo.", ephemeral=True)
         return
 
     settings: Dict[str, Any] = bot.settings.get_settings(guild.id)
@@ -1056,18 +1091,22 @@ async def echo(
         or actor.guild_permissions.administrator
         or actor.guild_permissions.mention_everyone
     )
-    payload: str = message if privileged else sanitize_mass_pings(message)
+    payload: str = ""
+    if message:
+        payload = message if privileged else sanitize_mass_pings(message)
+
     allowed: discord.AllowedMentions = discord.AllowedMentions(
         everyone=privileged, roles=privileged, users=True
     )
 
+    files = await _get_echo_files(ctx, attachment)
+
     try:
-        await target.send(payload[:2000], allowed_mentions=allowed)
+        await _send_echo_message(target, payload, allowed, files)
     except discord.Forbidden:
         await ctx.send(f"❌ I don't have permission to send messages in {target.mention}.", ephemeral=True)
         return
-    except discord.HTTPException as exc:
-        log.error("Echo send failed: %s", exc)
+    except discord.HTTPException:
         await ctx.send("⚠️ Echo failed due to a Discord API error.", ephemeral=True)
         return
 

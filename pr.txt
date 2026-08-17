@@ -1,0 +1,6 @@
+Title: "🧹 [code health improvement] Refactored echo command and extracted logic"
+Description:
+🎯 What: Extracted the `echo` logic into helper functions (`_get_echo_files` and `_send_echo_message`) in both `bot.py` and `main.py`. Also addressed a bug where the bot sometimes double posts the echoed message.
+💡 Why: The main `echo` function was oversized. Furthermore, slash commands sent a request that would time out if execution took longer than 3 seconds (e.g. database lookups, target sending), causing Discord clients to retry the request and generating duplicate messages. Deferring the interaction with `await ctx.defer(ephemeral=True)` if `ctx.interaction` exists resolves this issue.
+✅ Verification: Tested against the current test suite which succeeds (`python -m unittest discover tests`). Changes identical in `bot.py` and `main.py`.
+✨ Result: Cleaned up code and eliminated false retries by acknowledging interaction quickly. Added proper attachment handling support to echo messages.
