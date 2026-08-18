@@ -2766,20 +2766,22 @@ async def _handle_ai(message: discord.Message) -> None:
 
     if not should_reply:
         return
-    if now < bot.ai_next_fire.get(channel_id, 0.0):
+    if not (is_mentioned or replying_to_bot) and now < bot.ai_next_fire.get(channel_id, 0.0):
         return
     if _ai_quota_left(trigger_message.guild.id, int(config.get("daily_limit") or 0)) <= 0:
         return
 
     lock = bot.ai_locks.setdefault(channel_id, asyncio.Lock())
-    if lock.locked():
-        return
 
     async with lock:
+        now_in_lock = time.time()
+        if not (is_mentioned or replying_to_bot) and now_in_lock < bot.ai_next_fire.get(channel_id, 0.0):
+            return
+
         history = await _get_ai_history(channel_id)
         # Claim the cooldown before the network call so a burst can't double-fire.
-        bot.ai_next_fire[channel_id] = now + float(config.get("cooldown") or 60.0)
-        bot.ai_active_conversations[channel_id] = now
+        bot.ai_next_fire[channel_id] = now_in_lock + float(config.get("cooldown") or 60.0)
+        bot.ai_active_conversations[channel_id] = now_in_lock
         _ai_quota_spend(trigger_message.guild.id)
 
         relevant_ids = [str(trigger_message.author.id)] + [
