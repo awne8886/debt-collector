@@ -2800,7 +2800,16 @@ async def _handle_ai(message: discord.Message) -> None:
         if not messages:
             return
 
-        async with message.channel.typing():
+        try:
+            async with message.channel.typing():
+                reply, provider = await ai_generate_reply(
+                    message.guild.id, system_prompt, messages, config
+                )
+        except discord.HTTPException as exc:
+            if exc.status == 429:
+                bot.log_error("ai:typing_ratelimit", exc)
+            else:
+                bot.log_error("ai:typing", exc)
             reply, provider = await ai_generate_reply(
                 message.guild.id, system_prompt, messages, config
             )
@@ -3397,7 +3406,7 @@ async def ask_cmd(ctx: commands.Context, *, prompt: str):
     if _ai_quota_left(ctx.guild.id, int(config.get("daily_limit") or 0)) <= 0:
         return await ctx.send("❌ This server hit its daily AI limit.", ephemeral=True)
 
-    await ctx.defer(ephemeral=private)
+    await ctx.defer(ephemeral=True)
     _ai_quota_spend(ctx.guild.id)
     system_prompt = build_system_prompt(
         ctx.guild, ctx.channel.id, config, [str(ctx.author.id)]
@@ -3415,11 +3424,11 @@ async def ask_cmd(ctx: commands.Context, *, prompt: str):
     chunks = chunk_text(sanitize_mass_pings(reply))
     await ctx.send(
         chunks[0],
-        ephemeral=private,
+        ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
     for extra in chunks[1:]:
-        await ctx.send(extra, ephemeral=private, allowed_mentions=discord.AllowedMentions.none())
+        await ctx.send(extra, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.hybrid_command(name="aiopt", description="Control whether the AI may read or reply to you")
