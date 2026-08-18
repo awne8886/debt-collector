@@ -95,3 +95,53 @@ class TestAIRateLimitHandling(unittest.IsolatedAsyncioTestCase):
 
             mock_bot.log_error.assert_called_with("ai:typing_ratelimit", unittest.mock.ANY)
             mock_message.reply.assert_called_once_with("Hello response", mention_author=False, allowed_mentions=unittest.mock.ANY)
+
+
+class TestAITargeting(unittest.IsolatedAsyncioTestCase):
+    async def test_reply_targets_trigger_message(self):
+        import discord
+        from unittest.mock import AsyncMock, patch
+
+        mock_msg1 = MagicMock(spec=discord.Message)
+        mock_msg1.guild = MagicMock(id=123)
+        mock_msg1.author = MagicMock(bot=False, id=111, display_name="User1")
+        mock_msg1.channel = MagicMock(id=789)
+        mock_msg1.content = "hello bot from user 1"
+        mock_msg1.attachments = []
+        mock_msg1.mention_everyone = False
+        mock_msg1.reply = AsyncMock()
+
+        mock_msg2 = MagicMock(spec=discord.Message)
+        mock_msg2.guild = MagicMock(id=123)
+        mock_msg2.author = MagicMock(bot=False, id=222, display_name="User2")
+        mock_msg2.channel = MagicMock(id=789)
+        mock_msg2.content = "hello bot from user 2"
+        mock_msg2.attachments = []
+        mock_msg2.mention_everyone = False
+        mock_msg2.reply = AsyncMock()
+
+        class DummyTyping:
+            async def __aenter__(self): pass
+            async def __aexit__(self, exc_type, exc, tb): pass
+
+        mock_msg1.channel.typing.return_value = DummyTyping()
+
+        with patch("main.bot") as mock_bot, \
+             patch("main.ai_config", return_value={"enabled": True, "channels": ["789"], "probability": 100.0, "cooldown": 0, "daily_limit": 0, "provider_order": ["openrouter"], "models": {}}), \
+             patch("main._get_ai_history", return_value=[{"role": "user", "author": "User1", "author_id": 111, "content": "hello bot from user 1"}]), \
+             patch("main._reply_target_is_bot", return_value=(False, None)), \
+             patch("main.ai_generate_reply", return_value=("AI response to user 1", "openrouter")):
+
+            mock_bot.user = MagicMock(id=999, display_name="BotName")
+            mock_bot.user.mentioned_in.return_value = True
+            mock_bot.settings.get_settings.return_value = {"prefix": "!"}
+            mock_bot.ai_active_conversations = {}
+            mock_bot.ai_next_fire = {}
+            mock_bot.ai_locks = {}
+            mock_bot.log_error = MagicMock()
+
+            from main import _handle_ai
+            await _handle_ai(mock_msg1)
+
+            mock_msg1.reply.assert_called_once_with("AI response to user 1", mention_author=False, allowed_mentions=unittest.mock.ANY)
+            mock_msg2.reply.assert_not_called()

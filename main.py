@@ -2712,43 +2712,44 @@ def _ai_is_ignored(config: Dict[str, Any], member: discord.abc.User) -> bool:
 
 async def _handle_ai(message: discord.Message) -> None:
     """Store channel chatter and decide whether the AI should answer."""
-    assert message.guild is not None
-    if message.author.bot or bot.user is None:
+    trigger_message = message
+    assert trigger_message.guild is not None
+    if trigger_message.author.bot or bot.user is None:
         return
 
-    config = ai_config(message.guild.id)
+    config = ai_config(trigger_message.guild.id)
     if not config["enabled"]:
         return
 
-    channel_id = message.channel.id
+    channel_id = trigger_message.channel.id
     if str(channel_id) not in (config.get("channels") or []):
         return
 
-    guild_prefix = bot.settings.get_settings(message.guild.id).get("prefix", COMMAND_PREFIX)
-    content = message.content or ""
+    guild_prefix = bot.settings.get_settings(trigger_message.guild.id).get("prefix", COMMAND_PREFIX)
+    content = trigger_message.content or ""
     if content.startswith(guild_prefix) or content.startswith(COMMAND_PREFIX):
         return
-    if _ai_is_ignored(config, message.author):
+    if _ai_is_ignored(config, trigger_message.author):
         return
 
     history = await _get_ai_history(channel_id)
-    replying_to_bot, replied_message = await _reply_target_is_bot(message)
+    replying_to_bot, replied_message = await _reply_target_is_bot(trigger_message)
 
-    if content.strip() or message.attachments:
+    if content.strip() or trigger_message.attachments:
         text = content.strip() or "[attachment]"
         _ai_remember(
             channel_id,
             {
                 "role": "user",
-                "author": message.author.display_name,
-                "author_id": message.author.id,
+                "author": trigger_message.author.display_name,
+                "author_id": trigger_message.author.id,
                 "content": text[:1500],
                 "timestamp": time.time(),
             },
         )
 
     now = time.time()
-    is_mentioned = bot.user.mentioned_in(message) and not message.mention_everyone
+    is_mentioned = bot.user.mentioned_in(trigger_message) and not trigger_message.mention_everyone
     last_ai = bot.ai_active_conversations.get(channel_id, 0.0)
     elapsed = now - last_ai
     base_chance = float(config.get("probability") or 0.0)
@@ -2767,7 +2768,7 @@ async def _handle_ai(message: discord.Message) -> None:
         return
     if now < bot.ai_next_fire.get(channel_id, 0.0):
         return
-    if _ai_quota_left(message.guild.id, int(config.get("daily_limit") or 0)) <= 0:
+    if _ai_quota_left(trigger_message.guild.id, int(config.get("daily_limit") or 0)) <= 0:
         return
 
     lock = bot.ai_locks.setdefault(channel_id, asyncio.Lock())
@@ -2775,16 +2776,17 @@ async def _handle_ai(message: discord.Message) -> None:
         return
 
     async with lock:
+        history = await _get_ai_history(channel_id)
         # Claim the cooldown before the network call so a burst can't double-fire.
         bot.ai_next_fire[channel_id] = now + float(config.get("cooldown") or 60.0)
         bot.ai_active_conversations[channel_id] = now
-        _ai_quota_spend(message.guild.id)
+        _ai_quota_spend(trigger_message.guild.id)
 
-        relevant_ids = [str(message.author.id)] + [
+        relevant_ids = [str(trigger_message.author.id)] + [
             str(m.get("author_id")) for m in history[-10:] if m.get("author_id")
         ]
         system_prompt = build_system_prompt(
-            message.guild, channel_id, config, relevant_ids
+            trigger_message.guild, channel_id, config, relevant_ids
         )
         messages = _format_history(history)
         if replying_to_bot and replied_message is not None and replied_message.content:
@@ -2801,9 +2803,9 @@ async def _handle_ai(message: discord.Message) -> None:
             return
 
         try:
-            async with message.channel.typing():
+            async with trigger_message.channel.typing():
                 reply, provider = await ai_generate_reply(
-                    message.guild.id, system_prompt, messages, config
+                    trigger_message.guild.id, system_prompt, messages, config
                 )
         except discord.HTTPException as exc:
             if exc.status == 429:
@@ -2811,7 +2813,7 @@ async def _handle_ai(message: discord.Message) -> None:
             else:
                 bot.log_error("ai:typing", exc)
             reply, provider = await ai_generate_reply(
-                message.guild.id, system_prompt, messages, config
+                trigger_message.guild.id, system_prompt, messages, config
             )
 
         if not reply:
@@ -2823,7 +2825,7 @@ async def _handle_ai(message: discord.Message) -> None:
             return
 
         try:
-            sent = await message.reply(
+            sent = await trigger_message.reply(
                 chunks[0],
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none(),
