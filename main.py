@@ -2247,8 +2247,8 @@ DEFAULT_PROVIDER_ORDER: List[str] = ["openrouter", "gemini", "groq"]
 
 DEFAULT_MODELS: Dict[str, str] = {
     "openrouter": os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash"),
-    "gemini": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-    "groq": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+    "gemini": os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
+    "groq": os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
 }
 
 # Curated, listable options. A guild may still set any model string manually.
@@ -2256,27 +2256,58 @@ MODEL_CATALOG: Dict[str, List[str]] = {
     "openrouter": [
         "google/gemini-2.5-flash",
         "google/gemini-2.5-flash-lite",
+        "openai/gpt-oss-120b",
         "openai/gpt-4o-mini",
         "anthropic/claude-3.5-haiku",
         "meta-llama/llama-3.3-70b-instruct",
         "deepseek/deepseek-chat",
         "mistralai/mistral-small-3.2-24b-instruct",
-        "qwen/qwen-2.5-72b-instruct",
     ],
     "gemini": [
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.5-pro",
-        "gemini-2.0-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-flash-latest",
     ],
     "groq": [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
         "openai/gpt-oss-120b",
         "openai/gpt-oss-20b",
-        "qwen/qwen3-32b",
+        "groq/compound-mini",
     ],
 }
+
+# Identifiers the providers have retired. A guild that saved one of these before
+# the shutdown keeps sending it and gets a hard 404 on every reply, so stored
+# names are rewritten to their live successor whenever the config is read.
+RETIRED_MODELS: Dict[str, Dict[str, str]] = {
+    "gemini": {
+        "gemini-2.5-flash": "gemini-3.6-flash",
+        "gemini-2.5-flash-lite": "gemini-3.5-flash-lite",
+        "gemini-2.5-pro": "gemini-3.7-flash",
+        "gemini-2.0-flash": "gemini-3.5-flash",
+        "gemini-2.0-flash-lite": "gemini-3.5-flash-lite",
+        "gemini-1.5-flash": "gemini-3.5-flash",
+        "gemini-1.5-pro": "gemini-3.7-flash",
+    },
+    "groq": {
+        "llama-3.3-70b-versatile": "openai/gpt-oss-120b",
+        "llama-3.1-8b-instant": "openai/gpt-oss-20b",
+        "llama3-70b-8192": "openai/gpt-oss-120b",
+        "llama3-8b-8192": "openai/gpt-oss-20b",
+        "mixtral-8x7b-32768": "openai/gpt-oss-20b",
+        "qwen/qwen3-32b": "openai/gpt-oss-20b",
+        "meta-llama/llama-4-scout-17b-16e-instruct": "openai/gpt-oss-120b",
+    },
+}
+
+
+def resolve_model(provider: str, model: Optional[str]) -> str:
+    """Map a stored model identifier onto one the provider still serves."""
+    name = str(model or "").strip()
+    if not name:
+        return DEFAULT_MODELS[provider]
+    return RETIRED_MODELS.get(provider, {}).get(name, name)
 
 AI_PRESETS: Dict[str, str] = {
     "debt_collector": (
@@ -2335,12 +2366,13 @@ def ai_config(guild_id: int) -> Dict[str, Any]:
     config = _ai_defaults()
     for key, value in stored.items():
         config[key] = value
-    if not config.get("models"):
-        config["models"] = dict(DEFAULT_MODELS)
-    else:
-        merged = dict(DEFAULT_MODELS)
-        merged.update(config["models"])
-        config["models"] = merged
+    merged = dict(DEFAULT_MODELS)
+    for provider, name in (config.get("models") or {}).items():
+        if provider in PROVIDER_KEYS:
+            merged[provider] = name
+    config["models"] = {
+        provider: resolve_model(provider, name) for provider, name in merged.items()
+    }
     order = [p for p in (config.get("provider_order") or []) if p in PROVIDER_KEYS]
     for provider in DEFAULT_PROVIDER_ORDER:
         if provider not in order:
@@ -2525,6 +2557,47 @@ def _build_provider_request(
     return None
 
 
+def _flatten_text(value: Any) -> str:
+    """Collapse any provider content shape (None, str, list, dict) into plain text.
+
+    Provider payloads are not guaranteed to carry a string: content comes back as
+    None on refusals and reasoning-only turns, and as a list of typed parts on the
+    multimodal endpoints. Everything is normalised here so no caller ever runs a
+    string method on None.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(_flatten_text(item) for item in value)
+    if isinstance(value, dict):
+        return _flatten_text(value.get("text"))
+    return str(value)
+
+
+def _parse_openai_compatible(data: Dict[str, Any]) -> str:
+    """Read the reply out of an OpenAI-shaped response (OpenRouter, Groq).
+
+    message.content is null whenever the upstream model returns a filtered or
+    reasoning-only turn, so dict.get(key, "") hands back None rather than the
+    default and the following .strip() raises AttributeError.
+    """
+    choices = data.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        return _flatten_text(choices[0].get("text")).strip()
+    text = _flatten_text(message.get("content")).strip()
+    if not text:
+        for fallback in ("reasoning_content", "reasoning"):
+            text = _flatten_text(message.get(fallback)).strip()
+            if text:
+                break
+    return text
+
+
 def _parse_gemini(data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """Return (text, block_reason)."""
     feedback = data.get("promptFeedback") or {}
@@ -2533,12 +2606,12 @@ def _parse_gemini(data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     candidates = data.get("candidates") or []
     if not candidates:
         return None, "NO_CANDIDATES"
-    candidate = candidates[0]
+    candidate = candidates[0] if isinstance(candidates[0], dict) else {}
     finish = candidate.get("finishReason")
     if finish in ("SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT"):
         return None, str(finish)
     parts = ((candidate.get("content") or {}).get("parts")) or []
-    text = "".join(p.get("text", "") for p in parts).strip()
+    text = _flatten_text(parts).strip()
     if not text:
         return None, str(finish or "EMPTY")
     return text, None
@@ -2595,12 +2668,7 @@ async def ai_generate_reply(
                                 bot.log_error("ai:blocked", f"{provider}: {blocked}")
                                 break
                         else:
-                            choices = data.get("choices") or []
-                            text = (
-                                (choices[0].get("message") or {}).get("content", "").strip()
-                                if choices
-                                else ""
-                            )
+                            text = _parse_openai_compatible(data)
                         if text:
                             _ai_stat(provider, "ok")
                             return text, provider
@@ -3235,9 +3303,13 @@ async def ai_model(
         return
     config = ai_config(ctx.guild.id)
     models = dict(config.get("models") or {})
-    models[provider] = model.strip()[:100]
+    models[provider] = resolve_model(provider, model[:100])
     saved = await _ai_save(ctx.guild.id, models=models)
-    known = " " if model.strip() in MODEL_CATALOG[provider] else " *(custom model — untested)* "
+    known = (
+        " "
+        if models[provider] in MODEL_CATALOG[provider]
+        else " *(custom model — untested)* "
+    )
     await ctx.send(
         f"{_saved_mark(saved)} `{provider}` will now use `{models[provider]}`.{known}"
         f"{_saved_suffix(saved)}",
