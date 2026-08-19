@@ -145,3 +145,58 @@ class TestAITargeting(unittest.IsolatedAsyncioTestCase):
 
             mock_msg1.reply.assert_called_once_with("AI response to user 1", mention_author=False, allowed_mentions=unittest.mock.ANY)
             mock_msg2.reply.assert_not_called()
+
+
+class TestConcurrentAIMessages(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_messages_both_replied(self):
+        import discord
+        from unittest.mock import AsyncMock, patch
+
+        mock_msg1 = MagicMock(spec=discord.Message)
+        mock_msg1.guild = MagicMock(id=123)
+        mock_msg1.author = MagicMock(bot=False, id=111, display_name="User1")
+        mock_msg1.channel = MagicMock(id=789)
+        mock_msg1.content = "message 1"
+        mock_msg1.attachments = []
+        mock_msg1.mention_everyone = False
+        mock_msg1.mentions = []
+        mock_msg1.reply = AsyncMock()
+
+        mock_msg2 = MagicMock(spec=discord.Message)
+        mock_msg2.guild = MagicMock(id=123)
+        mock_msg2.author = MagicMock(bot=False, id=222, display_name="User2")
+        mock_msg2.channel = MagicMock(id=789)
+        mock_msg2.content = "message 2"
+        mock_msg2.attachments = []
+        mock_msg2.mention_everyone = False
+        mock_msg2.mentions = []
+        mock_msg2.reply = AsyncMock()
+
+        class DelayTyping:
+            async def __aenter__(self):
+                await asyncio.sleep(0.05)
+            async def __aexit__(self, exc_type, exc, tb):
+                pass
+
+        mock_msg1.channel.typing.side_effect = lambda: DelayTyping()
+        mock_msg2.channel.typing.side_effect = lambda: DelayTyping()
+
+        with patch("main.bot") as mock_bot,              patch("main.ai_config", return_value={"enabled": True, "channels": ["789"], "probability": 100.0, "cooldown": 0, "daily_limit": 0, "provider_order": ["openrouter"], "models": {}}),              patch("main._get_ai_history", side_effect=lambda cid: mock_bot.ai_history_buffer.get(cid, [])),              patch("main._reply_target_is_bot", return_value=(False, None)),              patch("main.ai_generate_reply", side_effect=[("Reply 1", "openrouter"), ("Reply 2", "openrouter")]):
+
+            mock_bot.user = MagicMock(id=999, display_name="BotName")
+            mock_bot.user.mentioned_in.return_value = True
+            mock_bot.settings.get_settings.return_value = {"prefix": "!"}
+            mock_bot.ai_active_conversations = {}
+            mock_bot.ai_next_fire = {}
+            mock_bot.ai_locks = {}
+            mock_bot.ai_history_buffer = {}
+            mock_bot.ai_pending = {}
+            mock_bot.ai_history_dirty = set()
+            mock_bot.ai_lru = {}
+            mock_bot.ai_daily = {}
+
+            from main import _handle_ai
+            await asyncio.gather(_handle_ai(mock_msg1), _handle_ai(mock_msg2))
+
+            mock_msg1.reply.assert_called_once_with("Reply 1", mention_author=False, allowed_mentions=unittest.mock.ANY)
+            mock_msg2.reply.assert_called_once_with("Reply 2", mention_author=False, allowed_mentions=unittest.mock.ANY)
