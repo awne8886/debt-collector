@@ -4684,7 +4684,27 @@ if __name__ == "__main__":
     else:
         async def runner() -> None:
             await _start_keepalive_server()
-            await bot.start(token)
+
+            backoff = 15
+            max_backoff = 300
+
+            while True:
+                try:
+                    await bot.start(token)
+                    break  # If start() returns cleanly, exit the loop
+                except discord.HTTPException as e:
+                    if e.status == 429:
+                        log.warning(f"Rate limited (HTTP 429) during startup: {e}. Retrying in {backoff} seconds...")
+                    else:
+                        log.warning(f"HTTPException during startup: {e}. Retrying in {backoff} seconds...")
+                except (discord.ConnectionClosed, aiohttp.ClientError, Exception) as e:
+                    log.warning(f"Connection error during startup: {e}. Retrying in {backoff} seconds...")
+
+                # Sleep with jitter
+                await asyncio.sleep(backoff + random.uniform(0, 5))
+
+                # Exponential backoff
+                backoff = min(backoff * 2, max_backoff)
             
         try:
             asyncio.run(runner())
