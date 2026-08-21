@@ -31,6 +31,233 @@ logging.basicConfig(
 )
 log: logging.Logger = logging.getLogger("debt-collector")
 
+
+# --------------------------------------------------------------------------- #
+# Environment-driven configuration + structured error recorder
+# --------------------------------------------------------------------------- #
+
+import sys as _sys
+import traceback as _traceback
+from collections import OrderedDict
+
+LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+ERROR_BUFFER_SIZE: int = int(os.getenv("ERROR_BUFFER_SIZE", "120"))
+ERROR_PERSIST: bool = os.getenv("ERROR_PERSIST", "1") == "1"
+_ERROR_DIGIT_RE = re.compile(r"\d{2,}")
+
+
+def _parse_id_set(raw: Optional[str]) -> frozenset:
+    """Parse a comma/space separated snowflake list; ignores malformed entries."""
+    if not raw:
+        return frozenset()
+    ids: set = set()
+    for chunk in re.split(r"[,\s]+", raw.strip()):
+        if chunk.isdigit():
+            ids.add(int(chunk))
+        elif chunk:
+            log.warning("Ignoring non-numeric SUPERUSER_IDS entry: %r", chunk)
+    return frozenset(ids)
+
+
+@dataclass
+class ErrorRecord:
+    """One deduplicated failure signature with its full context."""
+
+    fingerprint: str
+    where: str
+    exc_type: str
+    message: str
+    stack: str
+    first_seen: float
+    last_seen: float
+    count: int = 1
+    guild_id: Optional[int] = None
+    guild_name: Optional[str] = None
+    channel_id: Optional[int] = None
+    user_id: Optional[int] = None
+    user_name: Optional[str] = None
+    command: Optional[str] = None
+
+    def short_id(self) -> str:
+        return self.fingerprint[:8]
+
+    def summary(self) -> str:
+        scope: str = self.guild_name or ("global" if self.guild_id is None else str(self.guild_id))
+        badge: str = f" x{self.count}" if self.count > 1 else ""
+        tail: str = f" - `{self.command}`" if self.command else ""
+        return (
+            f"`{self.short_id()}` <t:{int(self.last_seen)}:R> - **{self.where}**{badge}\n"
+            f"\u2514 `{self.exc_type}: {self.message[:140]}`\n"
+            f"\u2514 {scope}{tail}"
+        )
+
+
+class ErrorRecorder:
+    """Fingerprinted, deduplicated, optionally persisted error buffer."""
+
+    def __init__(self, capacity: int = ERROR_BUFFER_SIZE) -> None:
+        self._records: "OrderedDict[str, ErrorRecord]" = OrderedDict()
+        self._capacity: int = max(10, capacity)
+        self._total: int = 0
+        self._started: float = time.time()
+
+    @staticmethod
+    def _fingerprint(where: str, exc_type: str, message: str) -> str:
+        normalized: str = _ERROR_DIGIT_RE.sub("#", message)[:200]
+        return hashlib.sha256(
+            f"{where}|{exc_type}|{normalized}".encode("utf-8")
+        ).hexdigest()
+
+    def record(
+        self,
+        where: str,
+        err: Any,
+        *,
+        guild: Optional[discord.Guild] = None,
+        channel: Optional[Any] = None,
+        user: Optional[discord.abc.User] = None,
+        command: Optional[str] = None,
+    ) -> ErrorRecord:
+        now: float = time.time()
+        self._total += 1
+
+        if isinstance(err, BaseException):
+            exc_type: str = type(err).__name__
+            message: str = str(err) or exc_type
+            stack: str = "".join(
+                _traceback.format_exception(type(err), err, err.__traceback__)
+            )[-3500:]
+        else:
+            exc_type = "Message"
+            message = str(err)
+            stack = ""
+
+        fingerprint: str = self._fingerprint(where, exc_type, message)
+        existing: Optional[ErrorRecord] = self._records.get(fingerprint)
+        if existing is not None:
+            existing.count += 1
+            existing.last_seen = now
+            if stack:
+                existing.stack = stack
+            self._records.move_to_end(fingerprint)
+            record: ErrorRecord = existing
+        else:
+            record = ErrorRecord(
+                fingerprint=fingerprint,
+                where=where,
+                exc_type=exc_type,
+                message=message[:600],
+                stack=stack,
+                first_seen=now,
+                last_seen=now,
+                guild_id=guild.id if guild is not None else None,
+                guild_name=guild.name if guild is not None else None,
+                channel_id=getattr(channel, "id", None),
+                user_id=getattr(user, "id", None),
+                user_name=str(user) if user is not None else None,
+                command=command,
+            )
+            self._records[fingerprint] = record
+            while len(self._records) > self._capacity:
+                self._records.popitem(last=False)
+
+        if ERROR_PERSIST:
+            self._schedule_persist(record)
+        return record
+
+    def _schedule_persist(self, record: ErrorRecord) -> None:
+        runner: Any = globals().get("bot")
+        if runner is None or not hasattr(runner, "spawn"):
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        runner.spawn(self._persist(record), name=f"errpersist:{record.short_id()}")
+
+    async def _persist(self, record: ErrorRecord) -> None:
+        try:
+            await asyncio.to_thread(
+                bot.settings.meta.update_one,
+                {"key": f"error:{record.fingerprint}"},
+                {
+                    "$set": {
+                        "value": {
+                            "where": record.where,
+                            "exc_type": record.exc_type,
+                            "message": record.message,
+                            "guild_id": record.guild_id,
+                            "command": record.command,
+                            "last_seen": record.last_seen,
+                        }
+                    },
+                    "$inc": {"occurrences": 1},
+                },
+                True,
+            )
+        except PyMongoError as exc:
+            log.debug("Error persistence failed: %s", exc)
+
+    def recent(
+        self,
+        *,
+        where: Optional[str] = None,
+        guild_id: Optional[int] = None,
+    ) -> List[ErrorRecord]:
+        items: List[ErrorRecord] = list(reversed(list(self._records.values())))
+        if where:
+            needle: str = where.casefold()
+            items = [r for r in items if needle in r.where.casefold()]
+        if guild_id is not None:
+            items = [r for r in items if r.guild_id in (None, guild_id)]
+        return items
+
+    def get(self, short_id: str) -> Optional[ErrorRecord]:
+        needle: str = short_id.strip().casefold()
+        if not needle:
+            return None
+        for record in self._records.values():
+            if record.fingerprint.startswith(needle):
+                return record
+        return None
+
+    def clear(self) -> int:
+        removed: int = len(self._records)
+        self._records.clear()
+        return removed
+
+    def stats(self) -> Dict[str, Any]:
+        by_type: Dict[str, int] = {}
+        for record in self._records.values():
+            by_type[record.exc_type] = by_type.get(record.exc_type, 0) + record.count
+        return {
+            "unique": len(self._records),
+            "total": self._total,
+            "uptime": time.time() - self._started,
+            "by_type": sorted(by_type.items(), key=lambda kv: kv[1], reverse=True),
+        }
+
+
+class ErrorRecorderHandler(logging.Handler):
+    """Bridges the logging tree into the recorder so nothing lives only in stderr."""
+
+    def __init__(self, recorder: ErrorRecorder) -> None:
+        super().__init__(level=logging.ERROR)
+        self._recorder: ErrorRecorder = recorder
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if record.exc_info and record.exc_info[1] is not None:
+                self._recorder.record(f"log:{record.name}", record.exc_info[1])
+            else:
+                self._recorder.record(f"log:{record.name}", record.getMessage())
+        except Exception:  # a logging handler must never raise
+            pass
+
+
+
 # --------------------------------------------------------------------------- #
 # Global constants
 # --------------------------------------------------------------------------- #
@@ -57,16 +284,17 @@ class AfkRecord:
     since: float
     pings: List[AfkPing] = field(default_factory=list)
 
-AFK_GRACE_SECONDS: float = 15.0
-COMMAND_PREFIX: str = "!"
-MONGO_DB_NAME: str = "debt_collector"
-MONGO_COLLECTION_NAME: str = "guild_settings"
-AI_HISTORY_COLLECTION_NAME: str = "ai_history"
+AFK_GRACE_SECONDS: float = float(os.getenv("AFK_GRACE_SECONDS", "15"))
+COMMAND_PREFIX: str = os.getenv("DEFAULT_PREFIX", "!")
+MONGO_DB_NAME: str = os.getenv("MONGO_DB_NAME", "debt_collector")
+MONGO_COLLECTION_NAME: str = os.getenv("MONGO_SETTINGS_COLLECTION", "guild_settings")
+AI_HISTORY_COLLECTION_NAME: str = os.getenv("MONGO_AI_COLLECTION", "ai_history")
 
-SUPERUSER_IDS: frozenset = frozenset(
+# Snowflake-only. Username matching was removed: Discord usernames are user-mutable
+# and re-claimable, so name-based authorization is a privilege-escalation vector.
+SUPERUSER_IDS: frozenset = _parse_id_set(os.getenv("SUPERUSER_IDS")) or frozenset(
     {1120393965485703219, 600689350686146562, 760531428881465366}
 )
-SUPERUSER_NAMES: frozenset = frozenset({"modfs"})
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "echoset": False,
@@ -123,19 +351,32 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "tags": {},
     "tempbans": {},
     "sticky": {},
-    "warns": {}
+    "warns": {},
+    "raid": {
+        "enabled": False,
+        "auto": True,
+        "until": 0,
+        "join_threshold": 8,
+        "window": 20,
+        "min_account_age_hours": 24,
+        "action": "quarantine",
+        "quarantine_role_id": None,
+    },
+    "quarantined": {},
 }
 
 def is_superuser(user: discord.abc.User) -> bool:
-    return user.id in SUPERUSER_IDS or user.name.lower() in SUPERUSER_NAMES
+    """Snowflake-only superuser check."""
+    return user.id in SUPERUSER_IDS
 
-def get_prefix(bot, message: discord.Message) -> str:
-    if message.guild is None:
+
+async def get_prefix(bot: "DebtCollectorBot", message: discord.Message) -> str:
+    """Async prefix resolver - never blocks the event loop on a cache miss."""
+    if message.guild is None or not hasattr(bot, "settings"):
         return COMMAND_PREFIX
-    if not hasattr(bot, "settings"):
-        return COMMAND_PREFIX
-    settings = bot.settings.get_settings(message.guild.id)
-    return settings.get("prefix", COMMAND_PREFIX)
+    settings: Dict[str, Any] = await bot.settings.fetch_settings(message.guild.id)
+    prefix: Any = settings.get("prefix", COMMAND_PREFIX)
+    return prefix if isinstance(prefix, str) and prefix else COMMAND_PREFIX
 
 # --------------------------------------------------------------------------- #
 # TASK 1 — Persistence layer
@@ -166,7 +407,11 @@ class MultiTenantSettingsManager:
         self.ai_history: Collection = self._client[MONGO_DB_NAME][AI_HISTORY_COLLECTION_NAME]
         self.cases: Collection = self._client[MONGO_DB_NAME]["mod_cases"]
         self.meta: Collection = self._client[MONGO_DB_NAME]["bot_meta"]
+        self.reminders: Collection = self._client[MONGO_DB_NAME]["reminders"]
         self._cache: Dict[int, Dict[str, Any]] = {}
+        self._warming: set = set()
+        self._cache_hits: int = 0
+        self._cache_misses: int = 0
 
     def get_settings(self, guild_id: int) -> Dict[str, Any]:
         if guild_id in self._cache:
@@ -255,6 +500,8 @@ class MultiTenantSettingsManager:
             (self.meta, "key", {"unique": True}),
             (self.cases, "guildid", {}),
             (self.cases, "target_id", {}),
+            (self.reminders, "due_at", {}),
+            (self.reminders, "user_id", {}),
         ):
             try:
                 collection.create_index(spec, **options)
@@ -271,6 +518,52 @@ class MultiTenantSettingsManager:
 
     async def push_settings(self, guild_id: int, payload: Dict[str, Any]) -> bool:
         return await asyncio.to_thread(self.update_settings, guild_id, payload)
+
+    def peek_settings(self, guild_id: int) -> Dict[str, Any]:
+        """Cache-only read. Never touches the network, so it is safe on the event loop.
+
+        On a miss it returns a defaults copy and schedules an off-loop warm-up.
+        """
+        cached: Optional[Dict[str, Any]] = self._cache.get(guild_id)
+        if cached is not None:
+            self._cache_hits += 1
+            return cached
+
+        self._cache_misses += 1
+        if guild_id not in self._warming:
+            self._warming.add(guild_id)
+            try:
+                asyncio.get_running_loop().create_task(self._warm(guild_id))
+            except RuntimeError:
+                self._warming.discard(guild_id)
+
+        fallback: Dict[str, Any] = copy.deepcopy(DEFAULT_SETTINGS)
+        fallback["guildid"] = str(guild_id)
+        return fallback
+
+    async def _warm(self, guild_id: int) -> None:
+        try:
+            await asyncio.to_thread(self.get_settings, guild_id)
+        except PyMongoError as exc:
+            log.error("Settings warm-up failed for guild %s: %s", guild_id, exc)
+        finally:
+            self._warming.discard(guild_id)
+
+    async def ping(self) -> bool:
+        """Off-loop database liveness probe."""
+        try:
+            await asyncio.to_thread(self._client.admin.command, "ping")
+            return True
+        except PyMongoError as exc:
+            log.warning("Database ping failed: %s", exc)
+            return False
+
+    def cache_stats(self) -> Dict[str, int]:
+        return {
+            "entries": len(self._cache),
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -335,11 +628,15 @@ class DebtCollectorBot(commands.Bot):
         intents: discord.Intents = discord.Intents.default()
         intents.message_content = True
         intents.members = True
+        intents.typing = False
+        intents.presences = False
         super().__init__(
             command_prefix=get_prefix,
             intents=intents,
             help_command=None,
             allowed_mentions=discord.AllowedMentions(roles=True),
+            member_cache_flags=discord.MemberCacheFlags.from_intents(intents),
+            chunk_guilds_at_startup=False,
         )
         self.settings: MultiTenantSettingsManager = settings_manager
         self.http_session: Optional[aiohttp.ClientSession] = None
@@ -360,20 +657,55 @@ class DebtCollectorBot(commands.Bot):
         self.ai_daily: Dict[str, int] = {}  # "guild:date" -> replies used
         self.automod_recent: Dict[Any, List[float]] = {}
         self.automod_strikes: Dict[Any, List[float]] = {}
-        self.error_log: List[Dict[str, Any]] = []
+        self.errors: ErrorRecorder = ErrorRecorder()
+        self._background_tasks: set = set()
 
-    def log_error(self, where: str, err: Any) -> None:
-        self.error_log.append({"where": where, "error": str(err)[:300], "at": int(time.time())})
-        del self.error_log[:-25]
+    def spawn(self, coro: Any, *, name: Optional[str] = None) -> Any:
+        """Fire-and-forget with a hard reference and a terminal error sink."""
+        task = asyncio.get_running_loop().create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(self._reap_task)
+        return task
+
+    def _reap_task(self, task: Any) -> None:
+        if task.cancelled():
+            return
+        exc: Optional[BaseException] = task.exception()
+        if exc is not None:
+            self.errors.record(f"task:{task.get_name()}", exc)
+
+    def log_error(
+        self,
+        where: str,
+        err: Any,
+        *,
+        guild: Optional[discord.Guild] = None,
+        channel: Optional[Any] = None,
+        user: Optional[discord.abc.User] = None,
+        command: Optional[str] = None,
+    ) -> None:
+        self.errors.record(
+            where, err, guild=guild, channel=channel, user=user, command=command
+        )
 
     async def setup_hook(self) -> None:
-        self.http_session = aiohttp.ClientSession(headers={"User-Agent": "DebtCollectorBot"})
+        self.http_session = aiohttp.ClientSession(
+            headers={"User-Agent": "DebtCollectorBot"},
+            timeout=aiohttp.ClientTimeout(total=30.0, connect=10.0, sock_read=25.0),
+            connector=aiohttp.TCPConnector(limit=50, limit_per_host=10, ttl_dns_cache=300),
+        )
         try:
             await asyncio.to_thread(self.settings.ensure_indexes)
         except Exception as exc:
             log.warning("Index setup failed: %s", exc)
         await self._sync_commands_if_changed()
-        for loop_task in (reminder_loop, ai_flush_loop, tempban_loop):
+        for loop_task in (
+            reminder_loop,
+            ai_flush_loop,
+            tempban_loop,
+            personal_reminder_loop,
+        ):
             if not loop_task.is_running():
                 loop_task.start()
 
@@ -381,9 +713,15 @@ class DebtCollectorBot(commands.Bot):
         """Only hit Discord's sync endpoint when the command surface actually changed."""
         parts: List[str] = []
         for command in self.tree.walk_commands():
-            params = ",".join(p.name for p in (getattr(command, "parameters", None) or []))
+            params = ",".join(
+                f"{p.name}:{getattr(p.type, 'name', p.type)}:{int(p.required)}:{p.description}"
+                f":{'|'.join(str(c.value) for c in (p.choices or []))}"
+                for p in (getattr(command, "parameters", None) or [])
+            )
             parts.append(
                 f"{command.qualified_name}|{getattr(command, 'description', '')}|{params}"
+                f"|{getattr(command, 'default_permissions', None)}"
+                f"|{getattr(command, 'guild_only', False)}"
             )
         digest = hashlib.sha256("::".join(sorted(parts)).encode("utf-8")).hexdigest()
         stored = await asyncio.to_thread(self.settings.get_meta, "command_hash")
@@ -405,6 +743,82 @@ class DebtCollectorBot(commands.Bot):
 
 settings_manager: MultiTenantSettingsManager = MultiTenantSettingsManager()
 bot: DebtCollectorBot = DebtCollectorBot(settings_manager)
+
+logging.getLogger().addHandler(ErrorRecorderHandler(bot.errors))
+
+
+# --------------------------------------------------------------------------- #
+# Global rate limiting
+# --------------------------------------------------------------------------- #
+
+COMMAND_RATE_LIMITS: Dict[str, Tuple[int, float, str]] = {
+    "roleall": (1, 300.0, "guild"),
+    "steal": (2, 60.0, "guild"),
+    "export": (1, 120.0, "guild"),
+    "import": (1, 120.0, "guild"),
+    "massban": (1, 120.0, "guild"),
+    "purge user": (3, 30.0, "guild"),
+    "purge contains": (3, 30.0, "guild"),
+    "purge bots": (3, 30.0, "guild"),
+    "purge links": (3, 30.0, "guild"),
+    "snipe": (3, 10.0, "channel"),
+    "poll": (2, 30.0, "channel"),
+    "ask": (1, 10.0, "user"),
+    "diagnose": (2, 30.0, "guild"),
+    "remindme": (5, 60.0, "user"),
+}
+DEFAULT_RATE_LIMIT: Tuple[int, float, str] = (5, 10.0, "user")
+_COOLDOWN_STATE: Dict[Tuple[str, str, int], List[float]] = {}
+
+
+def _bucket_key(ctx: commands.Context, scope: str) -> int:
+    if scope == "guild":
+        return ctx.guild.id if ctx.guild is not None else ctx.author.id
+    if scope == "channel":
+        return ctx.channel.id
+    return ctx.author.id
+
+
+@bot.check
+async def global_rate_limit(ctx: commands.Context) -> bool:
+    """One dynamic bucket per command, plus a catch-all anti-spam bucket."""
+    if ctx.command is None or is_superuser(ctx.author):
+        return True
+
+    name: str = ctx.command.qualified_name
+    rate, per, scope = COMMAND_RATE_LIMITS.get(name, DEFAULT_RATE_LIMIT)
+    key: Tuple[str, str, int] = (name, scope, _bucket_key(ctx, scope))
+    now: float = time.monotonic()
+
+    hits: List[float] = [t for t in _COOLDOWN_STATE.get(key, []) if now - t < per]
+    if len(hits) >= rate:
+        retry_after: float = per - (now - hits[0])
+        _COOLDOWN_STATE[key] = hits
+        raise commands.CommandOnCooldown(
+            commands.Cooldown(rate, per), retry_after, commands.BucketType.default
+        )
+
+    hits.append(now)
+    _COOLDOWN_STATE[key] = hits
+    if len(_COOLDOWN_STATE) > 20_000:
+        for stale_key in [k for k, v in _COOLDOWN_STATE.items() if not v or now - v[-1] > 600]:
+            _COOLDOWN_STATE.pop(stale_key, None)
+    return True
+
+
+@bot.event
+async def on_error(event_method: str, *args: Any, **kwargs: Any) -> None:
+    """Catches listener failures that would otherwise only reach stderr."""
+    exc_value: Optional[BaseException] = _sys.exc_info()[1]
+    guild: Optional[discord.Guild] = None
+    for arg in args:
+        candidate = getattr(arg, "guild", None)
+        if isinstance(candidate, discord.Guild):
+            guild = candidate
+            break
+    if exc_value is not None:
+        bot.errors.record(f"event:{event_method}", exc_value, guild=guild)
+    log.exception("Unhandled exception in event %s", event_method)
 
 # --------------------------------------------------------------------------- #
 # TASK 3 — Multi-tier GIF fetching with strict fallbacks
@@ -584,7 +998,7 @@ async def extract_message_from_link(ctx: commands.Context, link: str) -> Optiona
         return None
     try:
         return await channel.fetch_message(message_id)
-    except:
+    except Exception:
         return None
 
 def humanize_seconds(seconds: float) -> str:
@@ -790,28 +1204,39 @@ async def on_message_delete(message: discord.Message) -> None:
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
-    guild_id = member.guild.id
-    settings = bot.settings.get_settings(guild_id)
-    joinroles = settings.get("joinroles", [])
-    if not joinroles:
+    settings: Dict[str, Any] = bot.settings.peek_settings(member.guild.id)
+    join_roles: List[Any] = settings.get("joinroles") or []
+    if not join_roles:
         return
 
-    roles_to_add = []
-    for r_id in joinroles:
-        role = member.guild.get_role(int(r_id))
-        if role and role < member.guild.me.top_role:
-            roles_to_add.append(role)
-    if roles_to_add:
+    me: Optional[discord.Member] = member.guild.me
+    if me is None or not me.guild_permissions.manage_roles:
+        return
+
+    roles_to_add: List[discord.Role] = []
+    for raw_id in join_roles:
         try:
-            await member.add_roles(*roles_to_add, reason="Auto join role")
-        except:
-            pass
+            role: Optional[discord.Role] = member.guild.get_role(int(raw_id))
+        except (TypeError, ValueError):
+            continue
+        if role is not None and not role.managed and role < me.top_role:
+            roles_to_add.append(role)
+
+    if not roles_to_add:
+        return
+
+    try:
+        await member.add_roles(*roles_to_add, reason="Auto join role")
+    except discord.Forbidden:
+        log.warning("Join roles blocked by hierarchy in guild %s.", member.guild.id)
+    except discord.HTTPException as exc:
+        bot.log_error("joinrole", exc, guild=member.guild, user=member)
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if payload.user_id == bot.user.id or not payload.guild_id:
         return
-    settings = bot.settings.get_settings(payload.guild_id)
+    settings = bot.settings.peek_settings(payload.guild_id)
     reactionroles = settings.get("reactionroles", {})
 
     key = f"{payload.message_id}_{str(payload.emoji)}"
@@ -829,14 +1254,16 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if role and role < guild.me.top_role:
         try:
             await member.add_roles(role, reason="Reaction role")
-        except:
-            pass
+        except discord.Forbidden:
+            log.warning("Reaction role blocked by hierarchy in guild %s.", guild.id)
+        except discord.HTTPException as exc:
+            bot.log_error("reactionrole:add", exc, guild=guild, user=member)
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> None:
     if payload.user_id == bot.user.id or not payload.guild_id:
         return
-    settings = bot.settings.get_settings(payload.guild_id)
+    settings = bot.settings.peek_settings(payload.guild_id)
     reactionroles = settings.get("reactionroles", {})
 
     key = f"{payload.message_id}_{str(payload.emoji)}"
@@ -854,46 +1281,72 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
     if role and role < guild.me.top_role:
         try:
             await member.remove_roles(role, reason="Reaction role")
-        except:
-            pass
+        except discord.Forbidden:
+            log.warning("Reaction role removal blocked by hierarchy in guild %s.", guild.id)
+        except discord.HTTPException as exc:
+            bot.log_error("reactionrole:remove", exc, guild=guild, user=member)
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot or message.guild is None:
         return
+
     try:
         await _handle_afk_return(message)
         await _handle_afk_mentions(message)
 
-        # auto-purge
-        settings = bot.settings.get_settings(message.guild.id)
-        ap = settings.get("autopurge", {"channels": {}, "exempt_roles": []})
-        entry = ap["channels"].get(str(message.channel.id))
+        settings: Dict[str, Any] = bot.settings.peek_settings(message.guild.id)
+        autopurge: Dict[str, Any] = settings.get("autopurge") or {
+            "channels": {},
+            "exempt_roles": [],
+        }
+        entry: Optional[Dict[str, Any]] = (autopurge.get("channels") or {}).get(
+            str(message.channel.id)
+        )
+
         if entry and message.author.id != bot.user.id:
-            until = entry.get("until")
+            until: Optional[float] = entry.get("until")
             if until and time.time() > until:
-                ap["channels"].pop(str(message.channel.id), None)
-                bot.settings.update_settings(message.guild.id, {"autopurge": ap})
-            elif not any(r.id in ap["exempt_roles"] for r in getattr(message.author, "roles", [])):
+                channels: Dict[str, Any] = dict(autopurge.get("channels") or {})
+                channels.pop(str(message.channel.id), None)
+                await bot.settings.push_fields(
+                    message.guild.id, {"autopurge.channels": channels}
+                )
+            elif not any(
+                role.id in (autopurge.get("exempt_roles") or [])
+                for role in getattr(message.author, "roles", [])
+            ):
                 try:
                     await message.delete()
-                    return
-                except discord.HTTPException as e:
-                    bot.log_error("autopurge", e)
+                except discord.HTTPException as exc:
+                    bot.log_error(
+                        "autopurge", exc, guild=message.guild, user=message.author
+                    )
+                return
 
         if await _handle_automod(message):
             return
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        bot.log_error("on_message:gate", exc, guild=message.guild, user=message.author)
 
-        await _apply_guild_automations(message)
-        await _handle_sticky(message)
-        await _handle_ai(message)
-    except discord.DiscordException as exc:
-        log.error("on_message handler error: %s", exc)
-    except PyMongoError as exc:
-        log.error("on_message database error: %s", exc)
-    except Exception as exc:  # never let one handler kill the whole pipeline
-        bot.log_error("on_message", exc)
+    # Commands dispatch before any long-running enrichment (AI calls take seconds).
     await bot.process_commands(message)
+
+    async def _enrich() -> None:
+        try:
+            await _apply_guild_automations(message)
+            await _handle_sticky(message)
+            await _handle_ai(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            bot.log_error(
+                "on_message:enrich", exc, guild=message.guild, user=message.author
+            )
+
+    bot.spawn(_enrich(), name=f"enrich:{message.id}")
 
 # --------------------------------------------------------------------------- #
 # Commands
@@ -1021,7 +1474,7 @@ async def roleall_cmd(ctx: commands.Context, *, role: str):
         try:
             await m.add_roles(resolved, reason=f"roleall by {ctx.author}")
             return True
-        except:
+        except Exception:
             return False
 
     chunk_size = 10
@@ -1222,7 +1675,7 @@ async def timeout_cmd(ctx: commands.Context, user: discord.Member, minutes: int,
     if not member_has_perms(ctx.author, moderate_members=True): return await ctx.send("❌ You need Timeout permission.", ephemeral=True)
     err = mod_block_reason(ctx.author, user, ctx.guild.me)
     if err: return await ctx.send(err, ephemeral=True)
-    await user.timeout(discord.utils.utcnow() + discord.utils.timedelta(minutes=minutes), reason=reason)
+    await user.timeout(discord.utils.utcnow() + timedelta(minutes=minutes), reason=reason)
     await ctx.send(f"🤐 **{user}** is timed out for {minutes}m. Reason: {reason}")
 
 @bot.hybrid_command(name="untimeout", description="Remove a member's timeout")
@@ -1882,33 +2335,118 @@ async def set_prefix_cmd(ctx: commands.Context, prefix: str):
     if not prefix or len(prefix) > 5:
         return await ctx.send("❌ Prefix must be 1-5 characters.", ephemeral=True)
     
-    settings = bot.settings.get_settings(ctx.guild.id)
-    settings["prefix"] = prefix
-    bot.settings.update_settings(ctx.guild.id, settings)
+    await bot.settings.push_fields(ctx.guild.id, {"prefix": prefix})
     await ctx.send(f"✅ Prefix set to `{prefix}` — try `{prefix}ping` or `{prefix}hug @someone`.", ephemeral=True)
 
-@bot.hybrid_command(name="errors", description="Show the bot's recent errors (admin)")
+@bot.hybrid_group(
+    name="errors",
+    description="Inspect the bot's recent runtime errors",
+    fallback="recent",
+)
 @app_commands.default_permissions(administrator=True)
 @commands.guild_only()
-async def errors_cmd(ctx: commands.Context):
+@commands.has_permissions(administrator=True)
+@app_commands.describe(source="Filter by where the error came from, e.g. 'ai' or 'modlog'")
+async def errors_group(ctx: commands.Context, source: Optional[str] = None) -> None:
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
-    if not bot.error_log:
-        return await ctx.send("✅ No errors recorded since the last restart.", ephemeral=True)
+    records: List[ErrorRecord] = bot.errors.recent(
+        where=source, guild_id=None if is_superuser(ctx.author) else ctx.guild.id
+    )
+    if not records:
+        scope: str = f" matching `{source}`" if source else ""
+        return await ctx.send(f"✅ No errors recorded{scope}.", ephemeral=True)
 
-    lines: List[str] = [
-        f"<t:{e['at']}:R> · **{e['where']}**\n└ `{str(e['error'])[:250]}`"
-        for e in reversed(bot.error_log)
-    ]
+    stats: Dict[str, Any] = bot.errors.stats()
     pages = build_pages(
         "Recent errors (newest first)",
-        lines,
+        [record.summary() for record in records],
         0xE74C3C,
         per_page=5,
-        footer=f"{len(bot.error_log)} kept in memory · cleared on restart",
+        footer=(
+            f"{stats['unique']} unique - {stats['total']} total - "
+            "/errors detail <id> for a traceback"
+        ),
     )
     await send_pages(ctx, pages, ephemeral=True)
+
+
+@errors_group.command(name="detail", description="Show the full traceback for one error id")
+@commands.has_permissions(administrator=True)
+@app_commands.describe(error_id="The short id shown by /errors, e.g. 3f9a1c2b")
+async def errors_detail(ctx: commands.Context, error_id: str) -> None:
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    record: Optional[ErrorRecord] = bot.errors.get(error_id)
+    if record is None:
+        return await ctx.send(f"❌ No error with id `{error_id[:12]}`.", ephemeral=True)
+    if record.guild_id not in (None, ctx.guild.id) and not is_superuser(ctx.author):
+        return await ctx.send("❌ That error belongs to another server.", ephemeral=True)
+
+    embed: discord.Embed = discord.Embed(
+        title=f"Error {record.short_id()} - {record.exc_type}",
+        description=f"```{discord.utils.escape_markdown(record.message)[:1000]}```",
+        color=0xE74C3C,
+        timestamp=datetime.fromtimestamp(record.last_seen, tz=timezone.utc),
+    )
+    embed.add_field(name="Source", value=f"`{record.where}`", inline=True)
+    embed.add_field(name="Occurrences", value=str(record.count), inline=True)
+    embed.add_field(name="First seen", value=f"<t:{int(record.first_seen)}:R>", inline=True)
+    if record.command:
+        embed.add_field(name="Command", value=f"`{record.command}`", inline=True)
+    if record.user_name:
+        embed.add_field(name="Invoker", value=f"`{record.user_name}`", inline=True)
+    if record.channel_id:
+        embed.add_field(name="Channel", value=f"<#{record.channel_id}>", inline=True)
+
+    if record.stack:
+        payload: bytes = record.stack.encode("utf-8")
+        return await ctx.send(
+            embed=embed,
+            file=discord.File(
+                io.BytesIO(payload), filename=f"trace-{record.short_id()}.txt"
+            ),
+            ephemeral=True,
+        )
+    await ctx.send(embed=embed, ephemeral=True)
+
+
+@errors_group.command(name="stats", description="Error totals grouped by exception type")
+@commands.has_permissions(administrator=True)
+async def errors_stats(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    stats: Dict[str, Any] = bot.errors.stats()
+    if not stats["by_type"]:
+        return await ctx.send(
+            "✅ No errors recorded since the last restart.", ephemeral=True
+        )
+    body: str = "\n".join(f"`{name}` - **{count}**" for name, count in stats["by_type"][:15])
+    embed: discord.Embed = discord.Embed(
+        title="Error statistics", description=body, color=0xE74C3C
+    )
+    embed.set_footer(
+        text=(
+            f"{stats['unique']} unique - {stats['total']} total - "
+            f"window {stats['uptime'] / 3600:.1f}h"
+        )
+    )
+    await ctx.send(embed=embed, ephemeral=True)
+
+
+@errors_group.command(name="clear", description="Empty the in-memory error buffer")
+@commands.has_permissions(administrator=True)
+async def errors_clear(ctx: commands.Context) -> None:
+    if not is_superuser(ctx.author):
+        return await ctx.send(
+            "❌ Only a bot superuser can clear the buffer.", ephemeral=True
+        )
+    removed: int = bot.errors.clear()
+    log.info("Error buffer cleared by %s (%d records).", ctx.author, removed)
+    await ctx.send(f"U0001f9f9 Cleared **{removed}** error records.", ephemeral=True)
 
 
 # Operational error trapping (prefix + slash, one funnel)
@@ -1962,6 +2500,14 @@ async def _report_error(ctx: commands.Context, error: commands.CommandError) -> 
         return
 
     log.exception("Unhandled error in command '%s'", ctx.command, exc_info=error)
+    bot.log_error(
+        f"command:{ctx.command}",
+        original,
+        guild=ctx.guild,
+        channel=ctx.channel,
+        user=ctx.author,
+        command=str(ctx.command),
+    )
     try:
         await ctx.send("⚠️ Something went wrong while running that command.", ephemeral=True)
     except discord.DiscordException:
@@ -1982,6 +2528,14 @@ async def on_app_command_error(
 ) -> None:
     # Hybrid commands funnel through on_command_error; this catches the rest.
     log.error("App command error: %s", error)
+    bot.errors.record(
+        f"app_command:{getattr(interaction.command, 'qualified_name', 'unknown')}",
+        error,
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command=getattr(interaction.command, "qualified_name", None),
+    )
     message: str = "⚠️ Something went wrong while running that command."
     if isinstance(error, app_commands.CheckFailure):
         message = "❌ You don't have permission to use this command."
@@ -2006,7 +2560,7 @@ async def on_app_command_error(
 async def reminder_loop():
     now = time.time()
     for guild in list(bot.guilds):
-        cfg = bot.settings.get_settings(guild.id).get("remind") or {}
+        cfg = bot.settings.peek_settings(guild.id).get("remind") or {}
         if not cfg.get("enabled") or not cfg.get("channel_id"):
             continue
         key = f"remind_{guild.id}"
@@ -2059,7 +2613,7 @@ async def _start_keepalive_server() -> None:
 async def _apply_guild_automations(message: discord.Message) -> None:
     """Cache-first settings lookup drives autoreact / autorespond."""
     assert message.guild is not None
-    settings = bot.settings.get_settings(message.guild.id)
+    settings = bot.settings.peek_settings(message.guild.id)
 
     autoreact: Dict[str, Any] = settings.get("autoreact") or {}
     if autoreact.get("enabled") and autoreact.get("emojis"):
@@ -3832,7 +4386,7 @@ async def send_modlog(
     color: discord.Color = discord.Color.orange(),
     fields: Optional[List[Tuple[str, str]]] = None,
 ) -> None:
-    settings = bot.settings.get_settings(guild.id)
+    settings = bot.settings.peek_settings(guild.id)
     channel_id = (settings.get("modlog") or {}).get("channel_id")
     if not channel_id:
         return
@@ -4324,7 +4878,7 @@ async def tempban_cmd(
         return await ctx.send("❌ I couldn't read that duration. Try `30m`, `6h`, `3d` or `1w`.", ephemeral=True)
 
     until = int(time.time()) + seconds
-    await ctx.guild.ban(user, reason=f"{reason} (tempban by {ctx.author}, {duration})", delete_message_days=0)
+    await ctx.guild.ban(user, reason=f"{reason} (tempban by {ctx.author}, {duration})", delete_message_seconds=0)
 
     settings = bot.settings.get_settings(ctx.guild.id)
     tempbans = dict(settings.get("tempbans") or {})
@@ -4341,7 +4895,7 @@ async def tempban_cmd(
 async def tempban_loop() -> None:
     now = time.time()
     for guild in list(bot.guilds):
-        settings = bot.settings.get_settings(guild.id)
+        settings = bot.settings.peek_settings(guild.id)
         tempbans = dict(settings.get("tempbans") or {})
         if not tempbans:
             continue
@@ -4600,7 +5154,7 @@ async def _starboard_listener(payload: discord.RawReactionActionEvent) -> None:
     guild = bot.get_guild(payload.guild_id)
     if guild is None:
         return
-    config = bot.settings.get_settings(guild.id).get("starboard") or {}
+    config = bot.settings.peek_settings(guild.id).get("starboard") or {}
     if not config.get("enabled") or not config.get("channel_id"):
         return
     if str(payload.emoji) != config.get("emoji", "⭐"):
@@ -4665,7 +5219,7 @@ async def _starboard_listener(payload: discord.RawReactionActionEvent) -> None:
 async def export_cmd(ctx: commands.Context):
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
-    settings = copy.deepcopy(bot.settings.get_settings(ctx.guild.id))
+    settings = copy.deepcopy(await bot.settings.fetch_settings(ctx.guild.id))
     settings.pop("_id", None)
     payload = json.dumps(settings, indent=2, default=str).encode("utf-8")
     if len(payload) > 7_000_000:
@@ -4677,36 +5231,1223 @@ async def export_cmd(ctx: commands.Context):
     )
 
 
-if __name__ == "__main__":
-    token = os.getenv("DISCORD_TOKEN")
-    if not token:
-        log.error("DISCORD_TOKEN environment variable not set.")
-    else:
-        async def runner() -> None:
-            await _start_keepalive_server()
 
-            backoff = 15
-            max_backoff = 300
+# --------------------------------------------------------------------------- #
+# Personal reminders
+# --------------------------------------------------------------------------- #
 
-            while True:
+
+@bot.hybrid_group(
+    name="remindme",
+    description="Personal reminders delivered by DM",
+    fallback="add",
+)
+@commands.guild_only()
+@app_commands.describe(
+    when="How long from now - 10m, 2h30m, 3d, 1w",
+    text="What you want to be reminded about",
+)
+async def remindme_group(ctx: commands.Context, when: str, *, text: str) -> None:
+    seconds: Optional[int] = parse_duration(when)
+    if seconds is None:
+        return await ctx.send(
+            "\u274c I couldn't read that duration. Try `10m`, `2h30m`, `3d` or `1w`.",
+            ephemeral=True,
+        )
+    if seconds < 30:
+        return await ctx.send("\u274c Minimum reminder delay is 30 seconds.", ephemeral=True)
+
+    clean: str = discord.utils.escape_mentions(text.strip())[:500]
+    if not clean:
+        return await ctx.send("\u274c Give me something to remind you about.", ephemeral=True)
+
+    try:
+        existing: int = await asyncio.to_thread(
+            bot.settings.reminders.count_documents,
+            {"user_id": str(ctx.author.id), "delivered": False},
+        )
+    except PyMongoError as exc:
+        bot.log_error("remindme:count", exc, guild=ctx.guild, user=ctx.author)
+        return await ctx.send("\u26a0\ufe0f The reminder store is unreachable right now.", ephemeral=True)
+
+    if existing >= 25 and not is_superuser(ctx.author):
+        return await ctx.send(
+            "\u274c You already have 25 pending reminders. Clear some with `/remindme list`.",
+            ephemeral=True,
+        )
+
+    due_at: float = time.time() + seconds
+    document: Dict[str, Any] = {
+        "user_id": str(ctx.author.id),
+        "guild_id": str(ctx.guild.id),
+        "channel_id": str(ctx.channel.id),
+        "text": clean,
+        "due_at": due_at,
+        "created_at": time.time(),
+        "jump_url": ctx.message.jump_url if ctx.message is not None else None,
+        "delivered": False,
+    }
+    try:
+        await asyncio.to_thread(bot.settings.reminders.insert_one, document)
+    except PyMongoError as exc:
+        bot.log_error("remindme:insert", exc, guild=ctx.guild, user=ctx.author)
+        return await ctx.send("\u26a0\ufe0f I couldn't save that reminder.", ephemeral=True)
+
+    log.info("Reminder scheduled for %s in %ds.", ctx.author, seconds)
+    await ctx.send(
+        f"\u23f0 I'll remind you <t:{int(due_at)}:R> - {clean[:120]}",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@remindme_group.command(name="list", description="Show your pending reminders")
+@commands.guild_only()
+async def remindme_list(ctx: commands.Context) -> None:
+    try:
+        docs: List[Dict[str, Any]] = await asyncio.to_thread(
+            lambda: list(
+                bot.settings.reminders.find(
+                    {"user_id": str(ctx.author.id), "delivered": False}
+                )
+                .sort("due_at", 1)
+                .limit(25)
+            )
+        )
+    except PyMongoError as exc:
+        bot.log_error("remindme:list", exc, guild=ctx.guild, user=ctx.author)
+        return await ctx.send("\u26a0\ufe0f The reminder store is unreachable right now.", ephemeral=True)
+
+    if not docs:
+        return await ctx.send("\u2705 You have no pending reminders.", ephemeral=True)
+
+    lines: List[str] = [
+        f"`{str(doc['_id'])[-6:]}` <t:{int(doc['due_at'])}:R> - {str(doc['text'])[:120]}"
+        for doc in docs
+    ]
+    pages = build_pages("Your reminders", lines, discord.Color.blurple(), per_page=8)
+    await send_pages(ctx, pages, ephemeral=True)
+
+
+@remindme_group.command(name="cancel", description="Cancel a pending reminder")
+@commands.guild_only()
+@app_commands.describe(reminder_id="The short id shown by /remindme list")
+async def remindme_cancel(ctx: commands.Context, reminder_id: str) -> None:
+    needle: str = reminder_id.strip().lower()
+    if not needle:
+        return await ctx.send("\u274c Give me a reminder id.", ephemeral=True)
+    try:
+        docs: List[Dict[str, Any]] = await asyncio.to_thread(
+            lambda: list(
+                bot.settings.reminders.find(
+                    {"user_id": str(ctx.author.id), "delivered": False}
+                )
+            )
+        )
+        match: Optional[Dict[str, Any]] = next(
+            (doc for doc in docs if str(doc["_id"]).lower().endswith(needle)), None
+        )
+        if match is None:
+            return await ctx.send(f"\u274c No pending reminder `{needle[:12]}`.", ephemeral=True)
+        await asyncio.to_thread(bot.settings.reminders.delete_one, {"_id": match["_id"]})
+    except PyMongoError as exc:
+        bot.log_error("remindme:cancel", exc, guild=ctx.guild, user=ctx.author)
+        return await ctx.send("\u26a0\ufe0f I couldn't cancel that reminder.", ephemeral=True)
+
+    await ctx.send(
+        f"\U0001f5d1\ufe0f Cancelled - {str(match['text'])[:120]}",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@tasks.loop(seconds=30.0)
+async def personal_reminder_loop() -> None:
+    now: float = time.time()
+    try:
+        due: List[Dict[str, Any]] = await asyncio.to_thread(
+            lambda: list(
+                bot.settings.reminders.find(
+                    {"delivered": False, "due_at": {"$lte": now}}
+                ).limit(50)
+            )
+        )
+    except PyMongoError as exc:
+        bot.log_error("remindme:sweep", exc)
+        return
+
+    for doc in due:
+        user: Optional[discord.abc.User] = bot.get_user(int(doc["user_id"]))
+        if user is None:
+            try:
+                user = await bot.fetch_user(int(doc["user_id"]))
+            except discord.DiscordException:
+                user = None
+
+        embed: discord.Embed = discord.Embed(
+            title="\u23f0 Reminder",
+            description=str(doc["text"])[:2000],
+            color=discord.Color.blurple(),
+            timestamp=datetime.fromtimestamp(float(doc["created_at"]), tz=timezone.utc),
+        )
+        if doc.get("jump_url"):
+            embed.add_field(name="Context", value=f"[original message]({doc['jump_url']})")
+
+        delivered: bool = False
+        if user is not None:
+            try:
+                await user.send(embed=embed)
+                delivered = True
+            except (discord.Forbidden, discord.HTTPException):
+                delivered = False
+
+        if not delivered and doc.get("channel_id"):
+            channel = bot.get_channel(int(doc["channel_id"]))
+            if isinstance(channel, discord.abc.Messageable):
                 try:
-                    await bot.start(token)
-                    break  # If start() returns cleanly, exit the loop
-                except discord.HTTPException as e:
-                    if e.status == 429:
-                        log.warning(f"Rate limited (HTTP 429) during startup: {e}. Retrying in {backoff} seconds...")
-                    else:
-                        log.warning(f"HTTPException during startup: {e}. Retrying in {backoff} seconds...")
-                except (discord.ConnectionClosed, aiohttp.ClientError, Exception) as e:
-                    log.warning(f"Connection error during startup: {e}. Retrying in {backoff} seconds...")
+                    await channel.send(f"<@{doc['user_id']}>", embed=embed)
+                    delivered = True
+                except discord.DiscordException as exc:
+                    bot.log_error("remindme:deliver", exc)
 
-                # Sleep with jitter
-                await asyncio.sleep(backoff + random.uniform(0, 5))
-
-                # Exponential backoff
-                backoff = min(backoff * 2, max_backoff)
-            
         try:
-            asyncio.run(runner())
-        except KeyboardInterrupt:
-            pass
+            await asyncio.to_thread(
+                bot.settings.reminders.update_one,
+                {"_id": doc["_id"]},
+                {"$set": {"delivered": True, "delivered_at": time.time()}},
+            )
+        except PyMongoError as exc:
+            bot.log_error("remindme:ack", exc)
+
+
+@personal_reminder_loop.before_loop
+async def before_personal_reminder_loop() -> None:
+    await bot.wait_until_ready()
+
+
+# --------------------------------------------------------------------------- #
+# Settings restore
+# --------------------------------------------------------------------------- #
+
+IMPORTABLE_KEYS: frozenset = frozenset(DEFAULT_SETTINGS.keys())
+
+
+@bot.hybrid_command(name="import", description="Restore settings from a /export backup file")
+@app_commands.default_permissions(administrator=True)
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+@app_commands.describe(
+    backup="The settings-<id>.json file produced by /export",
+    merge="Merge into current settings instead of replacing them",
+)
+async def import_cmd(
+    ctx: commands.Context,
+    backup: discord.Attachment,
+    merge: bool = True,
+) -> None:
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("\u274c You need Administrator permission.", ephemeral=True)
+    if backup.size > 2_000_000:
+        return await ctx.send("\u274c That file is too large (2 MB limit).", ephemeral=True)
+    if not backup.filename.lower().endswith(".json"):
+        return await ctx.send("\u274c I need the `.json` file from `/export`.", ephemeral=True)
+
+    try:
+        raw: bytes = await backup.read()
+        payload: Any = json.loads(raw.decode("utf-8"))
+    except (discord.HTTPException, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        bot.log_error("import:parse", exc, guild=ctx.guild, user=ctx.author)
+        return await ctx.send("\u274c I couldn't read that file as JSON.", ephemeral=True)
+
+    if not isinstance(payload, dict):
+        return await ctx.send("\u274c That backup isn't a settings object.", ephemeral=True)
+
+    accepted: Dict[str, Any] = {
+        key: value for key, value in payload.items() if key in IMPORTABLE_KEYS
+    }
+    rejected: List[str] = sorted(set(payload) - IMPORTABLE_KEYS - {"_id", "guildid"})
+    if not accepted:
+        return await ctx.send("\u274c No recognisable settings keys in that file.", ephemeral=True)
+
+    if merge:
+        current: Dict[str, Any] = copy.deepcopy(await bot.settings.fetch_settings(ctx.guild.id))
+        merged: Dict[str, Any] = _deep_merge(current, accepted)
+        merged.pop("_id", None)
+        final: Dict[str, Any] = {key: merged[key] for key in IMPORTABLE_KEYS if key in merged}
+    else:
+        base: Dict[str, Any] = copy.deepcopy(DEFAULT_SETTINGS)
+        final = _deep_merge(base, accepted)
+
+    saved: bool = await bot.settings.push_settings(ctx.guild.id, final)
+    if not saved:
+        return await ctx.send(
+            "\u26a0\ufe0f The database rejected the write - nothing changed.", ephemeral=True
+        )
+
+    bot.settings.evict_cache(ctx.guild.id)
+    log.info(
+        "Settings imported into guild %s by %s (%d keys, merge=%s).",
+        ctx.guild.id,
+        ctx.author,
+        len(accepted),
+        merge,
+    )
+    note: str = (
+        f"\n\u26a0\ufe0f Ignored unknown keys: `{', '.join(rejected[:10])}`" if rejected else ""
+    )
+    await ctx.send(
+        f"\u2705 Restored **{len(accepted)}** settings sections "
+        f"({'merged' if merge else 'replaced'}).{note}",
+        ephemeral=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Role audit
+# --------------------------------------------------------------------------- #
+
+
+@bot.hybrid_command(name="inrole", description="List every member holding a role")
+@commands.guild_only()
+@app_commands.describe(role="The role to audit", show_ids="Include user IDs for exports")
+async def inrole_cmd(
+    ctx: commands.Context,
+    role: discord.Role,
+    show_ids: bool = False,
+) -> None:
+    members: List[discord.Member] = sorted(
+        role.members, key=lambda m: (m.joined_at or datetime.now(timezone.utc))
+    )
+    if not members:
+        return await ctx.send(f"\U0001f4ed Nobody currently has {role.mention}.", ephemeral=True)
+
+    if len(members) > 500 and not member_has_perms(ctx.author, manage_roles=True):
+        return await ctx.send(
+            f"\u274c {role.mention} has **{len(members)}** members - "
+            "you need **Manage Roles** to list a role that large.",
+            ephemeral=True,
+        )
+
+    lines: List[str] = []
+    for index, member in enumerate(members, start=1):
+        joined: str = (
+            f"<t:{int(member.joined_at.timestamp())}:R>" if member.joined_at else "unknown"
+        )
+        identifier: str = f" - `{member.id}`" if show_ids else ""
+        lines.append(f"**{index}.** {member.mention} - `{member}`{identifier} - joined {joined}")
+
+    pages = build_pages(
+        f"{role.name} - {len(members)} member{'s' if len(members) != 1 else ''}",
+        lines,
+        role.color if role.color.value else discord.Color.blurple(),
+        per_page=10,
+        footer=f"Role created {role.created_at:%Y-%m-%d} - position {role.position}",
+    )
+    await send_pages(ctx, pages, ephemeral=True)
+
+
+# --------------------------------------------------------------------------- #
+# Operational self-check
+# --------------------------------------------------------------------------- #
+
+REQUIRED_GUILD_PERMISSIONS: Tuple[str, ...] = (
+    "manage_roles",
+    "manage_messages",
+    "kick_members",
+    "ban_members",
+    "moderate_members",
+    "manage_channels",
+    "embed_links",
+    "attach_files",
+    "read_message_history",
+    "add_reactions",
+)
+
+
+@bot.hybrid_command(name="diagnose", description="Run a health check on the bot (admin)")
+@app_commands.default_permissions(administrator=True)
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+async def diagnose_cmd(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("\u274c You need Administrator permission.", ephemeral=True)
+    await ctx.defer(ephemeral=True)
+
+    started: float = time.perf_counter()
+    db_ok: bool = await bot.settings.ping()
+    db_ms: float = (time.perf_counter() - started) * 1000
+
+    loops: Dict[str, Any] = {
+        "reminders": reminder_loop,
+        "ai flush": ai_flush_loop,
+        "tempbans": tempban_loop,
+        "personal reminders": personal_reminder_loop,
+    }
+    loop_lines: List[str] = []
+    for name, loop_obj in loops.items():
+        if loop_obj.is_running():
+            failed: bool = bool(loop_obj.failed())
+            loop_lines.append(
+                f"{'\u26a0\ufe0f' if failed else '\u2705'} {name}{' (failed)' if failed else ''}"
+            )
+        else:
+            loop_lines.append(f"\u274c {name} (stopped)")
+
+    me: discord.Member = ctx.guild.me
+    missing: List[str] = [
+        permission.replace("_", " ")
+        for permission in REQUIRED_GUILD_PERMISSIONS
+        if not getattr(me.guild_permissions, permission, False)
+    ]
+
+    cache: Dict[str, int] = bot.settings.cache_stats()
+    lookups: int = cache["hits"] + cache["misses"]
+    hit_rate: float = (cache["hits"] / lookups * 100) if lookups else 100.0
+    errors: Dict[str, Any] = bot.errors.stats()
+    uptime: float = time.time() - bot.start_time
+
+    embed: discord.Embed = discord.Embed(
+        title="\U0001fa7a Bot diagnostics",
+        color=discord.Color.green() if db_ok and not missing else discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="Gateway",
+        value=(
+            f"Latency **{bot.latency * 1000:.0f} ms**\n"
+            f"Uptime **{int(uptime // 3600)}h {int(uptime % 3600 // 60)}m**\n"
+            f"Guilds **{len(bot.guilds)}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Database",
+        value=(
+            f"{'\u2705 reachable' if db_ok else '\u274c unreachable'}\n"
+            f"Ping **{db_ms:.0f} ms**\n"
+            f"Cache **{cache['entries']}** guilds - **{hit_rate:.1f}%** hits"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Errors",
+        value=(
+            f"Unique **{errors['unique']}**\n"
+            f"Total **{errors['total']}**\n"
+            + (f"Top `{errors['by_type'][0][0]}`" if errors["by_type"] else "None recorded")
+        ),
+        inline=True,
+    )
+    embed.add_field(name="Background loops", value="\n".join(loop_lines), inline=False)
+    embed.add_field(
+        name="Permissions in this server",
+        value=(
+            "\u2705 All required permissions granted"
+            if not missing
+            else "\u274c Missing: " + ", ".join(f"`{p}`" for p in missing)
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Run /errors detail <id> for tracebacks")
+    await ctx.send(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------------- #
+# Effective permission resolution
+# --------------------------------------------------------------------------- #
+
+PERMCHECK_KEYS: Tuple[str, ...] = (
+    "view_channel",
+    "send_messages",
+    "send_messages_in_threads",
+    "embed_links",
+    "attach_files",
+    "add_reactions",
+    "read_message_history",
+    "manage_messages",
+    "mention_everyone",
+    "use_application_commands",
+    "connect",
+    "speak",
+)
+
+
+@bot.hybrid_command(
+    name="permcheck",
+    description="Show a member's effective permissions in a channel",
+)
+@commands.guild_only()
+@app_commands.describe(
+    member="Whose permissions to resolve (defaults to you)",
+    channel="Which channel to resolve against (defaults to here)",
+)
+async def permcheck_cmd(
+    ctx: commands.Context,
+    member: Optional[discord.Member] = None,
+    channel: Optional[Union[discord.TextChannel, discord.VoiceChannel]] = None,
+) -> None:
+    target: discord.Member = member or ctx.author
+    scope: Any = channel or ctx.channel
+
+    if target.id != ctx.author.id and not member_has_perms(ctx.author, manage_roles=True):
+        return await ctx.send(
+            "\u274c You need **Manage Roles** to inspect another member.", ephemeral=True
+        )
+    if not isinstance(scope, (discord.TextChannel, discord.VoiceChannel, discord.Thread)):
+        return await ctx.send("\u274c Pick a text or voice channel.", ephemeral=True)
+
+    resolved: discord.Permissions = scope.permissions_for(target)
+    granted: List[str] = []
+    denied: List[str] = []
+    for key in PERMCHECK_KEYS:
+        (granted if getattr(resolved, key, False) else denied).append(key.replace("_", " "))
+
+    overwrite_notes: List[str] = []
+    overwrites: Dict[Any, discord.PermissionOverwrite] = getattr(scope, "overwrites", {}) or {}
+    for holder, overwrite in overwrites.items():
+        applies: bool = holder == target or (
+            isinstance(holder, discord.Role) and holder in target.roles
+        )
+        if not applies:
+            continue
+        allow, deny = overwrite.pair()
+        pieces: List[str] = []
+        if allow.value:
+            pieces.append("+" + ", ".join(name for name, value in allow if value)[:120])
+        if deny.value:
+            pieces.append("-" + ", ".join(name for name, value in deny if value)[:120])
+        if pieces:
+            label: str = holder.mention if isinstance(holder, discord.Role) else "member override"
+            overwrite_notes.append(f"{label} {' '.join(pieces)}")
+
+    embed: discord.Embed = discord.Embed(
+        title=f"Permissions - {target.display_name}",
+        description=f"Resolved in {scope.mention}",
+        color=discord.Color.green() if resolved.send_messages else discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(
+        name="\u2705 Granted",
+        value=", ".join(f"`{name}`" for name in granted) or "none",
+        inline=False,
+    )
+    embed.add_field(
+        name="\u274c Denied",
+        value=", ".join(f"`{name}`" for name in denied) or "none",
+        inline=False,
+    )
+    embed.add_field(
+        name="Top role",
+        value=f"{target.top_role.mention} (position {target.top_role.position})",
+        inline=True,
+    )
+    embed.add_field(
+        name="Administrator",
+        value="yes - overrides everything" if resolved.administrator else "no",
+        inline=True,
+    )
+    if overwrite_notes:
+        embed.add_field(
+            name="Applicable overwrites",
+            value="\n".join(overwrite_notes[:6])[:1024],
+            inline=False,
+        )
+    await ctx.send(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+# --------------------------------------------------------------------------- #
+# Raid detection and lockdown
+# --------------------------------------------------------------------------- #
+
+RAID_DEFAULTS: Dict[str, Any] = {
+    "enabled": False,
+    "auto": True,
+    "until": 0,
+    "join_threshold": 8,
+    "window": 20,
+    "min_account_age_hours": 24,
+    "action": "quarantine",
+    "quarantine_role_id": None,
+}
+_RAID_JOINS: Dict[int, List[float]] = {}
+
+
+def _raid_config(guild_id: int) -> Dict[str, Any]:
+    stored: Dict[str, Any] = bot.settings.peek_settings(guild_id).get("raid") or {}
+    config: Dict[str, Any] = dict(RAID_DEFAULTS)
+    config.update({k: v for k, v in stored.items() if k in RAID_DEFAULTS})
+    return config
+
+
+@bot.hybrid_group(name="raid", description="Raid detection and lockdown", fallback="status")
+@app_commands.default_permissions(manage_guild=True)
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def raid_group(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    config: Dict[str, Any] = _raid_config(ctx.guild.id)
+    active: bool = bool(config["enabled"]) and float(config["until"]) > time.time()
+    role: Optional[discord.Role] = (
+        ctx.guild.get_role(int(config["quarantine_role_id"]))
+        if config.get("quarantine_role_id")
+        else None
+    )
+    recent: int = len([t for t in _RAID_JOINS.get(ctx.guild.id, []) if time.time() - t < 60])
+
+    embed: discord.Embed = discord.Embed(
+        title="\U0001f6e1\ufe0f Raid protection",
+        color=discord.Color.red() if active else discord.Color.green(),
+    )
+    embed.add_field(
+        name="State",
+        value=(
+            f"\U0001f534 **ACTIVE** until <t:{int(config['until'])}:R>"
+            if active
+            else "\U0001f7e2 standby"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Trigger",
+        value=f"{config['join_threshold']} joins / {config['window']}s"
+        + (" - auto-arm on" if config["auto"] else " - auto-arm off"),
+        inline=True,
+    )
+    embed.add_field(
+        name="Response",
+        value=f"`{config['action']}` accounts younger than {config['min_account_age_hours']}h",
+        inline=True,
+    )
+    embed.add_field(
+        name="Quarantine role",
+        value=role.mention if role is not None else "not configured",
+        inline=True,
+    )
+    embed.set_footer(text=f"{recent} joins in the last 60 seconds")
+    await ctx.send(embed=embed, ephemeral=True)
+
+
+@raid_group.command(name="on", description="Engage raid mode manually")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(minutes="How long to stay engaged (default 30)")
+async def raid_on(
+    ctx: commands.Context,
+    minutes: app_commands.Range[int, 1, 720] = 30,
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    until: int = int(time.time()) + int(minutes) * 60
+    await bot.settings.push_fields(ctx.guild.id, {"raid.enabled": True, "raid.until": until})
+    log.warning("Raid mode engaged in guild %s by %s.", ctx.guild.id, ctx.author)
+    await send_modlog(
+        ctx.guild,
+        "\U0001f6e1\ufe0f Raid mode engaged",
+        f"Engaged manually by {ctx.author.mention} until <t:{until}:f>.",
+        discord.Color.red(),
+    )
+    await ctx.send(f"\U0001f6e1\ufe0f Raid mode **engaged** until <t:{until}:R>.", ephemeral=True)
+
+
+@raid_group.command(name="off", description="Disengage raid mode")
+@commands.has_permissions(manage_guild=True)
+async def raid_off(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await bot.settings.push_fields(ctx.guild.id, {"raid.enabled": False, "raid.until": 0})
+    _RAID_JOINS.pop(ctx.guild.id, None)
+    log.info("Raid mode disengaged in guild %s by %s.", ctx.guild.id, ctx.author)
+    await send_modlog(
+        ctx.guild,
+        "\U0001f6e1\ufe0f Raid mode disengaged",
+        f"Disengaged by {ctx.author.mention}.",
+        discord.Color.green(),
+    )
+    await ctx.send("\U0001f7e2 Raid mode **disengaged**.", ephemeral=True)
+
+
+@raid_group.command(name="config", description="Tune raid detection thresholds")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(
+    join_threshold="Joins needed to auto-arm",
+    window="Detection window in seconds",
+    min_account_age_hours="Accounts younger than this are actioned",
+    action="What to do with a flagged account",
+    quarantine_role="Role applied when action is quarantine",
+    auto="Whether to auto-arm on a join spike",
+)
+async def raid_config(
+    ctx: commands.Context,
+    join_threshold: Optional[app_commands.Range[int, 3, 100]] = None,
+    window: Optional[app_commands.Range[int, 5, 300]] = None,
+    min_account_age_hours: Optional[app_commands.Range[int, 0, 8760]] = None,
+    action: Optional[Literal["quarantine", "kick", "ban"]] = None,
+    quarantine_role: Optional[discord.Role] = None,
+    auto: Optional[bool] = None,
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+
+    fields: Dict[str, Any] = {}
+    if join_threshold is not None:
+        fields["raid.join_threshold"] = int(join_threshold)
+    if window is not None:
+        fields["raid.window"] = int(window)
+    if min_account_age_hours is not None:
+        fields["raid.min_account_age_hours"] = int(min_account_age_hours)
+    if action is not None:
+        fields["raid.action"] = str(action)
+    if auto is not None:
+        fields["raid.auto"] = bool(auto)
+    if quarantine_role is not None:
+        if quarantine_role.managed or quarantine_role >= ctx.guild.me.top_role:
+            return await ctx.send(
+                "\u274c I can't assign that role - it's managed or above me in the hierarchy.",
+                ephemeral=True,
+            )
+        fields["raid.quarantine_role_id"] = str(quarantine_role.id)
+
+    if not fields:
+        return await ctx.send("\u274c Give me at least one setting to change.", ephemeral=True)
+    saved: bool = await bot.settings.push_fields(ctx.guild.id, fields)
+    await ctx.send(
+        f"{'\u2705' if saved else '\u26a0\ufe0f'} Updated **{len(fields)}** raid setting(s)"
+        f"{'.' if saved else ' in memory only - the database write failed.'}",
+        ephemeral=True,
+    )
+
+
+async def _raid_action(
+    guild: discord.Guild, member: discord.Member, config: Dict[str, Any]
+) -> None:
+    action: str = str(config.get("action") or "quarantine")
+    reason: str = "Raid protection - new account during active raid mode"
+    try:
+        if action == "ban":
+            await guild.ban(member, reason=reason, delete_message_seconds=3600)
+        elif action == "kick":
+            await member.kick(reason=reason)
+        else:
+            role_id: Any = config.get("quarantine_role_id")
+            role: Optional[discord.Role] = guild.get_role(int(role_id)) if role_id else None
+            if role is None or role >= guild.me.top_role:
+                log.warning(
+                    "Quarantine role unusable in guild %s - falling back to kick.", guild.id
+                )
+                await member.kick(reason=reason + " (quarantine role unavailable)")
+                action = "kick"
+            else:
+                await member.add_roles(role, reason=reason)
+    except discord.Forbidden:
+        log.warning("Raid action '%s' forbidden in guild %s.", action, guild.id)
+        return
+    except discord.HTTPException as exc:
+        bot.log_error("raid:action", exc, guild=guild, user=member)
+        return
+
+    await record_case(guild, f"raid:{action}", guild.me, member, reason)
+    await send_modlog(
+        guild,
+        f"\U0001f6e1\ufe0f Raid action - {action}",
+        f"{member.mention} (`{member}`) - account created "
+        f"<t:{int(member.created_at.timestamp())}:R>.",
+        discord.Color.red(),
+    )
+
+
+@bot.listen("on_member_join")
+async def raid_watch(member: discord.Member) -> None:
+    if member.bot:
+        return
+    guild: discord.Guild = member.guild
+    config: Dict[str, Any] = _raid_config(guild.id)
+    now: float = time.time()
+
+    window: int = int(config["window"])
+    joins: List[float] = [t for t in _RAID_JOINS.get(guild.id, []) if now - t <= window]
+    joins.append(now)
+    _RAID_JOINS[guild.id] = joins[-200:]
+
+    active: bool = bool(config["enabled"]) and float(config["until"]) > now
+
+    if not active and config["auto"] and len(joins) >= int(config["join_threshold"]):
+        until: int = int(now) + 1800
+        await bot.settings.push_fields(guild.id, {"raid.enabled": True, "raid.until": until})
+        active = True
+        log.warning(
+            "Raid auto-armed in guild %s (%d joins in %ds).", guild.id, len(joins), window
+        )
+        await send_modlog(
+            guild,
+            "\U0001f6a8 Raid mode auto-engaged",
+            f"**{len(joins)}** joins in {window}s exceeded the threshold. "
+            f"Active until <t:{until}:R>. Disable with `/raid off`.",
+            discord.Color.red(),
+        )
+
+    if not active:
+        return
+    if len(member.roles) > 1 or is_superuser(member):
+        return
+
+    min_age: float = float(config["min_account_age_hours"]) * 3600
+    account_age: float = (discord.utils.utcnow() - member.created_at).total_seconds()
+    if account_age < min_age:
+        await _raid_action(guild, member, config)
+
+
+# --------------------------------------------------------------------------- #
+# Filtered mass ban
+# --------------------------------------------------------------------------- #
+
+MASSBAN_HARD_CAP: int = 100
+
+
+class MassbanConfirm(discord.ui.View):
+    """Single-use confirmation gate bound to the invoking moderator."""
+
+    def __init__(self, author_id: int, timeout: float = 60.0) -> None:
+        super().__init__(timeout=timeout)
+        self.author_id: int = author_id
+        self.value: Optional[bool] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message(
+            "\u274c Only the moderator who ran this command can confirm it.", ephemeral=True
+        )
+        return False
+
+    def _disable(self) -> None:
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+    async def on_timeout(self) -> None:
+        self.value = False
+        self._disable()
+
+    @discord.ui.button(label="Confirm ban", style=discord.ButtonStyle.danger, emoji="\U0001f528")
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.value = True
+        self._disable()
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.value = False
+        self._disable()
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+
+@bot.hybrid_command(
+    name="massban", description="Ban every member matching a filter (preview first)"
+)
+@app_commands.default_permissions(ban_members=True)
+@commands.guild_only()
+@commands.has_permissions(ban_members=True)
+@commands.bot_has_permissions(ban_members=True)
+@app_commands.describe(
+    account_age_hours="Only accounts younger than this many hours",
+    joined_within_minutes="Only members who joined in the last N minutes",
+    name_pattern="Regex matched against username and nickname",
+    no_avatar="Only members using the default avatar",
+    reason="Audit-log reason",
+)
+async def massban_cmd(
+    ctx: commands.Context,
+    account_age_hours: Optional[app_commands.Range[int, 0, 8760]] = None,
+    joined_within_minutes: Optional[app_commands.Range[int, 1, 10080]] = None,
+    name_pattern: Optional[str] = None,
+    no_avatar: bool = False,
+    *,
+    reason: Optional[str] = "Mass ban - raid cleanup",
+) -> None:
+    if not member_has_perms(ctx.author, ban_members=True):
+        return await ctx.send("\u274c You need the **Ban Members** permission.", ephemeral=True)
+
+    if (
+        account_age_hours is None
+        and joined_within_minutes is None
+        and not name_pattern
+        and not no_avatar
+    ):
+        return await ctx.send(
+            "\u274c Give me at least one filter. A filter-less mass ban is never run.",
+            ephemeral=True,
+        )
+
+    pattern: Optional[re.Pattern] = None
+    if name_pattern:
+        try:
+            pattern = re.compile(name_pattern, re.IGNORECASE)
+        except re.error as exc:
+            return await ctx.send(f"\u274c Invalid regex: `{exc}`.", ephemeral=True)
+
+    await ctx.defer(ephemeral=True)
+
+    now: datetime = discord.utils.utcnow()
+    actor_top: discord.Role = ctx.author.top_role
+    me: discord.Member = ctx.guild.me
+    targets: List[discord.Member] = []
+
+    for member in ctx.guild.members:
+        if member.bot or member.id in (ctx.author.id, me.id, ctx.guild.owner_id):
+            continue
+        if is_superuser(member):
+            continue
+        if member.top_role >= actor_top and not is_superuser(ctx.author):
+            continue
+        if member.top_role >= me.top_role:
+            continue
+        if account_age_hours is not None:
+            if (now - member.created_at).total_seconds() >= int(account_age_hours) * 3600:
+                continue
+        if joined_within_minutes is not None:
+            if member.joined_at is None:
+                continue
+            if (now - member.joined_at).total_seconds() > int(joined_within_minutes) * 60:
+                continue
+        if pattern is not None:
+            haystack: str = f"{member.name} {member.display_name}"
+            if not pattern.search(haystack):
+                continue
+        if no_avatar and member.avatar is not None:
+            continue
+        targets.append(member)
+
+    if not targets:
+        return await ctx.send("\u2705 No members matched those filters.", ephemeral=True)
+    if len(targets) > MASSBAN_HARD_CAP:
+        return await ctx.send(
+            f"\u274c **{len(targets)}** members matched, above the {MASSBAN_HARD_CAP} hard cap. "
+            "Tighten the filters - this guard exists to stop a runaway ban.",
+            ephemeral=True,
+        )
+
+    preview: str = "\n".join(
+        f"- `{member}` ({member.id}) - created <t:{int(member.created_at.timestamp())}:R>"
+        for member in targets[:15]
+    )
+    if len(targets) > 15:
+        preview += f"\n... and **{len(targets) - 15}** more."
+
+    embed: discord.Embed = discord.Embed(
+        title=f"\U0001f528 Mass ban preview - {len(targets)} target(s)",
+        description=preview[:4000],
+        color=discord.Color.red(),
+    )
+    embed.set_footer(text="Nothing has been banned yet. This preview expires in 60 seconds.")
+
+    view: MassbanConfirm = MassbanConfirm(ctx.author.id)
+    await ctx.send(embed=embed, view=view, ephemeral=True)
+    await view.wait()
+
+    if not view.value:
+        return await ctx.send("\u2705 Mass ban cancelled - nobody was banned.", ephemeral=True)
+
+    clean_reason: str = discord.utils.escape_mentions(str(reason or "Mass ban"))[:400]
+    banned: int = 0
+    failed: int = 0
+    for member in targets:
+        try:
+            await ctx.guild.ban(
+                member,
+                reason=f"{clean_reason} (massban by {ctx.author})",
+                delete_message_seconds=3600,
+            )
+            banned += 1
+            await record_case(ctx.guild, "massban", ctx.author, member, clean_reason)
+        except discord.Forbidden:
+            failed += 1
+        except discord.HTTPException as exc:
+            failed += 1
+            bot.log_error("massban", exc, guild=ctx.guild, user=member)
+        await asyncio.sleep(0.6)
+
+    log.warning(
+        "Mass ban in guild %s by %s: %d banned, %d failed.",
+        ctx.guild.id,
+        ctx.author,
+        banned,
+        failed,
+    )
+    await send_modlog(
+        ctx.guild,
+        "\U0001f528 Mass ban executed",
+        f"**{banned}** banned, **{failed}** failed.\n**Reason:** {clean_reason}",
+        discord.Color.red(),
+        [("Moderator", f"{ctx.author.mention} (`{ctx.author}`)")],
+    )
+    await ctx.send(
+        f"\U0001f528 Banned **{banned}** member(s)."
+        + (f" **{failed}** could not be banned." if failed else ""),
+        ephemeral=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Reversible quarantine
+# --------------------------------------------------------------------------- #
+
+
+async def _ensure_quarantine_role(guild: discord.Guild) -> Optional[discord.Role]:
+    """Return the configured quarantine role, creating and locking it down if absent."""
+    config: Dict[str, Any] = _raid_config(guild.id)
+    role_id: Any = config.get("quarantine_role_id")
+    role: Optional[discord.Role] = guild.get_role(int(role_id)) if role_id else None
+    if role is not None and role < guild.me.top_role:
+        return role
+
+    if not guild.me.guild_permissions.manage_roles:
+        return None
+    try:
+        role = await guild.create_role(
+            name="Quarantined",
+            colour=discord.Colour.dark_grey(),
+            reason="Quarantine role created automatically",
+        )
+    except discord.DiscordException as exc:
+        bot.log_error("quarantine:create_role", exc, guild=guild)
+        return None
+
+    denied: discord.PermissionOverwrite = discord.PermissionOverwrite(
+        send_messages=False,
+        send_messages_in_threads=False,
+        create_public_threads=False,
+        create_private_threads=False,
+        add_reactions=False,
+        speak=False,
+        connect=False,
+    )
+    for channel in guild.channels:
+        try:
+            await channel.set_permissions(role, overwrite=denied, reason="Quarantine lockdown")
+        except discord.DiscordException:
+            continue
+        await asyncio.sleep(0.3)
+
+    await bot.settings.push_fields(guild.id, {"raid.quarantine_role_id": str(role.id)})
+    log.info("Created quarantine role %s in guild %s.", role.id, guild.id)
+    return role
+
+
+@bot.hybrid_command(
+    name="quarantine", description="Isolate a member without banning them (reversible)"
+)
+@app_commands.default_permissions(moderate_members=True)
+@commands.guild_only()
+@commands.has_permissions(moderate_members=True)
+@commands.bot_has_permissions(manage_roles=True)
+@app_commands.describe(user="Who to isolate", reason="Why they are being isolated")
+async def quarantine_cmd(
+    ctx: commands.Context,
+    user: discord.Member,
+    *,
+    reason: Optional[str] = "No reason given",
+) -> None:
+    if not member_has_perms(ctx.author, moderate_members=True):
+        return await ctx.send(
+            "\u274c You need the **Timeout Members** permission.", ephemeral=True
+        )
+    block: Optional[str] = mod_block_reason(ctx.author, user, ctx.guild.me)
+    if block:
+        return await ctx.send(f"\u274c {block}", ephemeral=True)
+
+    await ctx.defer(ephemeral=True)
+
+    role: Optional[discord.Role] = await _ensure_quarantine_role(ctx.guild)
+    if role is None:
+        return await ctx.send(
+            "\u274c I couldn't set up a quarantine role. Grant me **Manage Roles** "
+            "or configure one with `/raid config quarantine_role:`.",
+            ephemeral=True,
+        )
+    if role in user.roles:
+        return await ctx.send(f"\u2139\ufe0f {user.mention} is already quarantined.", ephemeral=True)
+
+    removable: List[discord.Role] = [
+        r for r in user.roles if not r.is_default() and not r.managed and r < ctx.guild.me.top_role
+    ]
+    snapshot: List[str] = [str(r.id) for r in removable]
+
+    try:
+        if removable:
+            await user.remove_roles(*removable, reason=f"Quarantine by {ctx.author}")
+        await user.add_roles(role, reason=f"Quarantine by {ctx.author}: {reason}")
+    except discord.Forbidden:
+        return await ctx.send(
+            "\u274c I'm missing the permissions or hierarchy to change that member's roles.",
+            ephemeral=True,
+        )
+    except discord.HTTPException as exc:
+        bot.log_error("quarantine", exc, guild=ctx.guild, user=user)
+        return await ctx.send("\u26a0\ufe0f Discord rejected the role change.", ephemeral=True)
+
+    stored: Dict[str, Any] = dict(
+        bot.settings.peek_settings(ctx.guild.id).get("quarantined") or {}
+    )
+    stored[str(user.id)] = {
+        "roles": snapshot,
+        "at": int(time.time()),
+        "by": str(ctx.author),
+        "reason": str(reason or "")[:300],
+    }
+    await bot.settings.push_fields(ctx.guild.id, {"quarantined": stored})
+
+    clean: str = discord.utils.escape_mentions(str(reason or "No reason given"))[:400]
+    case_id: Optional[int] = await record_case(
+        ctx.guild, "quarantine", ctx.author, user, clean
+    )
+    try:
+        await user.send(
+            f"You have been quarantined in **{ctx.guild.name}**.\n"
+            f"**Reason:** {clean}\n"
+            "Your roles are stored and will be restored when a moderator releases you."
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    log.info("Quarantined %s in guild %s by %s.", user.id, ctx.guild.id, ctx.author)
+    await send_modlog(
+        ctx.guild,
+        f"\U0001f512 Quarantine{f' - case #{case_id}' if case_id else ''}",
+        f"**Reason:** {clean}",
+        discord.Color.dark_orange(),
+        [
+            ("Moderator", f"{ctx.author.mention} (`{ctx.author}`)"),
+            ("Target", f"{user.mention} (`{user}`)"),
+            ("Roles stored", str(len(snapshot))),
+        ],
+    )
+    await ctx.send(
+        f"\U0001f512 Quarantined **{user}** and stored **{len(snapshot)}** role(s).",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.hybrid_command(name="unquarantine", description="Release a member and restore their roles")
+@app_commands.default_permissions(moderate_members=True)
+@commands.guild_only()
+@commands.has_permissions(moderate_members=True)
+@commands.bot_has_permissions(manage_roles=True)
+@app_commands.describe(user="Who to release")
+async def unquarantine_cmd(ctx: commands.Context, user: discord.Member) -> None:
+    if not member_has_perms(ctx.author, moderate_members=True):
+        return await ctx.send(
+            "\u274c You need the **Timeout Members** permission.", ephemeral=True
+        )
+    await ctx.defer(ephemeral=True)
+
+    stored: Dict[str, Any] = dict(
+        bot.settings.peek_settings(ctx.guild.id).get("quarantined") or {}
+    )
+    entry: Optional[Dict[str, Any]] = stored.pop(str(user.id), None)
+    config: Dict[str, Any] = _raid_config(ctx.guild.id)
+    role_id: Any = config.get("quarantine_role_id")
+    role: Optional[discord.Role] = ctx.guild.get_role(int(role_id)) if role_id else None
+
+    if entry is None and (role is None or role not in user.roles):
+        return await ctx.send(f"\u2139\ufe0f {user.mention} isn't quarantined.", ephemeral=True)
+
+    restore: List[discord.Role] = []
+    for raw_id in (entry or {}).get("roles", []):
+        candidate: Optional[discord.Role] = ctx.guild.get_role(int(raw_id))
+        if candidate is not None and not candidate.managed and candidate < ctx.guild.me.top_role:
+            restore.append(candidate)
+
+    try:
+        if role is not None and role in user.roles:
+            await user.remove_roles(role, reason=f"Quarantine lifted by {ctx.author}")
+        if restore:
+            await user.add_roles(*restore, reason=f"Quarantine lifted by {ctx.author}")
+    except discord.Forbidden:
+        return await ctx.send(
+            "\u274c I'm missing the permissions or hierarchy to restore those roles.",
+            ephemeral=True,
+        )
+    except discord.HTTPException as exc:
+        bot.log_error("unquarantine", exc, guild=ctx.guild, user=user)
+        return await ctx.send("\u26a0\ufe0f Discord rejected the role change.", ephemeral=True)
+
+    await bot.settings.push_fields(ctx.guild.id, {"quarantined": stored})
+    case_id: Optional[int] = await record_case(
+        ctx.guild, "unquarantine", ctx.author, user, "Quarantine lifted"
+    )
+    log.info("Released %s in guild %s by %s.", user.id, ctx.guild.id, ctx.author)
+    await send_modlog(
+        ctx.guild,
+        f"\U0001f513 Quarantine lifted{f' - case #{case_id}' if case_id else ''}",
+        f"{user.mention} was released by {ctx.author.mention}.",
+        discord.Color.green(),
+        [("Roles restored", str(len(restore)))],
+    )
+    await ctx.send(
+        f"\U0001f513 Released **{user}** and restored **{len(restore)}** role(s).",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+if __name__ == "__main__":
+    token: Optional[str] = os.getenv("DISCORD_TOKEN")
+    if not token:
+        log.critical("DISCORD_TOKEN environment variable not set - refusing to start.")
+        raise SystemExit(1)
+
+    async def runner() -> None:
+        await _start_keepalive_server()
+
+        base_backoff: float = 15.0
+        max_backoff: float = 300.0
+        backoff: float = base_backoff
+
+        while True:
+            attempt_started: float = time.monotonic()
+            try:
+                await bot.start(token)
+                log.info("Gateway session closed cleanly - exiting supervisor.")
+                return
+            except (discord.LoginFailure, discord.PrivilegedIntentsRequired) as exc:
+                log.critical("Unrecoverable startup failure: %s", exc)
+                raise SystemExit(1) from exc
+            except discord.HTTPException as exc:
+                if exc.status == 429:
+                    log.warning("Rate limited (HTTP 429) during startup: %s", exc)
+                else:
+                    log.warning(
+                        "HTTP error during startup (status %s): %s", exc.status, exc
+                    )
+            except (
+                discord.ConnectionClosed,
+                discord.GatewayNotFound,
+                aiohttp.ClientError,
+                OSError,
+            ) as exc:
+                log.warning("Transport failure: %s", exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Unexpected supervisor failure.")
+
+            if time.monotonic() - attempt_started > 600:
+                backoff = base_backoff  # A long-lived session earns a fresh budget.
+
+            delay: float = backoff + random.uniform(0.0, 5.0)
+            log.info("Reconnecting in %.1fs.", delay)
+            await asyncio.sleep(delay)
+            backoff = min(backoff * 2, max_backoff)
+
+    try:
+        asyncio.run(runner())
+    except KeyboardInterrupt:
+        log.info("Interrupted - shutting down.")
