@@ -5587,9 +5587,9 @@ async def diagnose_cmd(ctx: commands.Context) -> None:
     for name, loop_obj in loops.items():
         if loop_obj.is_running():
             failed: bool = bool(loop_obj.failed())
-            loop_lines.append(
-                f"{'\u26a0\ufe0f' if failed else '\u2705'} {name}{' (failed)' if failed else ''}"
-            )
+            mark: str = "\u26a0\ufe0f" if failed else "\u2705"
+            suffix: str = " (failed)" if failed else ""
+            loop_lines.append(f"{mark} {name}{suffix}")
         else:
             loop_lines.append(f"\u274c {name} (stopped)")
 
@@ -5620,10 +5620,11 @@ async def diagnose_cmd(ctx: commands.Context) -> None:
         ),
         inline=True,
     )
+    db_state: str = "\u2705 reachable" if db_ok else "\u274c unreachable"
     embed.add_field(
         name="Database",
         value=(
-            f"{'\u2705 reachable' if db_ok else '\u274c unreachable'}\n"
+            f"{db_state}\n"
             f"Ping **{db_ms:.0f} ms**\n"
             f"Cache **{cache['entries']}** guilds - **{hit_rate:.1f}%** hits"
         ),
@@ -5911,9 +5912,10 @@ async def raid_config(
     if not fields:
         return await ctx.send("\u274c Give me at least one setting to change.", ephemeral=True)
     saved: bool = await bot.settings.push_fields(ctx.guild.id, fields)
+    mark: str = "\u2705" if saved else "\u26a0\ufe0f"
+    tail: str = "." if saved else " in memory only - the database write failed."
     await ctx.send(
-        f"{'\u2705' if saved else '\u26a0\ufe0f'} Updated **{len(fields)}** raid setting(s)"
-        f"{'.' if saved else ' in memory only - the database write failed.'}",
+        f"{mark} Updated **{len(fields)}** raid setting(s){tail}",
         ephemeral=True,
     )
 
