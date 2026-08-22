@@ -298,7 +298,7 @@ SUPERUSER_IDS: frozenset = _parse_id_set(os.getenv("SUPERUSER_IDS")) or frozense
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "echoset": False,
-    "autoreact": {"enabled": False, "emojis": []},
+    "autoreact": {"triggers": {}},
     "autorespond": {"enabled": False, "triggers": {}},
     "prefix": "!",
     "joinroles": [],
@@ -653,6 +653,8 @@ class DebtCollectorBot(commands.Bot):
         self.ai_next_fire: Dict[int, float] = {}  # channel_id -> cooldown expiry
         self.ai_locks: Dict[int, asyncio.Lock] = {}  # channel_id -> generation lock
         self.ai_lru: Dict[int, float] = {}  # channel_id -> last touched
+        self.ai_repeat: Dict[int, Dict[str, Any]] = {}  # channel_id -> repeat tracker
+        self.ai_user_recent: Dict[Tuple[int, int], List[float]] = {}  # burst tracker
         self.ai_stats: Dict[str, Dict[str, Any]] = {}  # provider -> counters
         self.ai_daily: Dict[str, int] = {}  # "guild:date" -> replies used
         self.automod_recent: Dict[Any, List[float]] = {}
@@ -785,6 +787,9 @@ async def global_rate_limit(ctx: commands.Context) -> bool:
     if ctx.command is None or is_superuser(ctx.author):
         return True
 
+    if not _can_run(ctx.author, ctx.command):
+        return True  # the staff gate rejects this; don't burn a cooldown slot
+
     name: str = ctx.command.qualified_name
     rate, per, scope = COMMAND_RATE_LIMITS.get(name, DEFAULT_RATE_LIMIT)
     key: Tuple[str, str, int] = (name, scope, _bucket_key(ctx, scope))
@@ -804,6 +809,20 @@ async def global_rate_limit(ctx: commands.Context) -> bool:
         for stale_key in [k for k, v in _COOLDOWN_STATE.items() if not v or now - v[-1] > 600]:
             _COOLDOWN_STATE.pop(stale_key, None)
     return True
+
+
+@bot.check
+async def staff_command_gate(ctx: commands.Context) -> bool:
+    """Reject gated commands before the body runs, so non-staff get the taunt."""
+    if ctx.command is None or ctx.guild is None:
+        return True
+    if _can_run(ctx.author, ctx.command):
+        return True
+    perms: Optional[discord.Permissions] = _required_permissions(ctx.command)
+    required: List[str] = (
+        [name.replace("_", " ") for name, value in perms if value] if perms else []
+    )
+    raise NotStaff(required)
 
 
 @bot.event
@@ -2164,7 +2183,12 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "set welcome": "Message posted when someone joins; empty channel turns it off.",
     "set goodbye": "Message posted when someone leaves; empty channel turns it off.",
     "echoset": "Allow or block the /echo command server-wide.",
-    "autoreact": "Emojis the bot automatically adds to every new message.",
+    "autoreact": "React with chosen emojis whenever a message contains a trigger word.",
+    "autoreact add": "Add a trigger plus the emojis to react with, and whether it matches "
+    "as a whole word or anywhere inside longer words.",
+    "autoreact remove": "Remove one emoji from a trigger, or delete the trigger entirely.",
+    "autoreact list": "Show every trigger, its emojis and its match mode.",
+    "autoreact clear": "Delete every autoreact trigger in this server.",
     "autorespond": "Automatic replies triggered by keywords in chat.",
     "autopurge": "Auto-delete every new message in chosen channels.",
     "autopurge on": "Start auto-deleting in a channel, optionally for a limited time.",
@@ -2220,11 +2244,52 @@ COMMAND_SUMMARY: Dict[str, str] = {
 }
 
 
-def _visible_commands() -> List[commands.Command]:
-    """Every registered command and subcommand, deduplicated and sorted."""
+PEASANT_TAUNTS: Tuple[str, ...] = ("peasant", "lol, imagine having no perms")
+
+
+class NotStaff(commands.CheckFailure):
+    """Raised when a member invokes a command gated behind permissions they lack."""
+
+    def __init__(self, required: List[str]) -> None:
+        self.required: List[str] = required
+        super().__init__("Missing staff permissions.")
+
+
+def _required_permissions(command: commands.Command) -> Optional[discord.Permissions]:
+    """The default_permissions gate on a command, inherited from its parent group."""
+    node: Optional[commands.Command] = command
+    while node is not None:
+        app_command = getattr(node, "app_command", None)
+        perms = getattr(app_command, "default_permissions", None)
+        if perms is not None and perms.value:
+            return perms
+        node = node.parent
+    return None
+
+
+def _can_run(user: discord.abc.User, command: commands.Command) -> bool:
+    """Whether this user satisfies the command's permission gate."""
+    perms: Optional[discord.Permissions] = _required_permissions(command)
+    if perms is None:
+        return True
+    if not isinstance(user, discord.Member):
+        return False
+    return member_has_perms(user, **{name: True for name, value in perms if value})
+
+
+def _visible_commands(
+    user: Optional[discord.abc.User] = None,
+) -> List[commands.Command]:
+    """Registered commands, deduplicated and sorted.
+
+    When a user is supplied, commands gated behind permissions they lack are
+    omitted entirely - they never appear in help, listings or autocomplete.
+    """
     seen: Dict[str, commands.Command] = {}
     for command in bot.walk_commands():
         if command.hidden:
+            continue
+        if user is not None and not _can_run(user, command):
             continue
         seen[command.qualified_name] = command
     return sorted(seen.values(), key=lambda c: c.qualified_name)
@@ -2265,18 +2330,12 @@ def _usage_for(command: commands.Command) -> str:
 
 
 def _permission_note(command: commands.Command) -> str:
-    """Read the real default_permissions off the command or its parent group."""
-    node: Optional[commands.Command] = command
-    while node is not None:
-        app_command = getattr(node, "app_command", None)
-        perms = getattr(app_command, "default_permissions", None)
-        if perms is not None and perms.value:
-            names: List[str] = [
-                name.replace("_", " ").title() for name, value in perms if value
-            ]
-            return "Requires " + ", ".join(f"**{name}**" for name in names)
-        node = node.parent
-    return "Anyone can use this"
+    """Human-readable form of the command's permission gate."""
+    perms: Optional[discord.Permissions] = _required_permissions(command)
+    if perms is None:
+        return "Anyone can use this"
+    names: List[str] = [name.replace("_", " ").title() for name, value in perms if value]
+    return "Requires " + ", ".join(f"**{name}**" for name in names)
 
 
 def _parameter_lines(command: commands.Command) -> List[str]:
@@ -2311,7 +2370,7 @@ async def _command_name_autocomplete(
     needle: str = (current or "").casefold().lstrip("/")
     matches: List[str] = [
         command.qualified_name
-        for command in _visible_commands()
+        for command in _visible_commands(interaction.user)
         if needle in command.qualified_name.casefold()
     ]
     matches.sort(key=lambda n: (not n.casefold().startswith(needle), len(n), n))
@@ -2330,10 +2389,12 @@ async def help_cmd(ctx: commands.Context, *, command: Optional[str] = None) -> N
     if command:
         query: str = command.strip().lstrip("/").strip()
         target: Optional[commands.Command] = bot.get_command(query)
+        if target is not None and not _can_run(ctx.author, target):
+            target = None  # gated commands stay invisible, not merely refused
         if target is None:
             suggestions: List[str] = [
                 c.qualified_name
-                for c in _visible_commands()
+                for c in _visible_commands(ctx.author)
                 if query.casefold() in c.qualified_name.casefold()
             ][:6]
             hint: str = (
@@ -2387,7 +2448,7 @@ async def help_cmd(ctx: commands.Context, *, command: Optional[str] = None) -> N
         return await ctx.send(embed=embed, ephemeral=True)
 
     counts: Dict[str, int] = {}
-    for entry in _visible_commands():
+    for entry in _visible_commands(ctx.author):
         key: str = _category_for(entry)
         counts[key] = counts.get(key, 0) + 1
 
@@ -2435,7 +2496,7 @@ async def commands_cmd(
     ] = None,
 ) -> None:
     prefix: str = ctx.clean_prefix or COMMAND_PREFIX
-    everything: List[commands.Command] = _visible_commands()
+    everything: List[commands.Command] = _visible_commands(ctx.author)
 
     if category is None:
         counts: Dict[str, int] = {}
@@ -2912,6 +2973,25 @@ async def _report_error(ctx: commands.Context, error: commands.CommandError) -> 
             f"⏳ Slow down — try again in {error.retry_after:.1f}s.", ephemeral=True
         )
         return
+    if isinstance(error, (NotStaff, commands.MissingPermissions)):
+        if ctx.interaction is None:
+            # Guessed a staff command from chat. No details, no hints.
+            await ctx.send(
+                random.choice(PEASANT_TAUNTS),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        required: List[str] = list(getattr(error, "required", None) or [])
+        detail: str = (
+            " You need " + ", ".join(f"**{name}**" for name in required) + "."
+            if required
+            else ""
+        )
+        await ctx.send(
+            f"❌ You don't have permission to use this command.{detail}",
+            ephemeral=True,
+        )
+        return
     if isinstance(error, commands.CheckFailure):
         await ctx.send("❌ You don't have permission to use this command.", ephemeral=True)
         return
@@ -2966,7 +3046,9 @@ async def on_app_command_error(
         command=getattr(interaction.command, "qualified_name", None),
     )
     message: str = "⚠️ Something went wrong while running that command."
-    if isinstance(error, app_commands.CheckFailure):
+    if isinstance(error, (NotStaff, app_commands.MissingPermissions)):
+        message = "❌ You don't have permission to use this command."
+    elif isinstance(error, app_commands.CheckFailure):
         message = "❌ You don't have permission to use this command."
     try:
         if interaction.response.is_done():
@@ -3044,9 +3126,16 @@ async def _apply_guild_automations(message: discord.Message) -> None:
     assert message.guild is not None
     settings = bot.settings.peek_settings(message.guild.id)
 
-    autoreact: Dict[str, Any] = settings.get("autoreact") or {}
-    if autoreact.get("enabled") and autoreact.get("emojis"):
-        for emoji in list(autoreact["emojis"])[:5]:
+    content: str = message.content or ""
+    if content:
+        queued: List[str] = []
+        for trigger, spec in _autoreact_triggers(message.guild.id).items():
+            if not _autoreact_pattern(trigger, str(spec["mode"])).search(content):
+                continue
+            for emoji in spec["emojis"]:
+                if emoji not in queued:
+                    queued.append(emoji)
+        for emoji in queued[:AUTOREACT_REACTION_CAP]:
             try:
                 await message.add_reaction(emoji)
             except (discord.HTTPException, discord.Forbidden, TypeError):
@@ -3176,30 +3265,350 @@ async def autorespond_cmd(
     )
 
 
-@bot.hybrid_command(
+AUTOREACT_MAX_TRIGGERS: int = 50
+AUTOREACT_MAX_EMOJIS: int = 5
+AUTOREACT_REACTION_CAP: int = 6
+AUTOREACT_MODES: Tuple[str, ...] = ("word", "anywhere")
+
+_AUTOREACT_CUSTOM_EMOJI_RE: re.Pattern = re.compile(r"<a?:\w{2,32}:(\d{15,25})>")
+_AUTOREACT_UNICODE_EMOJI_RE: re.Pattern = re.compile(
+    "(?:[\U0001f1e6-\U0001f1ff]{2})"
+    "|(?:[0-9#*]\ufe0f?\u20e3)"
+    "|(?:[\U0001f000-\U0001faff\u2600-\u27bf\u2b00-\u2bff\u2190-\u21ff\u2300-\u23ff]"
+    "[\ufe00-\ufe0f\U0001f3fb-\U0001f3ff]*"
+    "(?:\u200d[\U0001f000-\U0001faff\u2600-\u27bf\u2b00-\u2bff\u2300-\u23ff]"
+    "[\ufe00-\ufe0f\U0001f3fb-\U0001f3ff]*)*)"
+)
+_AUTOREACT_PATTERN_CACHE: Dict[Tuple[str, str], re.Pattern] = {}
+
+
+def _autoreact_pattern(trigger: str, mode: str) -> re.Pattern:
+    """Compiled matcher for one trigger, cached across messages.
+
+    "word" requires the trigger to stand alone, so `a` does not fire on `maze`.
+    "anywhere" is a plain substring match, so `a` does fire on `maze`.
+    """
+    key: Tuple[str, str] = (trigger, mode)
+    cached: Optional[re.Pattern] = _AUTOREACT_PATTERN_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    escaped: str = re.escape(trigger)
+    if mode == "word":
+        pattern = re.compile(r"(?<!\w)" + escaped + r"(?!\w)", re.IGNORECASE)
+    else:
+        pattern = re.compile(escaped, re.IGNORECASE)
+
+    if len(_AUTOREACT_PATTERN_CACHE) > 500:
+        _AUTOREACT_PATTERN_CACHE.clear()
+    _AUTOREACT_PATTERN_CACHE[key] = pattern
+    return pattern
+
+
+def _parse_emoji_tokens(raw: str) -> List[str]:
+    """Pull custom and unicode emojis out of free text, order preserved.
+
+    Accepts them run together (\U0001f600\U0001f603) or space separated.
+    """
+    tokens: List[str] = []
+    text: str = raw or ""
+
+    for match in _AUTOREACT_CUSTOM_EMOJI_RE.finditer(text):
+        tokens.append(match.group(0))
+    text = _AUTOREACT_CUSTOM_EMOJI_RE.sub(" ", text)
+
+    for cluster in _AUTOREACT_UNICODE_EMOJI_RE.findall(text):
+        cleaned: str = str(cluster).strip()
+        if cleaned:
+            tokens.append(cleaned)
+
+    unique: List[str] = []
+    for token in tokens:
+        if token not in unique:
+            unique.append(token)
+    return unique
+
+
+def _emoji_is_usable(token: str) -> bool:
+    """Custom emojis must be reachable by the bot; unicode is always fine."""
+    match: Optional[re.Match] = _AUTOREACT_CUSTOM_EMOJI_RE.fullmatch(token)
+    if match is None:
+        return True
+    return bot.get_emoji(int(match.group(1))) is not None
+
+
+def _autoreact_triggers(guild_id: int) -> Dict[str, Dict[str, Any]]:
+    """Normalized trigger map: {trigger: {"emojis": [...], "mode": "word"}}."""
+    stored: Any = (bot.settings.peek_settings(guild_id).get("autoreact") or {}).get("triggers")
+    result: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(stored, dict):
+        return result
+    for trigger, spec in stored.items():
+        if isinstance(spec, dict):
+            emojis: List[str] = [str(e) for e in (spec.get("emojis") or [])]
+            mode: str = str(spec.get("mode") or "word")
+        elif isinstance(spec, list):  # tolerate an older shape
+            emojis = [str(e) for e in spec]
+            mode = "word"
+        else:
+            continue
+        if not emojis:
+            continue
+        result[str(trigger)] = {
+            "emojis": emojis[:AUTOREACT_MAX_EMOJIS],
+            "mode": mode if mode in AUTOREACT_MODES else "word",
+        }
+    return result
+
+
+async def _autoreact_trigger_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> List[app_commands.Choice[str]]:
+    if interaction.guild_id is None:
+        return []
+    needle: str = (current or "").casefold()
+    triggers: Dict[str, Dict[str, Any]] = _autoreact_triggers(interaction.guild_id)
+    matches: List[str] = [t for t in triggers if needle in t.casefold()]
+    matches.sort()
+    return [
+        app_commands.Choice(
+            name=f"{trigger} ({''.join(triggers[trigger]['emojis'])})"[:100],
+            value=trigger,
+        )
+        for trigger in matches[:25]
+    ]
+
+
+@bot.hybrid_group(
     name="autoreact",
-    description="Add, remove or list emojis the bot auto-reacts with",
+    description="React with chosen emojis when a message contains a trigger",
+    fallback="list",
 )
 @app_commands.default_permissions(manage_guild=True)
-async def autoreact_cmd(
-    ctx: commands.Context, state: Literal["on", "off"], *, emojis: Optional[str] = None
+@commands.guild_only()
+async def autoreact_group(ctx: commands.Context) -> None:
+    triggers: Dict[str, Dict[str, Any]] = _autoreact_triggers(ctx.guild.id)
+    if not triggers:
+        return await ctx.send(
+            "\U0001f4ed No autoreact triggers yet.\n"
+            f"Add one with `{ctx.clean_prefix}autoreact add <trigger> <emojis> [mode]`.",
+            ephemeral=True,
+        )
+
+    lines: List[str] = []
+    for trigger in sorted(triggers):
+        spec: Dict[str, Any] = triggers[trigger]
+        note: str = (
+            "whole word only" if spec["mode"] == "word" else "anywhere, even inside words"
+        )
+        lines.append(
+            f"**{discord.utils.escape_markdown(trigger)}** \u2192 {' '.join(spec['emojis'])}\n"
+            f"\u2003matches: {note}"
+        )
+
+    pages = build_pages(
+        f"Autoreact \u00b7 {len(triggers)} trigger(s)",
+        lines,
+        discord.Color.blurple(),
+        per_page=10,
+        footer=f"{ctx.clean_prefix}autoreact add / remove / clear",
+    )
+    await send_pages(ctx, pages, ephemeral=True)
+
+
+@autoreact_group.command(
+    name="add",
+    description="Add a trigger and the emojis to react with",
+)
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(
+    trigger="Text to watch for. Wrap in quotes for more than one word.",
+    emojis="One or more emojis, run together or space separated (max 5)",
+    mode="word = only as a standalone word · anywhere = also inside longer words",
+)
+async def autoreact_add(
+    ctx: commands.Context,
+    trigger: str,
+    emojis: str,
+    mode: Literal["word", "anywhere"] = "word",
 ) -> None:
-    if not isinstance(ctx.author, discord.Member) or not member_has_perms(
-        ctx.author, manage_guild=True
-    ):
-        await ctx.send("❌ You need the **Manage Server** permission for this.", ephemeral=True)
-        return
-    settings: Dict[str, Any] = bot.settings.get_settings(ctx.guild.id)  # type: ignore[union-attr]
-    conf: Dict[str, Any] = dict(settings.get("autoreact") or {"enabled": False, "emojis": []})
-    conf["enabled"] = state == "on"
-    if emojis:
-        conf["emojis"] = emojis.split()[:5]
-    saved: bool = bot.settings.update_settings(ctx.guild.id, {"autoreact": conf})  # type: ignore[union-attr]
-    status: str = "enabled" if conf["enabled"] else "disabled"
-    emoji_list: str = " ".join(conf.get("emojis") or []) or "*(none set)*"
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send(
+            "\u274c You need the **Manage Server** permission for this.", ephemeral=True
+        )
+
+    clean_trigger: str = trigger.strip()[:100]
+    if not clean_trigger:
+        return await ctx.send("\u274c Give me a trigger to watch for.", ephemeral=True)
+
+    parsed: List[str] = _parse_emoji_tokens(emojis)
+    if not parsed:
+        return await ctx.send(
+            "\u274c I couldn't find any emojis in that. Pass them like "
+            "`\U0001f44b\U0001f389` or `\U0001f44b \U0001f389`.",
+            ephemeral=True,
+        )
+
+    usable: List[str] = [token for token in parsed if _emoji_is_usable(token)]
+    rejected: List[str] = [token for token in parsed if token not in usable]
+    if not usable:
+        return await ctx.send(
+            "\u274c I can't use those emojis \u2014 custom ones must be from a server I'm in.",
+            ephemeral=True,
+        )
+
+    triggers: Dict[str, Dict[str, Any]] = _autoreact_triggers(ctx.guild.id)
+    existing: Optional[Dict[str, Any]] = triggers.get(clean_trigger)
+    if existing is None and len(triggers) >= AUTOREACT_MAX_TRIGGERS:
+        return await ctx.send(
+            f"\u274c This server already has {AUTOREACT_MAX_TRIGGERS} triggers. "
+            f"Remove one first with `{ctx.clean_prefix}autoreact remove`.",
+            ephemeral=True,
+        )
+
+    merged: List[str] = list((existing or {}).get("emojis") or [])
+    added: List[str] = []
+    for token in usable:
+        if token in merged:
+            continue
+        if len(merged) >= AUTOREACT_MAX_EMOJIS:
+            break
+        merged.append(token)
+        added.append(token)
+
+    triggers[clean_trigger] = {"emojis": merged, "mode": mode}
+    saved: bool = await bot.settings.push_fields(
+        ctx.guild.id, {"autoreact.triggers": triggers}
+    )
+    _AUTOREACT_PATTERN_CACHE.pop((clean_trigger, "word"), None)
+    _AUTOREACT_PATTERN_CACHE.pop((clean_trigger, "anywhere"), None)
+
+    log.info(
+        "Autoreact trigger %r set in guild %s by %s (mode=%s, %d emoji).",
+        clean_trigger,
+        ctx.guild.id,
+        ctx.author,
+        mode,
+        len(merged),
+    )
+
+    note: str = (
+        "will fire only as a standalone word"
+        if mode == "word"
+        else "will fire anywhere, even inside longer words"
+    )
+    detail: str = ""
+    if not added and existing is not None:
+        detail = "\nThose emojis were already on this trigger; the match mode was updated."
+    elif len(added) < len(usable):
+        detail = f"\nStopped at the {AUTOREACT_MAX_EMOJIS}-emoji limit for one trigger."
+    if rejected:
+        detail += f"\n\u26a0\ufe0f Skipped {len(rejected)} emoji I can't access."
+    if not saved:
+        detail += "\n\u26a0\ufe0f Saved in memory only \u2014 the database write failed."
+
     await ctx.send(
-        f"{'✅' if saved else '⚠️'} Autoreact **{status}** — emojis: {emoji_list}"
-        + ("" if saved else " (database write failed)"),
+        f"\u2705 **{discord.utils.escape_markdown(clean_trigger)}** \u2192 "
+        f"{' '.join(merged)}\nIt {note}.{detail}",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@autoreact_group.command(
+    name="remove",
+    description="Remove one emoji from a trigger, or the whole trigger",
+)
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(
+    trigger="Which trigger to change",
+    emoji="Leave empty to delete the trigger entirely",
+)
+@app_commands.autocomplete(trigger=_autoreact_trigger_autocomplete)
+async def autoreact_remove(
+    ctx: commands.Context,
+    trigger: str,
+    emoji: Optional[str] = None,
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send(
+            "\u274c You need the **Manage Server** permission for this.", ephemeral=True
+        )
+
+    triggers: Dict[str, Dict[str, Any]] = _autoreact_triggers(ctx.guild.id)
+    key: str = trigger.strip()
+    if key not in triggers:
+        match: Optional[str] = next(
+            (t for t in triggers if t.casefold() == key.casefold()), None
+        )
+        if match is None:
+            return await ctx.send(
+                f"\u274c No trigger called **{discord.utils.escape_markdown(key[:60])}**.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        key = match
+
+    if emoji is None:
+        triggers.pop(key, None)
+        outcome: str = f"\U0001f5d1\ufe0f Removed the trigger **{discord.utils.escape_markdown(key)}**."
+    else:
+        wanted: List[str] = _parse_emoji_tokens(emoji)
+        remaining: List[str] = [
+            token for token in triggers[key]["emojis"] if token not in wanted
+        ]
+        if len(remaining) == len(triggers[key]["emojis"]):
+            return await ctx.send(
+                "\u274c That emoji isn't on this trigger. Current: "
+                + " ".join(triggers[key]["emojis"]),
+                ephemeral=True,
+            )
+        if remaining:
+            triggers[key]["emojis"] = remaining
+            outcome = (
+                f"\u2705 **{discord.utils.escape_markdown(key)}** \u2192 "
+                + " ".join(remaining)
+            )
+        else:
+            triggers.pop(key, None)
+            outcome = (
+                f"\U0001f5d1\ufe0f That was the last emoji, so the trigger "
+                f"**{discord.utils.escape_markdown(key)}** was removed."
+            )
+
+    saved: bool = await bot.settings.push_fields(
+        ctx.guild.id, {"autoreact.triggers": triggers}
+    )
+    _AUTOREACT_PATTERN_CACHE.pop((key, "word"), None)
+    _AUTOREACT_PATTERN_CACHE.pop((key, "anywhere"), None)
+    log.info("Autoreact trigger %r edited in guild %s by %s.", key, ctx.guild.id, ctx.author)
+
+    await ctx.send(
+        outcome + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@autoreact_group.command(name="clear", description="Delete every autoreact trigger")
+@commands.has_permissions(manage_guild=True)
+async def autoreact_clear(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send(
+            "\u274c You need the **Manage Server** permission for this.", ephemeral=True
+        )
+
+    count: int = len(_autoreact_triggers(ctx.guild.id))
+    if not count:
+        return await ctx.send("\u2705 There were no autoreact triggers.", ephemeral=True)
+
+    saved: bool = await bot.settings.push_fields(ctx.guild.id, {"autoreact.triggers": {}})
+    _AUTOREACT_PATTERN_CACHE.clear()
+    log.info("Autoreact cleared in guild %s by %s (%d triggers).", ctx.guild.id, ctx.author, count)
+    await ctx.send(
+        f"\U0001f9f9 Removed **{count}** autoreact trigger(s)."
+        + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
     )
 
 
@@ -3224,6 +3633,87 @@ AI_CONVO_WINDOW: float = 600.0
 AI_ACTIVE_START_CHANCE: float = 80.0
 AI_CHANNEL_LRU: int = 200
 AI_HISTORY_TTL_DAYS: int = 30
+AI_SPAM_REPEAT_LIMIT: int = 3
+AI_SPAM_WINDOW: float = 60.0
+AI_USER_BURST_LIMIT: int = 5
+AI_USER_BURST_WINDOW: float = 30.0
+AI_MIN_MEANINGFUL_CHARS: int = 2
+
+_CUSTOM_EMOJI_RE: re.Pattern = re.compile(r"<a?:\w+:\d+>")
+_EMOJI_RANGE_RE: re.Pattern = re.compile(
+    "[\U0001f000-\U0001faff\u2600-\u27bf\U0001f1e6-\U0001f1ff"
+    "\u2b00-\u2bff\ufe0f\u200d\u2190-\u21ff\u2300-\u23ff]"
+)
+_REPEAT_RUN_RE: re.Pattern = re.compile(r"(.)\1{2,}")
+
+
+def _ai_normalize(text: str) -> str:
+    """Collapse whitespace, case and character runs so 'aaaa!!!' == 'aa!'."""
+    collapsed: str = re.sub(r"\s+", " ", text or "").strip().casefold()
+    return _REPEAT_RUN_RE.sub(r"\1\1", collapsed)
+
+
+def _ai_meaningful_text(text: str) -> str:
+    """Word characters left once emoji and punctuation are removed."""
+    stripped: str = _CUSTOM_EMOJI_RE.sub("", text or "")
+    stripped = _EMOJI_RANGE_RE.sub("", stripped)
+    return re.sub(r"[^\w]", "", stripped, flags=re.UNICODE)
+
+
+def _ai_content_key(message: discord.Message) -> str:
+    """Normalized identity of a message, covering sticker-only posts."""
+    key: str = _ai_normalize(message.content or "")
+    if not key and message.stickers:
+        key = "sticker:" + ",".join(sticker.name for sticker in message.stickers).casefold()
+    if not key and message.attachments:
+        key = "attachment:" + str(len(message.attachments))
+    return key
+
+
+def _ai_abuse_reason(message: discord.Message, *, addressed: bool) -> Optional[str]:
+    """Why the AI should ignore this message, or None when it is legitimate.
+
+    Flagged messages are neither answered nor written to history, so a spam run
+    cannot poison the context window the model reasons over.
+    """
+    now: float = time.time()
+    channel_id: int = message.channel.id
+    burst_key: Tuple[int, int] = (channel_id, message.author.id)
+
+    hits: List[float] = [
+        stamp
+        for stamp in bot.ai_user_recent.get(burst_key, [])
+        if now - stamp < AI_USER_BURST_WINDOW
+    ]
+    hits.append(now)
+    bot.ai_user_recent[burst_key] = hits[-20:]
+    if len(bot.ai_user_recent) > 5000:
+        for stale in [
+            key
+            for key, stamps in bot.ai_user_recent.items()
+            if not stamps or now - stamps[-1] > 300
+        ]:
+            bot.ai_user_recent.pop(stale, None)
+    if len(hits) > AI_USER_BURST_LIMIT:
+        return "user burst"
+
+    key: str = _ai_content_key(message)
+    state: Optional[Dict[str, Any]] = bot.ai_repeat.get(channel_id)
+    if state is not None and state.get("key") == key and now - float(state["at"]) < AI_SPAM_WINDOW:
+        state["count"] = int(state["count"]) + 1
+        state["at"] = now
+    else:
+        state = {"key": key, "count": 1, "at": now}
+        bot.ai_repeat[channel_id] = state
+    if key and int(state["count"]) >= AI_SPAM_REPEAT_LIMIT:
+        return "repeated content"
+
+    if not addressed:
+        if message.stickers and not (message.content or "").strip():
+            return "sticker only"
+        if len(_ai_meaningful_text(message.content or "")) < AI_MIN_MEANINGFUL_CHARS:
+            return "no meaningful text"
+    return None
 AI_REPLY_HARD_LIMIT: int = 1900
 
 PROVIDER_KEYS: Dict[str, str] = {
@@ -3411,6 +3901,14 @@ def _ai_touch(channel_id: int) -> None:
 
 def _ai_remember(channel_id: int, entry: Dict[str, Any]) -> None:
     history = bot.ai_history_buffer.setdefault(channel_id, [])
+    if history:
+        last: Dict[str, Any] = history[-1]
+        same_role: bool = last.get("role") == entry.get("role")
+        same_text: bool = _ai_normalize(str(last.get("content") or "")) == _ai_normalize(
+            str(entry.get("content") or "")
+        )
+        if same_role and same_text:
+            return  # never stack duplicate turns into the context window
     history.append(entry)
     del history[:-AI_HISTORY_CAP]
     bot.ai_pending.setdefault(channel_id, []).append(entry)
@@ -3478,6 +3976,30 @@ def _ai_quota_spend(guild_id: int) -> None:
             bot.ai_daily.pop(stale, None)
 
 
+def _gemini_contents(messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Build Gemini turns, trimming both ends to satisfy its ordering rules.
+
+    Gemini rejects a request whose first or last turn belongs to the model
+    ("Requests ending with a model turn are not supported"), which happens
+    whenever the bot spoke last and the newest user message was not stored.
+    """
+    contents: List[Dict[str, Any]] = [
+        {
+            "role": "user" if entry["role"] == "user" else "model",
+            "parts": [{"text": entry["content"]}],
+        }
+        for entry in messages
+        if str(entry.get("content") or "").strip()
+    ]
+    while contents and contents[0]["role"] == "model":
+        contents.pop(0)
+    while contents and contents[-1]["role"] == "model":
+        contents.pop()
+    if not contents:
+        contents = [{"role": "user", "parts": [{"text": "(continue the conversation)"}]}]
+    return contents
+
+
 def _build_provider_request(
     provider: str,
     key: str,
@@ -3513,13 +4035,7 @@ def _build_provider_request(
             ),
             "headers": {"Content-Type": "application/json", "x-goog-api-key": key},
             "payload": {
-                "contents": [
-                    {
-                        "role": "user" if m["role"] == "user" else "model",
-                        "parts": [{"text": m["content"]}],
-                    }
-                    for m in messages
-                ],
+                "contents": _gemini_contents(messages),
                 "systemInstruction": {"parts": [{"text": system_prompt}]},
                 "generationConfig": {
                     "maxOutputTokens": max_tokens,
@@ -3782,7 +4298,9 @@ async def _handle_ai(message: discord.Message) -> None:
     if str(channel_id) not in (config.get("channels") or []):
         return
 
-    guild_prefix = bot.settings.get_settings(trigger_message.guild.id).get("prefix", COMMAND_PREFIX)
+    guild_prefix = bot.settings.peek_settings(trigger_message.guild.id).get(
+        "prefix", COMMAND_PREFIX
+    )
     content = trigger_message.content or ""
     if content.startswith(guild_prefix) or content.startswith(COMMAND_PREFIX):
         return
@@ -3791,9 +4309,26 @@ async def _handle_ai(message: discord.Message) -> None:
 
     history = await _get_ai_history(channel_id)
     replying_to_bot, replied_message = await _reply_target_is_bot(trigger_message)
+    is_mentioned = bot.user.mentioned_in(trigger_message) and not trigger_message.mention_everyone
+    addressed: bool = bool(is_mentioned or replying_to_bot)
 
-    if content.strip() or trigger_message.attachments:
-        text = content.strip() or "[attachment]"
+    abuse: Optional[str] = _ai_abuse_reason(trigger_message, addressed=addressed)
+    if abuse is not None:
+        log.debug(
+            "AI ignored a message in channel %s from %s (%s).",
+            channel_id,
+            trigger_message.author.id,
+            abuse,
+        )
+        return
+
+    text = content.strip()
+    if not text and trigger_message.stickers:
+        names = ", ".join(sticker.name for sticker in trigger_message.stickers)
+        text = f"[sticker: {names[:100]}]"
+    if not text and trigger_message.attachments:
+        text = "[attachment]"
+    if text:
         _ai_remember(
             channel_id,
             {
@@ -3806,7 +4341,6 @@ async def _handle_ai(message: discord.Message) -> None:
         )
 
     now = time.time()
-    is_mentioned = bot.user.mentioned_in(trigger_message) and not trigger_message.mention_everyone
     last_ai = bot.ai_active_conversations.get(channel_id, 0.0)
     elapsed = now - last_ai
     base_chance = float(config.get("probability") or 0.0)
