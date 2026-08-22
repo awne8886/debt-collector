@@ -1177,6 +1177,13 @@ async def send_pages(
 @bot.event
 async def on_ready() -> None:
     log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
+    stray: List[str] = _uncategorised_roots()
+    if stray:
+        log.warning(
+            "%d command(s) missing from COMMAND_CATEGORY and shown as uncategorised: %s",
+            len(stray),
+            ", ".join(stray),
+        )
 
 
 @bot.event
@@ -1612,7 +1619,10 @@ async def reactionrole_remove(
         ephemeral=True,
     )
 
-@bot.hybrid_command(name="reaction", description="Make the bot react to a message.")
+@bot.hybrid_command(
+    name="reaction",
+    description="Make the bot add an emoji reaction to a linked message",
+)
 @app_commands.default_permissions(manage_messages=True)
 @commands.guild_only()
 @app_commands.describe(link="Link to the message", emoji="Reaction emoji")
@@ -1636,7 +1646,10 @@ async def reaction_cmd(ctx: commands.Context, link: str, emoji: str):
 # MODERATION & UTILITY (Migrated from bot.py)
 # --------------------------------------------------------------------------- #
 
-@bot.hybrid_command(name="ban", description="Ban a member")
+@bot.hybrid_command(
+    name="ban",
+    description="Permanently ban a member from the server",
+)
 @app_commands.default_permissions(ban_members=True)
 @commands.guild_only()
 async def ban_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optional[str] = "No reason given"):
@@ -1658,7 +1671,10 @@ async def unban_cmd(ctx: commands.Context, user_id: str):
     except Exception as e:
         await ctx.send(f"❌ Failed to unban: {e}", ephemeral=True)
 
-@bot.hybrid_command(name="kick", description="Kick a member")
+@bot.hybrid_command(
+    name="kick",
+    description="Remove a member; they can rejoin with a new invite",
+)
 @app_commands.default_permissions(kick_members=True)
 @commands.guild_only()
 async def kick_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optional[str] = "No reason given"):
@@ -1688,7 +1704,10 @@ async def untimeout_cmd(ctx: commands.Context, user: discord.Member):
     await user.timeout(None)
     await ctx.send(f"🔊 **{user}**'s timeout was removed.")
 
-@bot.hybrid_command(name="warn", description="Warn a member")
+@bot.hybrid_command(
+    name="warn",
+    description="Log a warning against a member and DM them the reason",
+)
 @app_commands.default_permissions(manage_messages=True)
 @commands.guild_only()
 async def warn_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optional[str] = "No reason given"):
@@ -1921,7 +1940,10 @@ async def uptime_cmd(ctx: commands.Context):
     s = (datetime.now(timezone.utc).timestamp() - bot.start_time)
     await ctx.send(f"⏱️ Uptime: {humanize_seconds(s)}")
 
-@bot.hybrid_command(name="userinfo", description="Info about a member")
+@bot.hybrid_command(
+    name="userinfo",
+    description="Account age, join date, roles and key permissions for a member",
+)
 async def userinfo_cmd(ctx: commands.Context, user: Optional[discord.Member] = None):
     user = user or ctx.author
     embed = discord.Embed(title=str(user), color=user.color)
@@ -1931,7 +1953,10 @@ async def userinfo_cmd(ctx: commands.Context, user: Optional[discord.Member] = N
     embed.add_field(name="Joined", value=f"<t:{int(user.joined_at.timestamp())}:R>")
     await ctx.send(embed=embed)
 
-@bot.hybrid_command(name="serverinfo", description="Info about this server")
+@bot.hybrid_command(
+    name="serverinfo",
+    description="Member counts, channels, roles, boosts and creation date",
+)
 @commands.guild_only()
 async def serverinfo_cmd(ctx: commands.Context):
     g = ctx.guild
@@ -1960,7 +1985,10 @@ async def banner_cmd(ctx: commands.Context, user: Optional[discord.User] = None)
     embed.set_image(url=fetched.banner.url)
     await ctx.send(embed=embed)
 
-@bot.hybrid_command(name="roleinfo", description="Info about a role")
+@bot.hybrid_command(
+    name="roleinfo",
+    description="Colour, position, member count and permissions for a role",
+)
 @commands.guild_only()
 async def roleinfo_cmd(ctx: commands.Context, role: discord.Role):
     embed = discord.Embed(title=f"@{role.name}", color=role.color)
@@ -1975,118 +2003,516 @@ async def roleinfo_cmd(ctx: commands.Context, role: discord.Role):
 async def membercount_cmd(ctx: commands.Context):
     await ctx.send(f"👥 **{ctx.guild.member_count}** members.")
 
-@bot.hybrid_command(name="help", description="What this bot can do")
-async def help_cmd(ctx: commands.Context):
+# --------------------------------------------------------------------------- #
+# Help system
+# --------------------------------------------------------------------------- #
+
+CATEGORY_LABELS: Dict[str, str] = {
+    "moderation": "\U0001f6e1\ufe0f Moderation",
+    "roles": "\U0001f3ad Roles",
+    "utility": "\U0001f6e0\ufe0f Utility",
+    "info": "\u2139\ufe0f Info",
+    "config": "\u2699\ufe0f Configuration (admin)",
+    "ai": "\U0001f9e0 AI",
+    "fun": "\U0001f389 Fun & roleplay",
+}
+
+# Root command -> category. Every root command in the tree must appear here;
+# _uncategorised_roots() reports any that do not so the listing cannot drift.
+COMMAND_CATEGORY: Dict[str, str] = {
+    # Moderation
+    "ban": "moderation",
+    "unban": "moderation",
+    "kick": "moderation",
+    "timeout": "moderation",
+    "untimeout": "moderation",
+    "warn": "moderation",
+    "warnings": "moderation",
+    "clearwarns": "moderation",
+    "tempban": "moderation",
+    "massban": "moderation",
+    "quarantine": "moderation",
+    "unquarantine": "moderation",
+    "purge": "moderation",
+    "lock": "moderation",
+    "unlock": "moderation",
+    "slowmode": "moderation",
+    "nickname": "moderation",
+    "case": "moderation",
+    "snipe": "moderation",
+    "raid": "moderation",
+    # Roles
+    "role": "roles",
+    "roleall": "roles",
+    "joinrole": "roles",
+    "reactionrole": "roles",
+    "inrole": "roles",
+    # Utility
+    "afk": "utility",
+    "echo": "utility",
+    "poll": "utility",
+    "reaction": "utility",
+    "remindme": "utility",
+    "steal": "utility",
+    "tag": "utility",
+    # Info
+    "ping": "info",
+    "uptime": "info",
+    "userinfo": "info",
+    "serverinfo": "info",
+    "avatar": "info",
+    "banner": "info",
+    "roleinfo": "info",
+    "membercount": "info",
+    "emojis": "info",
+    "permcheck": "info",
+    "help": "info",
+    "commands": "info",
+    # Configuration
+    "set": "config",
+    "echoset": "config",
+    "autoreact": "config",
+    "autorespond": "config",
+    "autopurge": "config",
+    "automod": "config",
+    "sticky": "config",
+    "starboard": "config",
+    "remind": "config",
+    "export": "config",
+    "import": "config",
+    "errors": "config",
+    "diagnose": "config",
+    # AI
+    "ai": "ai",
+    "ask": "ai",
+    "aiopt": "ai",
+}
+
+# Precise one-line summaries. Keys are fully qualified names, so subcommands are
+# addressed as "group sub". Falls back to the command's own description.
+COMMAND_SUMMARY: Dict[str, str] = {
+    # --- Moderation ---
+    "ban": "Permanently ban a member; they cannot rejoin until unbanned.",
+    "unban": "Lift a ban using the user's numeric ID (they are no longer in the member list).",
+    "kick": "Remove a member from the server; they can rejoin with a new invite.",
+    "timeout": "Mute a member for a number of minutes; they cannot talk, react or join voice.",
+    "untimeout": "End a member's timeout immediately.",
+    "warn": "Log a warning against a member and DM them the reason.",
+    "warnings": "List every warning recorded against a member, newest first.",
+    "clearwarns": "Erase all stored warnings for a member.",
+    "tempban": "Ban a member and unban them automatically once the duration expires.",
+    "massban": "Ban everyone matching a filter (account age, join time, name pattern, no avatar). "
+    "Shows a preview and requires confirmation before anything happens.",
+    "quarantine": "Strip a member's roles and isolate them behind a locked-down role. "
+    "Fully reversible - the original roles are stored.",
+    "unquarantine": "Release a quarantined member and restore the roles they had.",
+    "purge": "Bulk-delete recent messages in this channel.",
+    "purge user": "Delete only the messages a specific member sent recently.",
+    "purge contains": "Delete recent messages containing a given piece of text.",
+    "purge bots": "Delete recent messages posted by bots.",
+    "purge links": "Delete recent messages containing links or server invites.",
+    "lock": "Stop @everyone from sending messages in a channel.",
+    "unlock": "Reverse a lock and let @everyone post again.",
+    "slowmode": "Set the seconds each member must wait between messages; 0 disables it.",
+    "nickname": "Change a member's nickname, or reset it by leaving the name empty.",
+    "case": "Show a member's full moderation history from the numbered case book.",
+    "snipe": "Show the most recently deleted message in this channel.",
+    "raid": "Raid detection: auto-arms on a join spike and screens new accounts.",
+    "raid on": "Engage raid mode by hand for a set number of minutes.",
+    "raid off": "Disengage raid mode and clear the join counter.",
+    "raid config": "Set the join threshold, detection window, minimum account age, "
+    "response action and quarantine role.",
+    # --- Roles ---
+    "role": "Add or remove a single role from one member.",
+    "roleall": "Give one role to every member in the server; paced to respect rate limits.",
+    "joinrole": "Choose roles applied automatically to everyone who joins.",
+    "reactionrole": "Bind an emoji on a message to a role members can self-assign.",
+    "reactionrole list": "Show every reaction role configured in this server.",
+    "reactionrole remove": "Unbind one emoji, or every emoji, from a message.",
+    "inrole": "List every member who currently holds a role, with join dates.",
+    # --- Utility ---
+    "afk": "Mark yourself away; the bot collects your pings and reports them when you return.",
+    "echo": "Make the bot post a message, optionally in a different channel.",
+    "poll": "Start a reaction poll with up to ten options.",
+    "reaction": "Make the bot add an emoji reaction to a linked message.",
+    "remindme": "Schedule a personal reminder delivered by DM; survives a bot restart.",
+    "remindme list": "Show your pending reminders and when each one fires.",
+    "remindme cancel": "Cancel one pending reminder by its short id.",
+    "steal": "Copy one or more custom emojis from another server into this one.",
+    "tag": "Call up a saved text snippet by name.",
+    "tag add": "Create or overwrite a saved snippet.",
+    "tag remove": "Delete a saved snippet.",
+    "tag list": "List every saved snippet in this server.",
+    # --- Info ---
+    "ping": "Show the bot's gateway latency and confirm it is responding.",
+    "uptime": "How long the bot has been running since its last restart.",
+    "userinfo": "Account age, join date, roles and key permissions for a member.",
+    "serverinfo": "Member counts, channels, roles, boost level and creation date.",
+    "avatar": "Show a user's avatar at full size.",
+    "banner": "Show a user's profile banner, if they have one.",
+    "roleinfo": "Colour, position, member count and permissions for a role.",
+    "membercount": "Current member total for this server.",
+    "emojis": "List every custom emoji in this server.",
+    "permcheck": "Resolve a member's effective permissions in a channel, including which "
+    "role or overwrite is responsible.",
+    "help": "This help. Pass a command name for its full usage and options.",
+    "commands": "Browse every command grouped by category.",
+    # --- Configuration ---
+    "set": "Core server configuration.",
+    "set prefix": "Change the chat command prefix for this server (default `!`).",
+    "set modlog": "Send a log of every moderation action to a channel; empty turns it off.",
+    "set welcome": "Message posted when someone joins; empty channel turns it off.",
+    "set goodbye": "Message posted when someone leaves; empty channel turns it off.",
+    "echoset": "Allow or block the /echo command server-wide.",
+    "autoreact": "Emojis the bot automatically adds to every new message.",
+    "autorespond": "Automatic replies triggered by keywords in chat.",
+    "autopurge": "Auto-delete every new message in chosen channels.",
+    "autopurge on": "Start auto-deleting in a channel, optionally for a limited time.",
+    "autopurge off": "Stop auto-deleting in a channel.",
+    "autopurge exempt": "Add or remove a role whose messages are never auto-deleted.",
+    "autopurge status": "Show where auto-purge is active and which roles are exempt.",
+    "automod": "Automatic filtering of invites, links, spam, caps and mass mentions.",
+    "automod set": "Turn one automod rule on or off.",
+    "automod limits": "Tune the spam message count and mass-mention thresholds.",
+    "automod exempt": "Roles automod should never act on.",
+    "sticky": "Keep a message pinned to the bottom of a channel as people talk.",
+    "sticky off": "Stop the sticky message in a channel.",
+    "sticky list": "Show every channel with a sticky message.",
+    "starboard": "Repost messages to a highlights channel once they hit a star threshold.",
+    "starboard set": "Choose the starboard channel, emoji and star threshold.",
+    "starboard off": "Turn the starboard off.",
+    "remind": "A recurring announcement posted to a channel on a fixed interval.",
+    "remind set": "Create or update the recurring reminder.",
+    "remind off": "Stop the recurring reminder.",
+    "export": "Download this server's bot settings as a JSON backup.",
+    "import": "Restore settings from an /export backup; merges by default.",
+    "errors": "Recent runtime errors, deduplicated and newest first.",
+    "errors detail": "Full traceback and context for one error id.",
+    "errors stats": "Error totals grouped by exception type.",
+    "errors clear": "Empty the in-memory error buffer (bot superuser only).",
+    "diagnose": "Health check: gateway latency, database reachability, background loops, "
+    "cache hit rate and the bot's missing permissions.",
+    # --- AI ---
+    "ai": "Configure the AI assistant for this server.",
+    "ai setup": "Enable or disable the AI in a channel and set its reply chance.",
+    "ai status": "Show the complete AI configuration for this server.",
+    "ai persona": "Set the server-wide personality the AI writes with.",
+    "ai persona_show": "Show the current persona in full.",
+    "ai persona_clear": "Reset the persona to the default.",
+    "ai preset": "Apply a ready-made persona preset.",
+    "ai channel_persona": "Add an extra instruction that applies in one channel only.",
+    "ai user_persona": "Set how the AI treats one specific member.",
+    "ai remove_user_persona": "Remove a member's custom AI behaviour.",
+    "ai user_persona_list": "List every per-user AI instruction.",
+    "ai probability": "Base percentage chance the AI replies without being addressed.",
+    "ai cooldown": "Minimum seconds between AI replies in the same channel.",
+    "ai tuning": "Reply length (max tokens) and creativity (temperature).",
+    "ai limit": "Cap how many AI replies this server may use per day; 0 means unlimited.",
+    "ai models": "List the models available from each provider.",
+    "ai model": "Choose which model a provider should use.",
+    "ai providers": "Provider health, API key state and fallback order.",
+    "ai order": "Set the order providers are tried in when one fails.",
+    "ai ignore": "Exclude specific users or roles from the AI entirely.",
+    "ai reset": "Wipe the AI's memory of a channel's conversation.",
+    "ai stats": "AI usage counters since the last restart.",
+    "ask": "Ask the AI a one-off question with no conversation memory.",
+    "aiopt": "Opt yourself out of, or back into, the AI reading and replying to you.",
+}
+
+
+def _visible_commands() -> List[commands.Command]:
+    """Every registered command and subcommand, deduplicated and sorted."""
+    seen: Dict[str, commands.Command] = {}
+    for command in bot.walk_commands():
+        if command.hidden:
+            continue
+        seen[command.qualified_name] = command
+    return sorted(seen.values(), key=lambda c: c.qualified_name)
+
+
+def _category_for(command: commands.Command) -> str:
+    root: str = command.qualified_name.split(" ")[0]
+    if root in REACTIONS:
+        return "fun"
+    return COMMAND_CATEGORY.get(root, "uncategorised")
+
+
+def _uncategorised_roots() -> List[str]:
+    """Root commands with no category. Empty is the healthy state."""
+    return sorted(
+        {
+            command.qualified_name
+            for command in _visible_commands()
+            if command.parent is None and _category_for(command) == "uncategorised"
+        }
+    )
+
+
+def _summary_for(command: commands.Command) -> str:
+    return (
+        COMMAND_SUMMARY.get(command.qualified_name)
+        or command.description
+        or command.short_doc
+        or "No description."
+    )
+
+
+def _usage_for(command: commands.Command) -> str:
+    parts: List[str] = [f"/{command.qualified_name}"]
+    for name, parameter in command.clean_params.items():
+        parts.append(f"<{name}>" if parameter.required else f"[{name}]")
+    return " ".join(parts)
+
+
+def _permission_note(command: commands.Command) -> str:
+    """Read the real default_permissions off the command or its parent group."""
+    node: Optional[commands.Command] = command
+    while node is not None:
+        app_command = getattr(node, "app_command", None)
+        perms = getattr(app_command, "default_permissions", None)
+        if perms is not None and perms.value:
+            names: List[str] = [
+                name.replace("_", " ").title() for name, value in perms if value
+            ]
+            return "Requires " + ", ".join(f"**{name}**" for name in names)
+        node = node.parent
+    return "Anyone can use this"
+
+
+def _parameter_lines(command: commands.Command) -> List[str]:
+    described: Dict[str, str] = {}
+    choices: Dict[str, List[str]] = {}
+    app_command = getattr(command, "app_command", None)
+    for parameter in getattr(app_command, "parameters", None) or []:
+        described[parameter.name] = parameter.description or ""
+        if parameter.choices:
+            choices[parameter.name] = [str(choice.value) for choice in parameter.choices]
+
+    lines: List[str] = []
+    for name, parameter in command.clean_params.items():
+        flag: str = "required" if parameter.required else "optional"
+        text: str = described.get(name, "")
+        detail: str = f"`{name}` ({flag})"
+        if text:
+            detail += f" - {text}"
+        options: List[str] = choices.get(name, [])
+        if options:
+            detail += "\n\u2003choices: " + ", ".join(f"`{o}`" for o in options[:12])
+        default = getattr(parameter, "displayed_default", None)
+        if not parameter.required and default not in (None, "", "None"):
+            detail += f"\n\u2003default: `{default}`"
+        lines.append(detail)
+    return lines
+
+
+async def _command_name_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> List[app_commands.Choice[str]]:
+    needle: str = (current or "").casefold().lstrip("/")
+    matches: List[str] = [
+        command.qualified_name
+        for command in _visible_commands()
+        if needle in command.qualified_name.casefold()
+    ]
+    matches.sort(key=lambda n: (not n.casefold().startswith(needle), len(n), n))
+    return [app_commands.Choice(name=f"/{name}", value=name) for name in matches[:25]]
+
+
+@bot.hybrid_command(
+    name="help",
+    description="Show help, or full usage for one command",
+)
+@app_commands.describe(command="A command name, e.g. ban, purge user, ai persona")
+@app_commands.autocomplete(command=_command_name_autocomplete)
+async def help_cmd(ctx: commands.Context, *, command: Optional[str] = None) -> None:
+    prefix: str = ctx.clean_prefix or COMMAND_PREFIX
+
+    if command:
+        query: str = command.strip().lstrip("/").strip()
+        target: Optional[commands.Command] = bot.get_command(query)
+        if target is None:
+            suggestions: List[str] = [
+                c.qualified_name
+                for c in _visible_commands()
+                if query.casefold() in c.qualified_name.casefold()
+            ][:6]
+            hint: str = (
+                "\nDid you mean: " + ", ".join(f"`/{s}`" for s in suggestions)
+                if suggestions
+                else f"\nRun `{prefix}commands all` to see everything."
+            )
+            return await ctx.send(f"\u274c No command called `{query}`.{hint}", ephemeral=True)
+
+        category: str = _category_for(target)
+        embed: discord.Embed = discord.Embed(
+            title=f"/{target.qualified_name}",
+            description=_summary_for(target),
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="Usage",
+            value=f"`{_usage_for(target)}`\n`{prefix}{target.qualified_name} ...`",
+            inline=False,
+        )
+
+        parameters: List[str] = _parameter_lines(target)
+        if parameters:
+            embed.add_field(name="Options", value="\n".join(parameters)[:1024], inline=False)
+
+        if isinstance(target, commands.Group) and target.commands:
+            children: List[str] = sorted(
+                f"`/{child.qualified_name}` - {_summary_for(child)}"
+                for child in target.commands
+                if not child.hidden
+            )
+            embed.add_field(
+                name=f"Subcommands ({len(children)})",
+                value="\n".join(children)[:1024],
+                inline=False,
+            )
+
+        if target.aliases:
+            embed.add_field(
+                name="Aliases",
+                value=", ".join(f"`{alias}`" for alias in target.aliases),
+                inline=True,
+            )
+        embed.add_field(name="Permissions", value=_permission_note(target), inline=True)
+        embed.add_field(
+            name="Category",
+            value=CATEGORY_LABELS.get(category, "\U0001f9ea Uncategorised"),
+            inline=True,
+        )
+        embed.set_footer(text=f"Works as a slash command and as {prefix}{target.qualified_name}")
+        return await ctx.send(embed=embed, ephemeral=True)
+
+    counts: Dict[str, int] = {}
+    for entry in _visible_commands():
+        key: str = _category_for(entry)
+        counts[key] = counts.get(key, 0) + 1
+
+    overview: List[str] = [
+        f"{CATEGORY_LABELS[key]} - **{counts.get(key, 0)}** commands"
+        for key in CATEGORY_LABELS
+        if counts.get(key)
+    ]
+    stray: int = counts.get("uncategorised", 0)
+    if stray:
+        overview.append(f"\U0001f9ea Uncategorised - **{stray}** commands")
+
     embed = discord.Embed(
         title="Help",
         description=(
-            "**🧠 AI** — `/ai setup` to switch it on, `/ai persona` for its personality, "
-            "`/ask` for a one-off question, `/aiopt out` to exclude yourself.\n"
-            "**🤖 Auto-react / auto-respond** — react or reply when a trigger word is seen (admin only).\n"
-            "**🛡️ Automod & logs** — `/automod`, `/set modlog`, `/case`, `/tempban`.\n"
-            "**🎉 Fun & roleplay** — anime-gif actions like `/bite`, `/hug`, `/slap` — "
-            "these also work as chat commands with the prefix (default `!`, change with `/set prefix`).\n"
-            "**🛡️ Moderation** — ban, kick, timeout, warn, purge, lock, slowmode, etc.\n"
-            "**🛠️ Utility** — `/role`, `/roleall`, `/joinrole`, `/reactionrole`, `/reaction`, `/snipe`.\n"
-            "**ℹ️ Info** — `/userinfo`, `/serverinfo`, `/avatar`, `/ping`, `/roleinfo`.\n\n"
-            "Use `/commands` for a category list or `/commands all` for every command."
+            "\n".join(overview)
+            + f"\n\nEvery command works two ways: as a slash command (`/ban`) "
+            f"and as a chat command (`{prefix}ban`).\n"
+            f"\u2022 `{prefix}help <command>` - full usage, options and permissions\n"
+            f"\u2022 `{prefix}commands <category>` - browse one category\n"
+            f"\u2022 `{prefix}commands all` - every command at once"
         ),
         color=discord.Color.blurple(),
     )
+    embed.add_field(
+        name="Getting started",
+        value=(
+            f"`{prefix}help ban` - how one command works\n"
+            f"`{prefix}set prefix` - change the chat prefix\n"
+            f"`{prefix}set modlog` - log moderation to a channel\n"
+            f"`{prefix}diagnose` - check the bot is healthy"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"{sum(counts.values())} commands available")
     await ctx.send(embed=embed, ephemeral=True)
 
-CONFIG_CMDS = [
-    "/set prefix <prefix>",
-    "/set modlog [channel]",
-    "/set welcome [channel] [message]",
-    "/set goodbye [channel] [message]",
-    "/echoset <on/off>",
-    "/autoreact <on/off> [emojis]",
-    "/autorespond <add/remove/list> ...",
-    "/autopurge <on/off/exempt/status>",
-    "/automod set <rule> <on/off>",
-    "/automod limits [spam] [mentions]",
-    "/automod exempt <add/remove> <role>",
-    "/joinrole <role>",
-    "/reactionrole <set/list/remove>",
-    "/sticky <set/off/list>",
-    "/starboard <set/off/status>",
-    "/remind <set/off/status>",
-    "/tag <add/remove/list>",
-    "/export",
-    "/errors",
-]
-AI_CMDS = [
-    "/ai info", "/ai status", "/ai setup <enable/disable> [channel] [probability]",
-    "/ai persona <instruction>", "/ai persona_show", "/ai persona_clear",
-    "/ai preset <name>", "/ai channel_persona [channel] [instruction]",
-    "/ai user_persona <user> <instruction>", "/ai remove_user_persona <user>",
-    "/ai user_persona_list", "/ai probability <0-100>", "/ai cooldown <seconds>",
-    "/ai tuning [max_tokens] [temperature]", "/ai limit <replies>",
-    "/ai models [provider]", "/ai model <provider> <model>", "/ai providers",
-    "/ai order <first> [second] [third]", "/ai ignore <add/remove/list> [target]",
-    "/ai reset [channel]", "/ai stats",
-    "/ask <prompt>  (anyone)", "/aiopt <out/in/status>  (anyone)",
-]
-MOD_CMDS = [
-    "/ban <user> [reason]", "/unban <user_id>", "/kick <user> [reason]",
-    "/timeout <user> <minutes> [reason]", "/untimeout <user>",
-    "/warn <user> [reason]", "/warnings <user>", "/clearwarns <user>",
-    "/purge any <amount>", "/purge user <user> [amount]",
-    "/purge contains <text> [amount]", "/purge bots [amount]", "/purge links [amount]",
-    "/lock [channel]", "/unlock [channel]",
-    "/slowmode <seconds> [channel]", "/nickname <user> [name]",
-    "/role <add/remove> <user> <role>", "/roleall <role>", "/snipe",
-    "/tempban <user> <duration> [reason]", "/case <user> [limit]",
-]
-INFO_CMDS = [
-    "/ping", "/uptime", "/userinfo [user]", "/serverinfo",
-    "/avatar [user]", "/banner [user]", "/roleinfo <role>", "/membercount",
-    "/emojis", "/steal <emoji> [name]", "/afk [reason]", "/echo <message>",
-    "/poll <question> [options]", "/tag <name>",
-]
 
-@bot.hybrid_command(name="commands", description="List commands (pick a category, or 'all')")
+@bot.hybrid_command(name="commands", description="Browse every command by category")
 @app_commands.describe(category="Which category to show (default: overview)")
 async def commands_cmd(
     ctx: commands.Context,
-    category: Optional[Literal["all", "fun", "moderation", "info", "config", "ai"]] = None,
-):
-    show: str = category or "overview"
+    category: Optional[
+        Literal["all", "moderation", "roles", "utility", "info", "config", "ai", "fun"]
+    ] = None,
+) -> None:
+    prefix: str = ctx.clean_prefix or COMMAND_PREFIX
+    everything: List[commands.Command] = _visible_commands()
 
-    if show == "overview":
-        embed = discord.Embed(
+    if category is None:
+        counts: Dict[str, int] = {}
+        for entry in everything:
+            key: str = _category_for(entry)
+            counts[key] = counts.get(key, 0) + 1
+        lines: List[str] = [
+            f"`{prefix}commands {key}` - {CATEGORY_LABELS[key]} ({counts.get(key, 0)})"
+            for key in CATEGORY_LABELS
+            if counts.get(key)
+        ]
+        embed: discord.Embed = discord.Embed(
             title="Commands",
-            description=(
-                "Categories: **fun**, **moderation**, **info**, **config**, **ai**\n"
-                "`/commands fun` · `/commands moderation` · `/commands info` · "
-                "`/commands config` · `/commands ai` · `/commands all`"
-            ),
+            description="\n".join(lines)
+            + f"\n\n`{prefix}commands all` - every command\n"
+            f"`{prefix}help <command>` - usage for one command",
             color=discord.Color.blurple(),
         )
+        embed.set_footer(text=f"{len(everything)} commands available")
         return await ctx.send(embed=embed, ephemeral=True)
 
-    sections: List[Tuple[str, List[str]]] = []
-    if show in ("all", "fun"):
-        sections.append(("🎉 Fun & roleplay", ["/" + n for n in REACTIONS.keys()]))
-    if show in ("all", "moderation"):
-        sections.append(("🛡️ Moderation", MOD_CMDS))
-    if show in ("all", "info"):
-        sections.append(("ℹ️ Info & utility", INFO_CMDS))
-    if show in ("all", "config"):
-        sections.append(("⚙️ Config (admin)", CONFIG_CMDS))
-    if show in ("all", "ai"):
-        sections.append(("🧠 AI", AI_CMDS))
+    wanted: List[str] = (
+        list(CATEGORY_LABELS.keys()) if category == "all" else [str(category)]
+    )
+    if category == "all":
+        stray: List[str] = _uncategorised_roots()
+        if stray:
+            wanted.append("uncategorised")
 
-    lines: List[str] = []
-    for heading, entries in sections:
-        lines.append(f"__**{heading}**__")
-        lines.extend(f"`{entry}`" for entry in entries)
-        lines.append("\u200b")
-    while lines and lines[-1] == "\u200b":
-        lines.pop()
+    rendered: List[str] = []
+    for key in wanted:
+        members: List[commands.Command] = [
+            entry
+            for entry in everything
+            if _category_for(entry) == key and entry.parent is None
+        ]
+        if not members:
+            continue
 
-    pages = build_pages("Commands", lines, discord.Color.blurple(), per_page=16)
+        label: str = CATEGORY_LABELS.get(key, "\U0001f9ea Uncategorised")
+        rendered.append(f"__**{label}**__")
+
+        if key == "fun":
+            rendered.append(
+                "Anime reaction GIFs, each takes an optional member: "
+                + ", ".join(f"`/{name}`" for name in sorted(REACTIONS.keys()))
+            )
+            rendered.append("\u200b")
+            continue
+
+        for entry in sorted(members, key=lambda c: c.qualified_name):
+            rendered.append(f"`{_usage_for(entry)}`\n\u2003{_summary_for(entry)}")
+            if isinstance(entry, commands.Group):
+                for child in sorted(entry.commands, key=lambda c: c.qualified_name):
+                    if child.hidden:
+                        continue
+                    rendered.append(
+                        f"\u2003\u21b3 `{_usage_for(child)}`\n\u2003\u2003{_summary_for(child)}"
+                    )
+        rendered.append("\u200b")
+
+    while rendered and rendered[-1] == "\u200b":
+        rendered.pop()
+
+    if not rendered:
+        return await ctx.send("\u274c Nothing in that category.", ephemeral=True)
+
+    title: str = "All commands" if category == "all" else CATEGORY_LABELS.get(
+        str(category), "Commands"
+    )
+    pages = build_pages(
+        title,
+        rendered,
+        discord.Color.blurple(),
+        per_page=10,
+        footer=f"{prefix}help <command> for full usage and options",
+    )
     await send_pages(ctx, pages, ephemeral=True)
 
 
@@ -2319,7 +2745,10 @@ async def autopurge_status(ctx: commands.Context):
     await ctx.send(embed=embed, ephemeral=True)
 
 # ================= /set =================
-@bot.hybrid_group(name="set", description="Bot settings")
+@bot.hybrid_group(
+    name="set",
+    description="Server configuration: prefix, mod log, welcome and goodbye",
+)
 @commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 async def set_group(ctx: commands.Context):
@@ -2702,7 +3131,10 @@ async def _handle_afk_mentions(message: discord.Message) -> None:
             "\n".join(notices[:5]), allowed_mentions=discord.AllowedMentions.none()
         )
 
-@bot.hybrid_command(name="autorespond", description="Manage autoresponses.")
+@bot.hybrid_command(
+    name="autorespond",
+    description="Add, remove or list automatic replies to trigger words",
+)
 @app_commands.default_permissions(manage_guild=True)
 async def autorespond_cmd(
     ctx: commands.Context,
@@ -2744,7 +3176,10 @@ async def autorespond_cmd(
     )
 
 
-@bot.hybrid_command(name="autoreact", description="Manage autoreactions.")
+@bot.hybrid_command(
+    name="autoreact",
+    description="Add, remove or list emojis the bot auto-reacts with",
+)
 @app_commands.default_permissions(manage_guild=True)
 async def autoreact_cmd(
     ctx: commands.Context, state: Literal["on", "off"], *, emojis: Optional[str] = None
