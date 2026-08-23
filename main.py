@@ -3279,6 +3279,10 @@ _AUTOREACT_UNICODE_EMOJI_RE: re.Pattern = re.compile(
     "(?:\u200d[\U0001f000-\U0001faff\u2600-\u27bf\u2b00-\u2bff\u2300-\u23ff]"
     "[\ufe00-\ufe0f\U0001f3fb-\U0001f3ff]*)*)"
 )
+_AUTOREACT_ANY_EMOJI_RE: re.Pattern = re.compile(
+    "(?:" + _AUTOREACT_CUSTOM_EMOJI_RE.pattern + ")"
+    "|(?:" + _AUTOREACT_UNICODE_EMOJI_RE.pattern + ")"
+)
 _AUTOREACT_PATTERN_CACHE: Dict[Tuple[str, str], re.Pattern] = {}
 
 
@@ -3306,27 +3310,18 @@ def _autoreact_pattern(trigger: str, mode: str) -> re.Pattern:
 
 
 def _parse_emoji_tokens(raw: str) -> List[str]:
-    """Pull custom and unicode emojis out of free text, order preserved.
+    """Pull custom and unicode emojis out of free text, left to right.
 
-    Accepts them run together (\U0001f600\U0001f603) or space separated.
+    One scan over a combined pattern, so the returned order is exactly the
+    order they appear in the input - mixing custom and unicode does not
+    reshuffle them. Accepts them run together or space separated.
     """
     tokens: List[str] = []
-    text: str = raw or ""
-
-    for match in _AUTOREACT_CUSTOM_EMOJI_RE.finditer(text):
-        tokens.append(match.group(0))
-    text = _AUTOREACT_CUSTOM_EMOJI_RE.sub(" ", text)
-
-    for cluster in _AUTOREACT_UNICODE_EMOJI_RE.findall(text):
-        cleaned: str = str(cluster).strip()
-        if cleaned:
-            tokens.append(cleaned)
-
-    unique: List[str] = []
-    for token in tokens:
-        if token not in unique:
-            unique.append(token)
-    return unique
+    for match in _AUTOREACT_ANY_EMOJI_RE.finditer(raw or ""):
+        token: str = match.group(0).strip()
+        if token and token not in tokens:
+            tokens.append(token)
+    return tokens
 
 
 def _emoji_is_usable(token: str) -> bool:
