@@ -324,6 +324,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "ignored_roles": [],
         "max_tokens": 300,
         "temperature": 0.9,
+        "word_limit": 120,
         "daily_limit": 0,
         "models": {},
         "provider_order": ["openrouter", "gemini", "groq"],
@@ -2276,6 +2277,8 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "ai probability": "Base percentage chance the AI replies without being addressed.",
     "ai cooldown": "Minimum seconds between AI replies in the same channel.",
     "ai tuning": "Reply length (max tokens) and creativity (temperature).",
+    "ai wordlimit": "Discard AI replies longer than a set number of words, so "
+    "hallucinated essays and leaked instructions never reach chat.",
     "ai limit": "Cap how many AI replies this server may use per day; 0 means unlimited.",
     "ai models": "List the models available from each provider.",
     "ai model": "Choose which model a provider should use.",
@@ -3756,6 +3759,7 @@ def _ai_abuse_reason(message: discord.Message, *, addressed: bool) -> Optional[s
     return None
 AI_REPLY_HARD_LIMIT: int = 1900
 AI_REPLY_WORD_LIMIT: int = 120
+AI_WORD_LIMIT_MAX: int = 400
 AI_LEAK_SHINGLE: int = 6
 AI_LEAK_OVERLAP_RATIO: float = 0.18
 AI_LEAK_LONGEST_RUN: int = 12
@@ -3928,6 +3932,48 @@ _LEAK_MARKERS: Tuple[str, ...] = (
 )
 
 
+_THOUGHT_MARKERS: Tuple[str, ...] = (
+    "<think>",
+    "</think>",
+    "<thinking>",
+    "let's think step by step",
+    "as an ai language model",
+    "as an ai assistant",
+    "the user is asking",
+    "the user wants me",
+    "my response should",
+    "i should respond with",
+    "final answer:",
+    "based on my instructions",
+    "according to my instructions",
+    "according to my persona",
+    "per my persona",
+    "i must not reveal",
+    "okay, so the user",
+)
+
+_THINK_BLOCK_RE: re.Pattern = re.compile(
+    r"<(think|thinking|reasoning|scratchpad)>.*?</\1>", re.IGNORECASE | re.DOTALL
+)
+
+
+def _strip_thought_blocks(text: str) -> str:
+    """Remove fenced reasoning blocks some models emit before their answer."""
+    cleaned: str = _THINK_BLOCK_RE.sub(" ", text or "")
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+
+def _ai_word_limit(config: Dict[str, Any]) -> int:
+    """Resolved per-guild word ceiling. 0 means unlimited."""
+    try:
+        limit: int = int(config.get("word_limit", AI_REPLY_WORD_LIMIT))
+    except (TypeError, ValueError):
+        return AI_REPLY_WORD_LIMIT
+    if limit <= 0:
+        return 0
+    return min(limit, AI_WORD_LIMIT_MAX)
+
+
 def _leak_tokens(text: str) -> List[str]:
     """Lowercased word tokens, punctuation stripped, for overlap comparison."""
     return re.findall(r"[a-z0-9']+", (text or "").casefold())
@@ -3960,12 +4006,16 @@ def _longest_common_run(reply_tokens: List[str], prompt_tokens: List[str]) -> in
     return best
 
 
-def _ai_reply_leaks_prompt(reply: str, system_prompt: str) -> Optional[str]:
+def _ai_reply_leaks_prompt(
+    reply: str,
+    system_prompt: str,
+    word_limit: int = AI_REPLY_WORD_LIMIT,
+) -> Optional[str]:
     """Why this reply must not be sent, or None when it is clean.
 
-    Guards against the model regurgitating its own persona or rule block:
-    an explicit marker phrase, a long verbatim run, or heavy n-gram overlap
-    with the system prompt. Also caps runaway essay-length replies.
+    Four independent signals: a prompt marker phrase, a chain-of-thought
+    marker, a reply longer than the guild's word limit, and heavy verbatim
+    or n-gram overlap with the system prompt. Any hit means do not send.
     """
     text: str = (reply or "").strip()
     if not text:
@@ -3975,12 +4025,15 @@ def _ai_reply_leaks_prompt(reply: str, system_prompt: str) -> Optional[str]:
     for marker in _LEAK_MARKERS:
         if marker in lowered:
             return f"marker phrase ({marker!r})"
+    for marker in _THOUGHT_MARKERS:
+        if marker in lowered:
+            return f"reasoning leak ({marker!r})"
 
     reply_tokens: List[str] = _leak_tokens(text)
     word_count: int = len(reply_tokens)
 
-    if word_count > AI_REPLY_WORD_LIMIT:
-        return f"too long ({word_count} words)"
+    if word_limit > 0 and word_count > word_limit:
+        return f"over the word limit ({word_count} > {word_limit})"
 
     prompt_tokens: List[str] = _leak_tokens(system_prompt)
     if word_count >= AI_LEAK_SHINGLE and prompt_tokens:
@@ -3996,22 +4049,6 @@ def _ai_reply_leaks_prompt(reply: str, system_prompt: str) -> Optional[str]:
             if ratio >= AI_LEAK_OVERLAP_RATIO:
                 return f"{ratio * 100:.0f}% n-gram overlap with the prompt"
     return None
-
-
-def _trim_to_word_limit(text: str, limit: int = AI_REPLY_WORD_LIMIT) -> str:
-    """Cut a reply to whole sentences within the word budget."""
-    sentences: List[str] = re.split(r"(?<=[.!?])\s+", text.strip())
-    kept: List[str] = []
-    used: int = 0
-    for sentence in sentences:
-        words: int = len(_leak_tokens(sentence))
-        if kept and used + words > limit:
-            break
-        kept.append(sentence)
-        used += words
-    if not kept:
-        return " ".join(text.split()[:limit])
-    return " ".join(kept).strip()
 
 
 def chunk_text(text: str, limit: int = AI_REPLY_HARD_LIMIT) -> List[str]:
@@ -4560,10 +4597,10 @@ async def _handle_ai(message: discord.Message) -> None:
         if not reply:
             return
 
-        leak: Optional[str] = _ai_reply_leaks_prompt(reply, system_prompt)
-        if leak is not None and leak.startswith("too long"):
-            reply = _trim_to_word_limit(reply)
-            leak = _ai_reply_leaks_prompt(reply, system_prompt)
+        reply = _strip_thought_blocks(reply)
+        leak: Optional[str] = _ai_reply_leaks_prompt(
+            reply, system_prompt, _ai_word_limit(config)
+        )
         if leak is not None:
             log.warning(
                 "Suppressed AI reply in channel %s (%s, provider %s).",
@@ -4702,6 +4739,8 @@ async def ai_status(ctx: commands.Context):
         return
 
     config = ai_config(ctx.guild.id)
+    word_limit: int = _ai_word_limit(config)
+    word_limit_text: str = f"{word_limit} words" if word_limit else "off"
     embed = discord.Embed(
         title="🤖 AI configuration",
         color=discord.Color.blurple() if config["enabled"] else discord.Color.dark_grey(),
@@ -4711,7 +4750,8 @@ async def ai_status(ctx: commands.Context):
         value=(
             f"{'🟢 enabled' if config['enabled'] else '🔴 disabled'}\n"
             f"Chance **{config['probability']}%** · cooldown **{config['cooldown']:.0f}s**\n"
-            f"Max tokens **{config['max_tokens']}** · temperature **{config['temperature']}**"
+            f"Max tokens **{config['max_tokens']}** · temperature **{config['temperature']}**\n"
+            f"Reply word limit **{word_limit_text}**"
         ),
         inline=False,
     )
@@ -4905,6 +4945,50 @@ async def ai_cooldown(ctx: commands.Context, seconds: app_commands.Range[int, 0,
         return
     saved = await _ai_save(ctx.guild.id, cooldown=float(seconds))
     await ctx.send(f"{_saved_mark(saved)} Cooldown set to **{seconds}s**.{_saved_suffix(saved)}", ephemeral=True)
+
+
+@ai_group.command(
+    name="wordlimit",
+    description="Refuse AI replies longer than this many words",
+)
+@app_commands.describe(
+    words="Max words allowed in a reply. 0 turns the limit off (not recommended)."
+)
+async def ai_wordlimit(
+    ctx: commands.Context,
+    words: Optional[app_commands.Range[int, 0, AI_WORD_LIMIT_MAX]] = None,
+):
+    if not await _require_ai_admin(ctx):
+        return
+
+    config = ai_config(ctx.guild.id)
+    current: int = _ai_word_limit(config)
+
+    if words is None:
+        state: str = f"**{current} words**" if current else "**off**"
+        return await ctx.send(
+            f"U0001f4cf The AI reply word limit is {state}.\n"
+            f"Replies longer than this are discarded instead of sent, which stops "
+            f"hallucinated essays and leaked instructions from reaching chat.\n"
+            f"Change it with `{ctx.clean_prefix}ai wordlimit <words>`.",
+            ephemeral=True,
+        )
+
+    saved = await _ai_save(ctx.guild.id, word_limit=int(words))
+    if int(words) == 0:
+        body: str = (
+            "⚠️ Word limit **disabled**. Long hallucinated replies will no "
+            "longer be blocked by length — the instruction-leak checks still apply."
+        )
+    else:
+        body = (
+            f"U0001f4cf Word limit set to **{int(words)} words**. Anything longer is "
+            "discarded rather than sent."
+        )
+    log.info(
+        "AI word limit set to %s in guild %s by %s.", int(words), ctx.guild.id, ctx.author
+    )
+    await ctx.send(f"{_saved_mark(saved)} {body}{_saved_suffix(saved)}", ephemeral=True)
 
 
 @ai_group.command(name="tuning", description="Set reply length and creativity")
@@ -5184,6 +5268,22 @@ async def ask_cmd(ctx: commands.Context, *, prompt: str):
     reply, provider = await ai_generate_reply(ctx.guild.id, system_prompt, messages, config)
     if not reply:
         return await ctx.send("⚠️ Every AI provider failed. Try again shortly.", ephemeral=True)
+
+    reply = _strip_thought_blocks(reply)
+    limit: int = _ai_word_limit(config)
+    leak: Optional[str] = _ai_reply_leaks_prompt(reply, system_prompt, limit)
+    if leak is not None:
+        log.warning("Suppressed /ask reply in guild %s (%s).", ctx.guild.id, leak)
+        bot.log_error(f"ai:leak_suppressed ({leak})", reply[:200], guild=ctx.guild)
+        hint: str = (
+            f" It ran past the **{limit}-word** limit — raise it with "
+            f"`{ctx.clean_prefix}ai wordlimit` or ask something narrower."
+            if leak.startswith("over the word limit")
+            else " It looked like the bot's own instructions rather than an answer."
+        )
+        return await ctx.send(
+            f"⚠️ I blocked that answer before sending it.{hint}", ephemeral=True
+        )
 
     chunks = chunk_text(sanitize_mass_pings(reply))
     await ctx.send(
