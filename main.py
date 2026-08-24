@@ -363,6 +363,32 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "quarantine_role_id": None,
     },
     "quarantined": {},
+    "screening": {
+        "enabled": False,
+        "action": "log",
+        "threshold": 4,
+        "min_account_age_hours": 24,
+        "flag_default_avatar": True,
+        "flag_no_public_flags": False,
+        "created_near_ban_minutes": 60,
+        "evasion_days": 30,
+        "name_patterns": [],
+    },
+    "messagelog": {"enabled": False, "channel_id": None, "ignored_channels": []},
+    "modmail": {
+        "enabled": False,
+        "staff_roles": [],
+        "category_id": None,
+        "log_channel_id": None,
+        "ping_staff": True,
+        "transcripts": True,
+        "panel_title": "Contact staff",
+        "panel_message": "",
+        "welcome_title": "",
+        "welcome_message": "",
+        "blocked": [],
+        "tickets": {},
+    },
 }
 
 def is_superuser(user: discord.abc.User) -> bool:
@@ -701,6 +727,8 @@ class DebtCollectorBot(commands.Bot):
             await asyncio.to_thread(self.settings.ensure_indexes)
         except Exception as exc:
             log.warning("Index setup failed: %s", exc)
+        self.add_view(ModmailPanelView())
+        self.add_view(TicketCloseView())
         await self._sync_commands_if_changed()
         for loop_task in (
             reminder_loop,
@@ -2072,6 +2100,7 @@ COMMAND_CATEGORY: Dict[str, str] = {
     "poll": "utility",
     "reaction": "utility",
     "remindme": "utility",
+    "modmail": "utility",
     "steal": "utility",
     "tag": "utility",
     # Info
@@ -2101,6 +2130,8 @@ COMMAND_CATEGORY: Dict[str, str] = {
     "import": "config",
     "errors": "config",
     "diagnose": "config",
+    "screening": "config",
+    "messagelog": "config",
     # AI
     "ai": "ai",
     "ask": "ai",
@@ -2214,6 +2245,20 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "errors detail": "Full traceback and context for one error id.",
     "errors stats": "Error totals grouped by exception type.",
     "errors clear": "Empty the in-memory error buffer (bot superuser only).",
+    "screening": "Screen new joins for alt accounts and ban evasion, and act on the risky ones.",
+    "screening config": "Turn screening on or off and tune the threshold, action and signals.",
+    "screening pattern": "Add or remove a regex matched against joining members' names.",
+    "screening test": "Score an existing member as if they had just joined, without acting.",
+    "messagelog": "Log edited and deleted messages as embeds in a channel.",
+    "messagelog ignore": "Stop or resume logging one channel.",
+    "modmail": "Private staff tickets members open from a button panel.",
+    "modmail setup": "Set the staff role, ticket category, log channel and ping behaviour.",
+    "modmail panel": "Post the panel members press to open a ticket.",
+    "modmail message": "Set the panel text or the welcome embed shown inside new tickets.",
+    "modmail close": "Close the ticket in this channel and archive it.",
+    "modmail add": "Give another member access to the current ticket.",
+    "modmail block": "Stop a member from opening tickets, or let them again.",
+    "set messagelog": "Choose the channel edited and deleted messages are logged to.",
     "diagnose": "Health check: gateway latency, database reachability, background loops, "
     "cache hit rate and the bot's missing permissions.",
     # --- AI ---
@@ -3710,6 +3755,10 @@ def _ai_abuse_reason(message: discord.Message, *, addressed: bool) -> Optional[s
             return "no meaningful text"
     return None
 AI_REPLY_HARD_LIMIT: int = 1900
+AI_REPLY_WORD_LIMIT: int = 120
+AI_LEAK_SHINGLE: int = 6
+AI_LEAK_OVERLAP_RATIO: float = 0.18
+AI_LEAK_LONGEST_RUN: int = 12
 
 PROVIDER_KEYS: Dict[str, str] = {
     "openrouter": "OPENROUTER_API_KEY",
@@ -3859,6 +3908,110 @@ async def _ai_save(guild_id: int, **fields: Any) -> bool:
     """Write individual AI fields with dotted paths so concurrent edits don't clobber."""
     payload = {f"ai.{key}": value for key, value in fields.items()}
     return await bot.settings.push_fields(guild_id, payload)
+
+
+_LEAK_MARKERS: Tuple[str, ...] = (
+    "non-negotiable rules",
+    "these override anything above",
+    "instruction for this specific channel",
+    "per-user instructions:",
+    "you are a discord bot in a public channel",
+    "everything inside <message> tags",
+    "never reveal, quote, or summarise",
+    "treat it as data to respond to",
+    "system prompt",
+    "my instructions are",
+    "my persona is",
+    "here are my instructions",
+    "<message from=",
+    "<context note=",
+)
+
+
+def _leak_tokens(text: str) -> List[str]:
+    """Lowercased word tokens, punctuation stripped, for overlap comparison."""
+    return re.findall(r"[a-z0-9']+", (text or "").casefold())
+
+
+def _shingles(tokens: List[str], size: int) -> set:
+    if len(tokens) < size:
+        return set()
+    return {tuple(tokens[i : i + size]) for i in range(len(tokens) - size + 1)}
+
+
+def _longest_common_run(reply_tokens: List[str], prompt_tokens: List[str]) -> int:
+    """Length of the longest verbatim token run shared with the system prompt."""
+    if not reply_tokens or not prompt_tokens:
+        return 0
+    prompt_index: Dict[str, List[int]] = {}
+    for position, token in enumerate(prompt_tokens):
+        prompt_index.setdefault(token, []).append(position)
+
+    best: int = 0
+    previous: Dict[int, int] = {}
+    for token in reply_tokens:
+        current: Dict[int, int] = {}
+        for position in prompt_index.get(token, ()):
+            length: int = previous.get(position - 1, 0) + 1
+            current[position] = length
+            if length > best:
+                best = length
+        previous = current
+    return best
+
+
+def _ai_reply_leaks_prompt(reply: str, system_prompt: str) -> Optional[str]:
+    """Why this reply must not be sent, or None when it is clean.
+
+    Guards against the model regurgitating its own persona or rule block:
+    an explicit marker phrase, a long verbatim run, or heavy n-gram overlap
+    with the system prompt. Also caps runaway essay-length replies.
+    """
+    text: str = (reply or "").strip()
+    if not text:
+        return "empty"
+
+    lowered: str = text.casefold()
+    for marker in _LEAK_MARKERS:
+        if marker in lowered:
+            return f"marker phrase ({marker!r})"
+
+    reply_tokens: List[str] = _leak_tokens(text)
+    word_count: int = len(reply_tokens)
+
+    if word_count > AI_REPLY_WORD_LIMIT:
+        return f"too long ({word_count} words)"
+
+    prompt_tokens: List[str] = _leak_tokens(system_prompt)
+    if word_count >= AI_LEAK_SHINGLE and prompt_tokens:
+        run: int = _longest_common_run(reply_tokens, prompt_tokens)
+        if run >= AI_LEAK_LONGEST_RUN:
+            return f"verbatim run of {run} words from the prompt"
+
+        reply_shingles: set = _shingles(reply_tokens, AI_LEAK_SHINGLE)
+        if reply_shingles:
+            prompt_shingles: set = _shingles(prompt_tokens, AI_LEAK_SHINGLE)
+            shared: int = len(reply_shingles & prompt_shingles)
+            ratio: float = shared / len(reply_shingles)
+            if ratio >= AI_LEAK_OVERLAP_RATIO:
+                return f"{ratio * 100:.0f}% n-gram overlap with the prompt"
+    return None
+
+
+def _trim_to_word_limit(text: str, limit: int = AI_REPLY_WORD_LIMIT) -> str:
+    """Cut a reply to whole sentences within the word budget."""
+    sentences: List[str] = re.split(r"(?<=[.!?])\s+", text.strip())
+    kept: List[str] = []
+    used: int = 0
+    for sentence in sentences:
+        words: int = len(_leak_tokens(sentence))
+        if kept and used + words > limit:
+            break
+        kept.append(sentence)
+        used += words
+    if not kept:
+        return " ".join(text.split()[:limit])
+    return " ".join(kept).strip()
 
 
 def chunk_text(text: str, limit: int = AI_REPLY_HARD_LIMIT) -> List[str]:
@@ -4405,6 +4558,23 @@ async def _handle_ai(message: discord.Message) -> None:
             )
 
         if not reply:
+            return
+
+        leak: Optional[str] = _ai_reply_leaks_prompt(reply, system_prompt)
+        if leak is not None and leak.startswith("too long"):
+            reply = _trim_to_word_limit(reply)
+            leak = _ai_reply_leaks_prompt(reply, system_prompt)
+        if leak is not None:
+            log.warning(
+                "Suppressed AI reply in channel %s (%s, provider %s).",
+                channel_id,
+                leak,
+                provider,
+            )
+            bot.log_error(f"ai:leak_suppressed ({leak})", reply[:200], guild=trigger_message.guild)
+            bot.ai_next_fire[channel_id] = time.time() + float(
+                config.get("cooldown") or 60.0
+            )
             return
 
         safe = sanitize_mass_pings(reply)
@@ -5518,6 +5688,37 @@ async def set_modlog_cmd(ctx: commands.Context, channel: Optional[discord.TextCh
         ctx.guild.id, {"modlog.channel_id": str(channel.id) if channel else None}
     )
     text = f"✅ Moderation actions will be logged to {channel.mention}." if channel else "✅ Moderation logging turned off."
+    await ctx.send(text if saved else text + " (database write failed)", ephemeral=True)
+
+
+@set_group.command(
+    name="messagelog", description="Log edited and deleted messages to a channel"
+)
+@app_commands.describe(channel="Log channel (leave empty to turn logging off)")
+async def set_messagelog_cmd(
+    ctx: commands.Context, channel: Optional[discord.TextChannel] = None
+):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+    if channel is not None:
+        permissions = channel.permissions_for(ctx.guild.me)
+        if not (permissions.send_messages and permissions.embed_links):
+            return await ctx.send(
+                f"❌ I need **Send Messages** and **Embed Links** in {channel.mention}.",
+                ephemeral=True,
+            )
+    saved = await bot.settings.push_fields(
+        ctx.guild.id,
+        {
+            "messagelog.channel_id": str(channel.id) if channel else None,
+            "messagelog.enabled": channel is not None,
+        },
+    )
+    text = (
+        f"✅ Edits and deletions will be logged to {channel.mention}."
+        if channel
+        else "✅ Message logging turned off."
+    )
     await ctx.send(text if saved else text + " (database write failed)", ephemeral=True)
 
 
@@ -7359,6 +7560,1322 @@ async def unquarantine_cmd(ctx: commands.Context, user: discord.Member) -> None:
     )
     await ctx.send(
         f"\U0001f513 Released **{user}** and restored **{len(restore)}** role(s).",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Join screening - alt accounts and ban evasion
+# --------------------------------------------------------------------------- #
+
+SCREENING_ACTIONS: Tuple[str, ...] = ("log", "quarantine", "kick")
+SCREENING_WEIGHTS: Dict[str, int] = {
+    "new_account": 3,
+    "default_avatar": 1,
+    "name_pattern": 3,
+    "created_near_ban": 2,
+    "no_flags": 1,
+}
+EVASION_BAN_ACTIONS: Tuple[str, ...] = ("ban", "tempban", "massban", "raid:ban")
+
+
+def _screening_config(guild_id: int) -> Dict[str, Any]:
+    stored: Dict[str, Any] = bot.settings.peek_settings(guild_id).get("screening") or {}
+    config: Dict[str, Any] = copy.deepcopy(DEFAULT_SETTINGS["screening"])
+    for key, value in stored.items():
+        if key in config:
+            config[key] = value
+    if config["action"] not in SCREENING_ACTIONS:
+        config["action"] = "log"
+    return config
+
+
+def _normalize_name(raw: str) -> str:
+    """Fold a display name so lookalikes collapse together."""
+    lowered: str = (raw or "").casefold()
+    stripped: str = re.sub(r"[^a-z0-9]+", "", lowered)
+    return stripped
+
+
+async def _recent_ban_records(guild_id: int, days: int) -> List[Dict[str, Any]]:
+    """Ban entries from the case book within the window, newest first."""
+    since: datetime = datetime.now(timezone.utc) - timedelta(days=max(1, days))
+    try:
+        return await asyncio.to_thread(
+            lambda: list(
+                bot.settings.cases.find(
+                    {
+                        "guildid": str(guild_id),
+                        "action": {"$in": list(EVASION_BAN_ACTIONS)},
+                        "at": {"$gte": since},
+                    }
+                )
+                .sort("case_id", -1)
+                .limit(300)
+            )
+        )
+    except PyMongoError as exc:
+        bot.log_error("screening:cases", exc)
+        return []
+
+
+async def _screen_member(
+    member: discord.Member, config: Dict[str, Any]
+) -> Tuple[int, List[str], List[Dict[str, Any]]]:
+    """Score a joining account. Returns (score, reasons, evasion matches)."""
+    score: int = 0
+    reasons: List[str] = []
+    now: datetime = discord.utils.utcnow()
+
+    age_hours: float = (now - member.created_at).total_seconds() / 3600.0
+    min_age: float = float(config["min_account_age_hours"])
+    if min_age > 0 and age_hours < min_age:
+        score += SCREENING_WEIGHTS["new_account"]
+        reasons.append(f"account is {age_hours:.1f}h old (under {min_age:.0f}h)")
+
+    if config["flag_default_avatar"] and member.avatar is None:
+        score += SCREENING_WEIGHTS["default_avatar"]
+        reasons.append("using the default avatar")
+
+    patterns: List[str] = [str(p) for p in (config.get("name_patterns") or [])]
+    haystack: str = f"{member.name} {member.display_name}"
+    for raw_pattern in patterns:
+        try:
+            if re.search(raw_pattern, haystack, re.IGNORECASE):
+                score += SCREENING_WEIGHTS["name_pattern"]
+                reasons.append(f"name matches `{raw_pattern[:40]}`")
+                break
+        except re.error:
+            log.warning("Invalid screening name pattern in guild %s: %r", member.guild.id, raw_pattern)
+
+    if config["flag_no_public_flags"] and not member.public_flags.value:
+        score += SCREENING_WEIGHTS["no_flags"]
+        reasons.append("no account badges")
+
+    evasion: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = await _recent_ban_records(
+        member.guild.id, int(config["evasion_days"])
+    )
+    joiner_key: str = _normalize_name(member.name)
+    display_key: str = _normalize_name(member.display_name)
+    for record in records:
+        target_key: str = _normalize_name(str(record.get("target") or "").split("#")[0])
+        if not target_key or len(target_key) < 3:
+            continue
+        if target_key in (joiner_key, display_key):
+            evasion.append(record)
+            continue
+        banned_at: Any = record.get("at")
+        if isinstance(banned_at, datetime):
+            banned_utc: datetime = banned_at.replace(tzinfo=banned_at.tzinfo or timezone.utc)
+            gap: float = abs((member.created_at - banned_utc).total_seconds())
+            if gap < float(config["created_near_ban_minutes"]) * 60:
+                score += SCREENING_WEIGHTS["created_near_ban"]
+                reasons.append("account created around the time of a recent ban")
+                break
+
+    if evasion:
+        score += SCREENING_WEIGHTS["name_pattern"]
+        reasons.append(f"name matches {len(evasion)} recently banned account(s)")
+
+    return score, reasons, evasion
+
+
+async def _screening_act(
+    member: discord.Member, config: Dict[str, Any], score: int, reasons: List[str]
+) -> str:
+    """Apply the configured response. Returns the action actually taken."""
+    action: str = str(config["action"])
+    reason_text: str = f"Join screening score {score}: " + "; ".join(reasons)[:300]
+
+    if action == "log":
+        return "log"
+    try:
+        if action == "kick":
+            await member.kick(reason=reason_text)
+            return "kick"
+        role: Optional[discord.Role] = await _ensure_quarantine_role(member.guild)
+        if role is None:
+            log.warning(
+                "Screening wanted to quarantine in guild %s but no role was usable.",
+                member.guild.id,
+            )
+            return "log"
+        await member.add_roles(role, reason=reason_text)
+        return "quarantine"
+    except discord.Forbidden:
+        log.warning("Screening action '%s' forbidden in guild %s.", action, member.guild.id)
+        return "log"
+    except discord.HTTPException as exc:
+        bot.log_error("screening:action", exc, guild=member.guild, user=member)
+        return "log"
+
+
+@bot.listen("on_member_join")
+async def screening_watch(member: discord.Member) -> None:
+    if member.bot:
+        return
+    config: Dict[str, Any] = _screening_config(member.guild.id)
+    if not config.get("enabled"):
+        return
+    if is_superuser(member) or len(member.roles) > 1:
+        return
+
+    score, reasons, evasion = await _screen_member(member, config)
+    threshold: int = int(config["threshold"])
+    if score < threshold and not evasion:
+        return
+
+    taken: str = "log"
+    if score >= threshold:
+        taken = await _screening_act(member, config, score, reasons)
+
+    fields: List[Tuple[str, str]] = [
+        ("Member", f"{member.mention} (`{member}`)"),
+        ("Account created", f"<t:{int(member.created_at.timestamp())}:R>"),
+        ("Score", f"{score} (threshold {threshold})"),
+        ("Action", f"`{taken}`"),
+    ]
+    if evasion:
+        listed: str = ", ".join(
+            f"`{record.get('target')}`" for record in evasion[:4] if record.get("target")
+        )
+        fields.append(("Possible evasion of", listed[:1024] or "unknown"))
+
+    await send_modlog(
+        member.guild,
+        "\U0001f50e Join flagged by screening",
+        "\n".join(f"\u2022 {reason}" for reason in reasons)[:2000] or "No specific signals.",
+        discord.Color.orange() if taken == "log" else discord.Color.red(),
+        fields[:6],
+    )
+    if taken != "log":
+        await record_case(
+            member.guild,
+            f"screening:{taken}",
+            member.guild.me,
+            member,
+            "; ".join(reasons)[:400],
+        )
+    log.info(
+        "Screening flagged %s in guild %s (score %d, action %s).",
+        member.id,
+        member.guild.id,
+        score,
+        taken,
+    )
+
+
+@bot.hybrid_group(
+    name="screening",
+    description="Screen new joins for alt accounts and ban evasion",
+    fallback="status",
+)
+@app_commands.default_permissions(manage_guild=True)
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def screening_group(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    config: Dict[str, Any] = _screening_config(ctx.guild.id)
+    patterns: List[str] = [str(p) for p in (config.get("name_patterns") or [])]
+
+    embed: discord.Embed = discord.Embed(
+        title="\U0001f50e Join screening",
+        color=discord.Color.green() if config["enabled"] else discord.Color.greyple(),
+    )
+    embed.add_field(
+        name="State",
+        value="\U0001f7e2 active" if config["enabled"] else "\u26aa off",
+        inline=True,
+    )
+    embed.add_field(name="Action", value=f"`{config['action']}`", inline=True)
+    embed.add_field(
+        name="Threshold", value=f"score \u2265 **{config['threshold']}**", inline=True
+    )
+    embed.add_field(
+        name="Signals",
+        value=(
+            f"\u2022 younger than **{config['min_account_age_hours']}h** "
+            f"(+{SCREENING_WEIGHTS['new_account']})\n"
+            f"\u2022 default avatar: "
+            f"{'on' if config['flag_default_avatar'] else 'off'} "
+            f"(+{SCREENING_WEIGHTS['default_avatar']})\n"
+            f"\u2022 no account badges: "
+            f"{'on' if config['flag_no_public_flags'] else 'off'} "
+            f"(+{SCREENING_WEIGHTS['no_flags']})\n"
+            f"\u2022 created within **{config['created_near_ban_minutes']}m** of a ban "
+            f"(+{SCREENING_WEIGHTS['created_near_ban']})\n"
+            f"\u2022 name pattern match (+{SCREENING_WEIGHTS['name_pattern']})"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"Name patterns ({len(patterns)})",
+        value=", ".join(f"`{p[:30]}`" for p in patterns[:10]) or "*none*",
+        inline=False,
+    )
+    embed.set_footer(
+        text=f"Evasion lookback {config['evasion_days']}d \u00b7 "
+        f"{ctx.clean_prefix}screening test <user> to dry-run"
+    )
+    await ctx.send(embed=embed, ephemeral=True)
+
+
+@screening_group.command(name="config", description="Tune join screening")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(
+    enabled="Turn screening on or off",
+    action="What to do when the score crosses the threshold",
+    threshold="Score needed to act",
+    min_account_age_hours="Accounts younger than this score points",
+    default_avatar="Score accounts using the default avatar",
+    no_badges="Score accounts with no profile badges",
+    evasion_days="How far back to compare names against bans",
+)
+async def screening_config(
+    ctx: commands.Context,
+    enabled: Optional[bool] = None,
+    action: Optional[Literal["log", "quarantine", "kick"]] = None,
+    threshold: Optional[app_commands.Range[int, 1, 20]] = None,
+    min_account_age_hours: Optional[app_commands.Range[int, 0, 8760]] = None,
+    default_avatar: Optional[bool] = None,
+    no_badges: Optional[bool] = None,
+    evasion_days: Optional[app_commands.Range[int, 1, 365]] = None,
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+
+    fields: Dict[str, Any] = {}
+    if enabled is not None:
+        fields["screening.enabled"] = bool(enabled)
+    if action is not None:
+        fields["screening.action"] = str(action)
+    if threshold is not None:
+        fields["screening.threshold"] = int(threshold)
+    if min_account_age_hours is not None:
+        fields["screening.min_account_age_hours"] = int(min_account_age_hours)
+    if default_avatar is not None:
+        fields["screening.flag_default_avatar"] = bool(default_avatar)
+    if no_badges is not None:
+        fields["screening.flag_no_public_flags"] = bool(no_badges)
+    if evasion_days is not None:
+        fields["screening.evasion_days"] = int(evasion_days)
+
+    if not fields:
+        return await ctx.send("\u274c Give me at least one setting to change.", ephemeral=True)
+    saved: bool = await bot.settings.push_fields(ctx.guild.id, fields)
+    log.info("Screening config updated in guild %s by %s.", ctx.guild.id, ctx.author)
+    mark: str = "\u2705" if saved else "\u26a0\ufe0f"
+    tail: str = "." if saved else " in memory only - the database write failed."
+    await ctx.send(
+        f"{mark} Updated **{len(fields)}** screening setting(s){tail}", ephemeral=True
+    )
+
+
+@screening_group.command(
+    name="pattern", description="Add or remove a suspicious-name pattern"
+)
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(
+    action="Add or remove", pattern="A regular expression matched against names"
+)
+async def screening_pattern(
+    ctx: commands.Context, action: Literal["add", "remove"], *, pattern: str
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+
+    clean: str = pattern.strip()[:100]
+    if not clean:
+        return await ctx.send("\u274c Give me a pattern.", ephemeral=True)
+    try:
+        re.compile(clean)
+    except re.error as exc:
+        return await ctx.send(f"\u274c Invalid regex: `{exc}`.", ephemeral=True)
+
+    config: Dict[str, Any] = _screening_config(ctx.guild.id)
+    patterns: List[str] = [str(p) for p in (config.get("name_patterns") or [])]
+
+    if action == "add":
+        if clean in patterns:
+            return await ctx.send("\u2139\ufe0f That pattern is already listed.", ephemeral=True)
+        if len(patterns) >= 25:
+            return await ctx.send("\u274c Limit of 25 patterns reached.", ephemeral=True)
+        patterns.append(clean)
+        outcome: str = f"\u2705 Added pattern `{clean[:60]}`."
+    else:
+        if clean not in patterns:
+            return await ctx.send("\u274c That pattern isn't listed.", ephemeral=True)
+        patterns.remove(clean)
+        outcome = f"\U0001f5d1\ufe0f Removed pattern `{clean[:60]}`."
+
+    saved: bool = await bot.settings.push_fields(
+        ctx.guild.id, {"screening.name_patterns": patterns}
+    )
+    await ctx.send(
+        outcome + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+    )
+
+
+@screening_group.command(
+    name="test", description="Show how a member would score, without acting"
+)
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(user="Which member to score")
+async def screening_test(ctx: commands.Context, user: discord.Member) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await ctx.defer(ephemeral=True)
+
+    config: Dict[str, Any] = _screening_config(ctx.guild.id)
+    score, reasons, evasion = await _screen_member(user, config)
+    threshold: int = int(config["threshold"])
+    would_act: bool = score >= threshold
+
+    embed: discord.Embed = discord.Embed(
+        title=f"Screening dry-run \u00b7 {user}",
+        description="\n".join(f"\u2022 {reason}" for reason in reasons) or "No signals matched.",
+        color=discord.Color.red() if would_act else discord.Color.green(),
+    )
+    embed.add_field(name="Score", value=f"**{score}** / threshold {threshold}", inline=True)
+    embed.add_field(
+        name="Would act",
+        value=f"yes - `{config['action']}`" if would_act else "no",
+        inline=True,
+    )
+    embed.add_field(
+        name="Account created",
+        value=f"<t:{int(user.created_at.timestamp())}:R>",
+        inline=True,
+    )
+    if evasion:
+        embed.add_field(
+            name="Name matches recent bans",
+            value=", ".join(f"`{r.get('target')}`" for r in evasion[:5])[:1024],
+            inline=False,
+        )
+    embed.set_footer(text="Nothing was applied - this is a preview only")
+    await ctx.send(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------------- #
+# Message archive - edits and deletions logged as embeds
+# --------------------------------------------------------------------------- #
+
+
+def _messagelog_config(guild_id: int) -> Dict[str, Any]:
+    stored: Dict[str, Any] = bot.settings.peek_settings(guild_id).get("messagelog") or {}
+    config: Dict[str, Any] = copy.deepcopy(DEFAULT_SETTINGS["messagelog"])
+    for key, value in stored.items():
+        if key in config:
+            config[key] = value
+    return config
+
+
+def _messagelog_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    """The configured log channel, or None when logging is off or unusable."""
+    config: Dict[str, Any] = _messagelog_config(guild.id)
+    if not config.get("enabled") or not config.get("channel_id"):
+        return None
+    channel: Any = guild.get_channel(int(config["channel_id"]))
+    if not isinstance(channel, discord.TextChannel):
+        return None
+    permissions: discord.Permissions = channel.permissions_for(guild.me)
+    if not (permissions.send_messages and permissions.embed_links):
+        return None
+    return channel
+
+
+def _messagelog_skip(guild_id: int, channel_id: int) -> bool:
+    config: Dict[str, Any] = _messagelog_config(guild_id)
+    if str(channel_id) == str(config.get("channel_id")):
+        return True  # never log the log channel
+    return str(channel_id) in [str(c) for c in (config.get("ignored_channels") or [])]
+
+
+def _describe_attachments(items: List[Any]) -> str:
+    if not items:
+        return ""
+    names: List[str] = []
+    for item in items[:5]:
+        name: Any = item.get("filename") if isinstance(item, dict) else getattr(item, "filename", None)
+        if name:
+            names.append(str(name))
+    return ", ".join(names)
+
+
+async def _post_messagelog(guild: discord.Guild, embed: discord.Embed) -> None:
+    channel: Optional[discord.TextChannel] = _messagelog_channel(guild)
+    if channel is None:
+        return
+    try:
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except discord.DiscordException as exc:
+        bot.log_error("messagelog:send", exc, guild=guild)
+
+
+@bot.listen("on_raw_message_edit")
+async def messagelog_edit(payload: discord.RawMessageUpdateEvent) -> None:
+    if payload.guild_id is None:
+        return
+    guild: Optional[discord.Guild] = bot.get_guild(payload.guild_id)
+    if guild is None or _messagelog_skip(guild.id, payload.channel_id):
+        return
+
+    data: Dict[str, Any] = payload.data or {}
+    author: Dict[str, Any] = data.get("author") or {}
+    if author.get("bot"):
+        return
+
+    after: str = str(data.get("content") or "")
+    cached: Optional[discord.Message] = payload.cached_message
+    before: str = cached.content if cached is not None else ""
+    if cached is not None and cached.author.bot:
+        return
+    if before == after:
+        return  # embed hydration and pin changes also fire this event
+
+    author_name: str = (
+        str(cached.author) if cached is not None else str(author.get("username") or "unknown")
+    )
+    author_id: Any = cached.author.id if cached is not None else author.get("id")
+    jump: str = (
+        f"https://discord.com/channels/{guild.id}/{payload.channel_id}/{payload.message_id}"
+    )
+
+    embed: discord.Embed = discord.Embed(
+        title="\u270f\ufe0f Message edited",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    if cached is not None:
+        embed.set_author(name=author_name, icon_url=cached.author.display_avatar.url)
+    else:
+        embed.set_author(name=author_name)
+    embed.add_field(
+        name="Before",
+        value=(discord.utils.escape_markdown(before)[:1000] if before else "*not cached*"),
+        inline=False,
+    )
+    embed.add_field(
+        name="After",
+        value=(discord.utils.escape_markdown(after)[:1000] if after else "*empty*"),
+        inline=False,
+    )
+    embed.add_field(name="Channel", value=f"<#{payload.channel_id}>", inline=True)
+    embed.add_field(name="Jump", value=f"[go to message]({jump})", inline=True)
+    if author_id:
+        embed.set_footer(text=f"Author ID {author_id} \u00b7 Message ID {payload.message_id}")
+    await _post_messagelog(guild, embed)
+
+
+@bot.listen("on_raw_message_delete")
+async def messagelog_delete(payload: discord.RawMessageDeleteEvent) -> None:
+    if payload.guild_id is None:
+        return
+    guild: Optional[discord.Guild] = bot.get_guild(payload.guild_id)
+    if guild is None or _messagelog_skip(guild.id, payload.channel_id):
+        return
+
+    cached: Optional[discord.Message] = payload.cached_message
+    if cached is not None and cached.author.bot:
+        return
+
+    embed: discord.Embed = discord.Embed(
+        title="\U0001f5d1\ufe0f Message deleted",
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    if cached is not None:
+        embed.set_author(
+            name=str(cached.author), icon_url=cached.author.display_avatar.url
+        )
+        embed.description = (
+            discord.utils.escape_markdown(cached.content)[:2000]
+            if cached.content
+            else "*no text content*"
+        )
+        attachments: str = _describe_attachments(list(cached.attachments))
+        if attachments:
+            embed.add_field(name="Attachments", value=attachments[:1024], inline=False)
+        if cached.stickers:
+            embed.add_field(
+                name="Stickers",
+                value=", ".join(sticker.name for sticker in cached.stickers)[:1024],
+                inline=False,
+            )
+        embed.add_field(
+            name="Sent",
+            value=f"<t:{int(cached.created_at.timestamp())}:R>",
+            inline=True,
+        )
+        embed.set_footer(
+            text=f"Author ID {cached.author.id} \u00b7 Message ID {payload.message_id}"
+        )
+    else:
+        embed.description = "*Message was not cached, so its content is unavailable.*"
+        embed.set_footer(text=f"Message ID {payload.message_id}")
+
+    embed.add_field(name="Channel", value=f"<#{payload.channel_id}>", inline=True)
+    await _post_messagelog(guild, embed)
+
+
+@bot.listen("on_raw_bulk_message_delete")
+async def messagelog_bulk_delete(payload: discord.RawBulkMessageDeleteEvent) -> None:
+    if payload.guild_id is None:
+        return
+    guild: Optional[discord.Guild] = bot.get_guild(payload.guild_id)
+    if guild is None or _messagelog_skip(guild.id, payload.channel_id):
+        return
+
+    embed: discord.Embed = discord.Embed(
+        title="\U0001f9f9 Bulk delete",
+        description=(
+            f"**{len(payload.message_ids)}** messages were removed from "
+            f"<#{payload.channel_id}>."
+        ),
+        color=discord.Color.dark_red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    cached_count: int = len(payload.cached_messages)
+    if cached_count:
+        authors: Dict[str, int] = {}
+        for message in payload.cached_messages:
+            authors[str(message.author)] = authors.get(str(message.author), 0) + 1
+        top: List[str] = [
+            f"`{name}` \u00d7{count}"
+            for name, count in sorted(authors.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        ]
+        embed.add_field(name=f"Authors ({cached_count} cached)", value="\n".join(top)[:1024], inline=False)
+    await _post_messagelog(guild, embed)
+
+
+@bot.hybrid_group(
+    name="messagelog",
+    description="Log edited and deleted messages to a channel",
+    fallback="status",
+)
+@app_commands.default_permissions(manage_guild=True)
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def messagelog_group(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    config: Dict[str, Any] = _messagelog_config(ctx.guild.id)
+    ignored: List[str] = [str(c) for c in (config.get("ignored_channels") or [])]
+    channel: Optional[discord.TextChannel] = _messagelog_channel(ctx.guild)
+
+    embed: discord.Embed = discord.Embed(
+        title="\U0001f4dc Message log",
+        color=discord.Color.green() if channel is not None else discord.Color.greyple(),
+    )
+    if not config.get("enabled") or not config.get("channel_id"):
+        state: str = "\u26aa off"
+    elif channel is None:
+        state = "\u26a0\ufe0f configured, but I can't post there"
+    else:
+        state = f"\U0001f7e2 logging to {channel.mention}"
+    embed.add_field(name="State", value=state, inline=False)
+    embed.add_field(
+        name=f"Ignored channels ({len(ignored)})",
+        value=", ".join(f"<#{c}>" for c in ignored[:15]) or "*none*",
+        inline=False,
+    )
+    embed.set_footer(
+        text=f"{ctx.clean_prefix}set messagelog #channel \u00b7 "
+        f"{ctx.clean_prefix}messagelog ignore #channel"
+    )
+    await ctx.send(embed=embed, ephemeral=True)
+
+
+@messagelog_group.command(
+    name="ignore", description="Stop or resume logging one channel"
+)
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(channel="Which channel to toggle")
+async def messagelog_ignore(
+    ctx: commands.Context, channel: discord.TextChannel
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+
+    config: Dict[str, Any] = _messagelog_config(ctx.guild.id)
+    ignored: List[str] = [str(c) for c in (config.get("ignored_channels") or [])]
+    if str(channel.id) in ignored:
+        ignored.remove(str(channel.id))
+        outcome: str = f"\u2705 Resumed logging in {channel.mention}."
+    else:
+        ignored.append(str(channel.id))
+        outcome = f"\U0001f507 {channel.mention} will no longer be logged."
+
+    saved: bool = await bot.settings.push_fields(
+        ctx.guild.id, {"messagelog.ignored_channels": ignored}
+    )
+    await ctx.send(
+        outcome + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Modmail - button-opened private ticket channels
+# --------------------------------------------------------------------------- #
+
+MODMAIL_OPEN_ID: str = "modmail:open"
+MODMAIL_CLOSE_ID: str = "modmail:close"
+MODMAIL_COOLDOWN_SECONDS: float = 600.0
+MODMAIL_DEFAULT_PANEL: str = (
+    "Need help from the staff team? Press the button below and I'll open a private "
+    "channel for you. Only you and the staff can see it."
+)
+MODMAIL_DEFAULT_WELCOME: str = (
+    "Thanks for reaching out. A staff member will be with you shortly.\n\n"
+    "Please describe your issue here, with any screenshots or links that help. "
+    "Press **Close ticket** below when you're done."
+)
+_MODMAIL_LAST_OPEN: Dict[Tuple[int, int], float] = {}
+
+
+def _modmail_config(guild_id: int) -> Dict[str, Any]:
+    stored: Dict[str, Any] = bot.settings.peek_settings(guild_id).get("modmail") or {}
+    config: Dict[str, Any] = copy.deepcopy(DEFAULT_SETTINGS["modmail"])
+    for key, value in stored.items():
+        if key in config:
+            config[key] = value
+    return config
+
+
+def _modmail_staff_roles(guild: discord.Guild, config: Dict[str, Any]) -> List[discord.Role]:
+    roles: List[discord.Role] = []
+    for raw_id in config.get("staff_roles") or []:
+        role: Optional[discord.Role] = guild.get_role(int(raw_id))
+        if role is not None:
+            roles.append(role)
+    return roles
+
+
+def _modmail_ticket_for(config: Dict[str, Any], user_id: int) -> Optional[str]:
+    """Channel id of this member's open ticket, if any."""
+    for channel_id, record in (config.get("tickets") or {}).items():
+        if str(record.get("user_id")) == str(user_id) and not record.get("closed"):
+            return str(channel_id)
+    return None
+
+
+async def _modmail_next_number(guild_id: int) -> int:
+    try:
+        counter = await asyncio.to_thread(
+            bot.settings.meta.find_one_and_update,
+            {"key": f"modmail:{guild_id}"},
+            {"$inc": {"value": 1}},
+            upsert=True,
+            return_document=True,
+        )
+        return int((counter or {}).get("value", 1))
+    except PyMongoError as exc:
+        bot.log_error("modmail:counter", exc)
+        return int(time.time()) % 100000
+
+
+class TicketCloseView(discord.ui.View):
+    """Persistent close button pinned at the top of every ticket channel."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Close ticket",
+        style=discord.ButtonStyle.danger,
+        emoji="\U0001f512",
+        custom_id=MODMAIL_CLOSE_ID,
+    )
+    async def close_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if interaction.guild is None:
+            return
+        config: Dict[str, Any] = _modmail_config(interaction.guild.id)
+        tickets: Dict[str, Any] = dict(config.get("tickets") or {})
+        record: Optional[Dict[str, Any]] = tickets.get(str(interaction.channel_id))
+        if record is None:
+            return await interaction.response.send_message(
+                "\u274c This doesn't look like an open ticket.", ephemeral=True
+            )
+
+        opener_id: int = int(record.get("user_id") or 0)
+        is_staff: bool = isinstance(
+            interaction.user, discord.Member
+        ) and member_has_perms(interaction.user, manage_messages=True)
+        if interaction.user.id != opener_id and not is_staff:
+            return await interaction.response.send_message(
+                "\u274c Only the person who opened this ticket or a staff member can close it.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer()
+        await _modmail_close(
+            interaction.guild,
+            interaction.channel,
+            closed_by=interaction.user,
+            reason="Closed via button",
+        )
+
+
+class ModmailPanelView(discord.ui.View):
+    """Persistent panel button members press to open a ticket."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Open a ticket",
+        style=discord.ButtonStyle.primary,
+        emoji="\U0001f4e8",
+        custom_id=MODMAIL_OPEN_ID,
+    )
+    async def open_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return
+        await interaction.response.defer(ephemeral=True)
+        channel, problem = await _modmail_open(interaction.guild, interaction.user)
+        if channel is None:
+            return await interaction.followup.send(f"\u274c {problem}", ephemeral=True)
+        await interaction.followup.send(
+            f"\u2705 Your ticket is open: {channel.mention}", ephemeral=True
+        )
+
+
+async def _modmail_open(
+    guild: discord.Guild, member: discord.Member
+) -> Tuple[Optional[discord.TextChannel], str]:
+    """Create a private ticket channel. Returns (channel, problem message)."""
+    config: Dict[str, Any] = _modmail_config(guild.id)
+    if not config.get("enabled"):
+        return None, "Modmail isn't set up in this server yet."
+    if str(member.id) in [str(u) for u in (config.get("blocked") or [])]:
+        return None, "You can't open tickets in this server."
+
+    existing_id: Optional[str] = _modmail_ticket_for(config, member.id)
+    if existing_id:
+        existing = guild.get_channel(int(existing_id))
+        if isinstance(existing, discord.TextChannel):
+            return None, f"You already have an open ticket: {existing.mention}"
+
+    key: Tuple[int, int] = (guild.id, member.id)
+    now: float = time.time()
+    last: float = _MODMAIL_LAST_OPEN.get(key, 0.0)
+    if now - last < MODMAIL_COOLDOWN_SECONDS and not member_has_perms(
+        member, manage_messages=True
+    ):
+        wait: int = int(MODMAIL_COOLDOWN_SECONDS - (now - last))
+        return None, f"Please wait {wait // 60}m {wait % 60}s before opening another ticket."
+
+    me: discord.Member = guild.me
+    if not me.guild_permissions.manage_channels:
+        return None, "I need the **Manage Channels** permission to open tickets."
+
+    staff_roles: List[discord.Role] = _modmail_staff_roles(guild, config)
+    if not staff_roles:
+        return None, "No staff role is configured for modmail."
+
+    category: Optional[discord.CategoryChannel] = None
+    if config.get("category_id"):
+        candidate = guild.get_channel(int(config["category_id"]))
+        if isinstance(candidate, discord.CategoryChannel):
+            category = candidate
+
+    overwrites: Dict[Any, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        me: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            manage_messages=True,
+            embed_links=True,
+            attach_files=True,
+        ),
+        member: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True,
+            add_reactions=True,
+        ),
+    }
+    for role in staff_roles:
+        overwrites[role] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True,
+            manage_messages=True,
+        )
+
+    number: int = await _modmail_next_number(guild.id)
+    name: str = f"ticket-{number:04d}-{re.sub(r'[^a-z0-9]+', '', member.name.casefold())[:20]}"
+
+    try:
+        channel: discord.TextChannel = await guild.create_text_channel(
+            name=name[:100],
+            category=category,
+            overwrites=overwrites,
+            topic=f"Modmail ticket #{number} for {member} ({member.id})",
+            reason=f"Modmail ticket opened by {member}",
+        )
+    except discord.Forbidden:
+        return None, "I'm not allowed to create a channel there."
+    except discord.HTTPException as exc:
+        bot.log_error("modmail:create", exc, guild=guild, user=member)
+        return None, "Discord refused to create the ticket channel."
+
+    _MODMAIL_LAST_OPEN[key] = now
+
+    welcome_text: str = str(config.get("welcome_message") or MODMAIL_DEFAULT_WELCOME)
+    embed: discord.Embed = discord.Embed(
+        title=str(config.get("welcome_title") or f"Ticket #{number}"),
+        description=welcome_text[:4000],
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Opened by", value=f"{member.mention} (`{member}`)", inline=True)
+    embed.add_field(
+        name="Account created",
+        value=f"<t:{int(member.created_at.timestamp())}:R>",
+        inline=True,
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"Ticket #{number}")
+
+    mention_line: str = member.mention
+    if config.get("ping_staff"):
+        mention_line += " " + " ".join(role.mention for role in staff_roles[:3])
+
+    try:
+        opener: discord.Message = await channel.send(
+            mention_line,
+            embed=embed,
+            view=TicketCloseView(),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+        )
+        await opener.pin(reason="Ticket header")
+    except discord.DiscordException as exc:
+        bot.log_error("modmail:header", exc, guild=guild, user=member)
+
+    tickets: Dict[str, Any] = dict(config.get("tickets") or {})
+    tickets[str(channel.id)] = {
+        "user_id": str(member.id),
+        "number": number,
+        "opened_at": int(now),
+        "closed": False,
+    }
+    await bot.settings.push_fields(guild.id, {"modmail.tickets": tickets})
+
+    log.info(
+        "Modmail ticket #%d opened in guild %s by %s (channel %s).",
+        number,
+        guild.id,
+        member,
+        channel.id,
+    )
+    await send_modlog(
+        guild,
+        f"\U0001f4e8 Ticket #{number} opened",
+        f"{member.mention} opened {channel.mention}.",
+        discord.Color.blurple(),
+    )
+    return channel, ""
+
+
+async def _modmail_transcript(channel: discord.TextChannel) -> Optional[discord.File]:
+    """Plain-text transcript of a ticket, oldest first."""
+    try:
+        lines: List[str] = []
+        async for message in channel.history(limit=500, oldest_first=True):
+            stamp: str = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            body: str = message.content or ""
+            if message.attachments:
+                body += " [attachments: " + _describe_attachments(list(message.attachments)) + "]"
+            if message.embeds and not body.strip():
+                body = "[embed]"
+            lines.append(f"[{stamp}] {message.author}: {body}")
+        if not lines:
+            return None
+        payload: bytes = "\n".join(lines).encode("utf-8")
+        return discord.File(io.BytesIO(payload), filename=f"{channel.name}.txt")
+    except discord.DiscordException as exc:
+        bot.log_error("modmail:transcript", exc, guild=channel.guild)
+        return None
+
+
+async def _modmail_close(
+    guild: discord.Guild,
+    channel: Any,
+    *,
+    closed_by: discord.abc.User,
+    reason: str,
+) -> bool:
+    """Close a ticket: strip member access, log a transcript, archive the channel."""
+    if not isinstance(channel, discord.TextChannel):
+        return False
+    config: Dict[str, Any] = _modmail_config(guild.id)
+    tickets: Dict[str, Any] = dict(config.get("tickets") or {})
+    record: Optional[Dict[str, Any]] = tickets.get(str(channel.id))
+    if record is None or record.get("closed"):
+        return False
+
+    number: Any = record.get("number", "?")
+    opener: Optional[discord.Member] = guild.get_member(int(record.get("user_id") or 0))
+
+    transcript: Optional[discord.File] = None
+    if config.get("transcripts"):
+        transcript = await _modmail_transcript(channel)
+
+    closing: discord.Embed = discord.Embed(
+        title=f"\U0001f512 Ticket #{number} closed",
+        description=discord.utils.escape_mentions(reason)[:2000],
+        color=discord.Color.greyple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    closing.add_field(name="Closed by", value=f"{closed_by.mention} (`{closed_by}`)", inline=True)
+    try:
+        await channel.send(embed=closing, allowed_mentions=discord.AllowedMentions.none())
+    except discord.DiscordException:
+        pass
+
+    if opener is not None:
+        try:
+            await channel.set_permissions(
+                opener, overwrite=None, reason="Ticket closed"
+            )
+        except discord.DiscordException as exc:
+            bot.log_error("modmail:revoke", exc, guild=guild, user=opener)
+        try:
+            await opener.send(
+                f"Your ticket **#{number}** in **{guild.name}** has been closed.\n"
+                f"**Reason:** {discord.utils.escape_mentions(reason)[:500]}"
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    if not channel.name.startswith("closed-"):
+        try:
+            await channel.edit(name=f"closed-{channel.name}"[:100], reason="Ticket closed")
+        except discord.DiscordException:
+            pass
+
+    record["closed"] = True
+    record["closed_at"] = int(time.time())
+    record["closed_by"] = str(closed_by)
+    tickets[str(channel.id)] = record
+    await bot.settings.push_fields(guild.id, {"modmail.tickets": tickets})
+
+    log_channel: Optional[discord.TextChannel] = None
+    if config.get("log_channel_id"):
+        candidate = guild.get_channel(int(config["log_channel_id"]))
+        if isinstance(candidate, discord.TextChannel):
+            log_channel = candidate
+    if log_channel is not None:
+        try:
+            await log_channel.send(
+                embed=closing,
+                file=transcript,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.DiscordException as exc:
+            bot.log_error("modmail:log", exc, guild=guild)
+
+    await send_modlog(
+        guild,
+        f"\U0001f512 Ticket #{number} closed",
+        f"{channel.mention} was closed by {closed_by.mention}.",
+        discord.Color.greyple(),
+    )
+    log.info("Modmail ticket #%s closed in guild %s by %s.", number, guild.id, closed_by)
+    return True
+
+
+@bot.hybrid_group(
+    name="modmail",
+    description="Private staff tickets opened from a button panel",
+    fallback="status",
+)
+@commands.guild_only()
+async def modmail_group(ctx: commands.Context) -> None:
+    config: Dict[str, Any] = _modmail_config(ctx.guild.id)
+    is_staff: bool = member_has_perms(ctx.author, manage_messages=True)
+
+    if not is_staff:
+        existing: Optional[str] = _modmail_ticket_for(config, ctx.author.id)
+        if existing:
+            return await ctx.send(
+                f"\U0001f4e8 Your open ticket: <#{existing}>", ephemeral=True
+            )
+        state: str = (
+            "Press the **Open a ticket** button on the modmail panel to reach staff."
+            if config.get("enabled")
+            else "Modmail isn't set up in this server yet."
+        )
+        return await ctx.send(state, ephemeral=True)
+
+    tickets: Dict[str, Any] = config.get("tickets") or {}
+    open_tickets: List[Tuple[str, Dict[str, Any]]] = [
+        (cid, rec) for cid, rec in tickets.items() if not rec.get("closed")
+    ]
+    staff_roles: List[discord.Role] = _modmail_staff_roles(ctx.guild, config)
+
+    embed: discord.Embed = discord.Embed(
+        title="\U0001f4e8 Modmail",
+        color=discord.Color.blurple() if config.get("enabled") else discord.Color.greyple(),
+    )
+    embed.add_field(
+        name="State",
+        value="\U0001f7e2 enabled" if config.get("enabled") else "\u26aa not set up",
+        inline=True,
+    )
+    embed.add_field(name="Open tickets", value=str(len(open_tickets)), inline=True)
+    embed.add_field(
+        name="Staff roles",
+        value=", ".join(role.mention for role in staff_roles) or "*none set*",
+        inline=False,
+    )
+    if config.get("category_id"):
+        embed.add_field(name="Category", value=f"<#{config['category_id']}>", inline=True)
+    if open_tickets:
+        listing: List[str] = [
+            f"#{rec.get('number')} \u00b7 <#{cid}> \u00b7 <@{rec.get('user_id')}>"
+            for cid, rec in sorted(
+                open_tickets, key=lambda kv: int(kv[1].get("number") or 0), reverse=True
+            )[:10]
+        ]
+        embed.add_field(name="Currently open", value="\n".join(listing)[:1024], inline=False)
+    embed.set_footer(
+        text=f"{ctx.clean_prefix}modmail setup \u00b7 {ctx.clean_prefix}modmail panel"
+    )
+    await ctx.send(embed=embed, ephemeral=True)
+
+
+@modmail_group.command(name="setup", description="Configure modmail staff role and category")
+@app_commands.default_permissions(administrator=True)
+@commands.has_permissions(administrator=True)
+@app_commands.describe(
+    staff_role="Role that can see and answer every ticket",
+    category="Category new ticket channels are created in",
+    log_channel="Where closing summaries and transcripts are posted",
+    ping_staff="Ping the staff role when a ticket opens",
+    transcripts="Attach a text transcript when a ticket closes",
+)
+async def modmail_setup(
+    ctx: commands.Context,
+    staff_role: discord.Role,
+    category: Optional[discord.CategoryChannel] = None,
+    log_channel: Optional[discord.TextChannel] = None,
+    ping_staff: bool = True,
+    transcripts: bool = True,
+) -> None:
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("\u274c You need Administrator permission.", ephemeral=True)
+    if not ctx.guild.me.guild_permissions.manage_channels:
+        return await ctx.send(
+            "\u274c I need the **Manage Channels** permission before modmail will work.",
+            ephemeral=True,
+        )
+
+    fields: Dict[str, Any] = {
+        "modmail.enabled": True,
+        "modmail.staff_roles": [str(staff_role.id)],
+        "modmail.category_id": str(category.id) if category else None,
+        "modmail.log_channel_id": str(log_channel.id) if log_channel else None,
+        "modmail.ping_staff": bool(ping_staff),
+        "modmail.transcripts": bool(transcripts),
+    }
+    saved: bool = await bot.settings.push_fields(ctx.guild.id, fields)
+    log.info("Modmail configured in guild %s by %s.", ctx.guild.id, ctx.author)
+
+    detail: str = f"Staff role {staff_role.mention}"
+    if category:
+        detail += f", tickets in **{category.name}**"
+    if log_channel:
+        detail += f", logs to {log_channel.mention}"
+    await ctx.send(
+        f"\u2705 Modmail is set up. {detail}.\n"
+        f"Post the panel with `{ctx.clean_prefix}modmail panel`."
+        + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@modmail_group.command(name="panel", description="Post the ticket panel with its button")
+@app_commands.default_permissions(manage_guild=True)
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(channel="Where to post the panel (defaults to here)")
+async def modmail_panel(
+    ctx: commands.Context, channel: Optional[discord.TextChannel] = None
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    config: Dict[str, Any] = _modmail_config(ctx.guild.id)
+    if not config.get("enabled"):
+        return await ctx.send(
+            f"\u274c Run `{ctx.clean_prefix}modmail setup` first.", ephemeral=True
+        )
+
+    target: discord.TextChannel = channel or ctx.channel
+    embed: discord.Embed = discord.Embed(
+        title=str(config.get("panel_title") or "Contact staff"),
+        description=str(config.get("panel_message") or MODMAIL_DEFAULT_PANEL)[:4000],
+        color=discord.Color.blurple(),
+    )
+    try:
+        await target.send(embed=embed, view=ModmailPanelView())
+    except discord.Forbidden:
+        return await ctx.send(f"\u274c I can't post in {target.mention}.", ephemeral=True)
+    except discord.HTTPException as exc:
+        bot.log_error("modmail:panel", exc, guild=ctx.guild)
+        return await ctx.send("\u26a0\ufe0f Discord rejected the panel message.", ephemeral=True)
+
+    await ctx.send(f"\u2705 Panel posted in {target.mention}.", ephemeral=True)
+
+
+@modmail_group.command(
+    name="message", description="Set the panel text or the ticket welcome embed"
+)
+@app_commands.default_permissions(manage_guild=True)
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(
+    target="Which text to change",
+    title="Embed title",
+    text="Embed body. Leave empty to restore the default.",
+)
+async def modmail_message(
+    ctx: commands.Context,
+    target: Literal["panel", "welcome"],
+    title: Optional[str] = None,
+    *,
+    text: Optional[str] = None,
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+
+    fields: Dict[str, Any] = {}
+    if target == "panel":
+        fields["modmail.panel_message"] = (text or MODMAIL_DEFAULT_PANEL)[:2000]
+        if title is not None:
+            fields["modmail.panel_title"] = title[:200]
+    else:
+        fields["modmail.welcome_message"] = (text or MODMAIL_DEFAULT_WELCOME)[:2000]
+        if title is not None:
+            fields["modmail.welcome_title"] = title[:200]
+
+    saved: bool = await bot.settings.push_fields(ctx.guild.id, fields)
+    preview: discord.Embed = discord.Embed(
+        title=(
+            fields.get("modmail.panel_title")
+            or fields.get("modmail.welcome_title")
+            or ("Contact staff" if target == "panel" else "Ticket")
+        ),
+        description=(
+            fields.get("modmail.panel_message") or fields.get("modmail.welcome_message")
+        ),
+        color=discord.Color.blurple(),
+    )
+    await ctx.send(
+        f"\u2705 Updated the **{target}** text."
+        + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        embed=preview,
+        ephemeral=True,
+    )
+    if target == "panel":
+        await ctx.send(
+            f"Re-post the panel with `{ctx.clean_prefix}modmail panel` to apply it.",
+            ephemeral=True,
+        )
+
+
+@modmail_group.command(name="close", description="Close the ticket in this channel")
+@commands.guild_only()
+@app_commands.describe(reason="Why the ticket is being closed")
+async def modmail_close(
+    ctx: commands.Context, *, reason: Optional[str] = "No reason given"
+) -> None:
+    config: Dict[str, Any] = _modmail_config(ctx.guild.id)
+    record: Optional[Dict[str, Any]] = (config.get("tickets") or {}).get(str(ctx.channel.id))
+    if record is None or record.get("closed"):
+        return await ctx.send(
+            "\u274c This channel isn't an open modmail ticket.", ephemeral=True
+        )
+    if str(ctx.author.id) != str(record.get("user_id")) and not member_has_perms(
+        ctx.author, manage_messages=True
+    ):
+        return await ctx.send(
+            "\u274c Only the ticket opener or a staff member can close it.", ephemeral=True
+        )
+
+    await ctx.defer(ephemeral=True)
+    closed: bool = await _modmail_close(
+        ctx.guild, ctx.channel, closed_by=ctx.author, reason=str(reason or "No reason given")
+    )
+    if closed:
+        await ctx.send("\u2705 Ticket closed.", ephemeral=True)
+    else:
+        await ctx.send("\u26a0\ufe0f I couldn't close that ticket.", ephemeral=True)
+
+
+@modmail_group.command(name="add", description="Give another member access to this ticket")
+@app_commands.default_permissions(manage_messages=True)
+@commands.has_permissions(manage_messages=True)
+@app_commands.describe(user="Who to add to this ticket")
+async def modmail_add(ctx: commands.Context, user: discord.Member) -> None:
+    if not member_has_perms(ctx.author, manage_messages=True):
+        return await ctx.send(
+            "\u274c You need the **Manage Messages** permission.", ephemeral=True
+        )
+    config: Dict[str, Any] = _modmail_config(ctx.guild.id)
+    if str(ctx.channel.id) not in (config.get("tickets") or {}):
+        return await ctx.send("\u274c This channel isn't a modmail ticket.", ephemeral=True)
+    try:
+        await ctx.channel.set_permissions(
+            user,
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            reason=f"Added to ticket by {ctx.author}",
+        )
+    except discord.Forbidden:
+        return await ctx.send("\u274c I can't change permissions here.", ephemeral=True)
+    await ctx.send(f"\u2705 {user.mention} can now see this ticket.", ephemeral=True)
+
+
+@modmail_group.command(name="block", description="Stop a member from opening tickets")
+@app_commands.default_permissions(manage_guild=True)
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(user="Who to block or unblock")
+async def modmail_block(ctx: commands.Context, user: discord.Member) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    config: Dict[str, Any] = _modmail_config(ctx.guild.id)
+    blocked: List[str] = [str(u) for u in (config.get("blocked") or [])]
+
+    if str(user.id) in blocked:
+        blocked.remove(str(user.id))
+        outcome: str = f"\u2705 {user.mention} can open tickets again."
+    else:
+        blocked.append(str(user.id))
+        outcome = f"\U0001f6ab {user.mention} can no longer open tickets."
+
+    saved: bool = await bot.settings.push_fields(ctx.guild.id, {"modmail.blocked": blocked})
+    log.info("Modmail block toggled for %s in guild %s.", user.id, ctx.guild.id)
+    await ctx.send(
+        outcome + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
