@@ -340,13 +340,41 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "mention_limit": 5,
         "exempt_roles": [],
     },
-    "welcome": {"enabled": False, "channel_id": None, "message": ""},
-    "goodbye": {"enabled": False, "channel_id": None, "message": ""},
+    "welcome": {
+        "enabled": False,
+        "channel_id": None,
+        "message": "",
+        "embed": False,
+        "title": "",
+        "color": "5865F2",
+        "image": "",
+        "thumbnail": True,
+        "ping": True,
+        "dm_message": "",
+    },
+    "goodbye": {
+        "enabled": False,
+        "channel_id": None,
+        "message": "",
+        "embed": False,
+        "title": "",
+        "color": "ED4245",
+        "image": "",
+        "thumbnail": True,
+        "ping": False,
+        "dm_message": "",
+    },
     "starboard": {
         "enabled": False,
         "channel_id": None,
         "threshold": 3,
-        "emoji": "\u2b50",
+        "self_star": False,
+        "allow_bots": False,
+        "show_count": False,
+        "blocked_emojis": [],
+        "ignored_channels": [],
+        "webhook_id": None,
+        "webhook_token": None,
         "posted": {},
     },
     "tags": {},
@@ -383,6 +411,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "log_channel_id": None,
         "ping_staff": True,
         "transcripts": True,
+        "delete_after": 10,
+        "dm_transcript": True,
         "panel_title": "Contact staff",
         "panel_message": "",
         "welcome_title": "",
@@ -671,6 +701,7 @@ class DebtCollectorBot(commands.Bot):
         self.afk_state: Dict[int, "AfkRecord"] = {}
         self.snipes: Dict[int, SnipedMessage] = {}
         self.next_fire: Dict[str, float] = {}
+        self.starboard_webhooks: Dict[int, Any] = {}
         self.sticky_locks: Dict[int, asyncio.Lock] = {}
         self.sticky_last: Dict[int, float] = {}
         self.ai_history_buffer: Dict[int, List[Dict[str, Any]]] = {}  # channel_id -> messages
@@ -2101,7 +2132,9 @@ COMMAND_CATEGORY: Dict[str, str] = {
     "poll": "utility",
     "reaction": "utility",
     "remindme": "utility",
-    "modmail": "utility",
+    "ticket": "utility",
+    "welcomer": "config",
+    "leaver": "config",
     "steal": "utility",
     "tag": "utility",
     # Info
@@ -2212,8 +2245,6 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "set": "Core server configuration.",
     "set prefix": "Change the chat command prefix for this server (default `!`).",
     "set modlog": "Send a log of every moderation action to a channel; empty turns it off.",
-    "set welcome": "Message posted when someone joins; empty channel turns it off.",
-    "set goodbye": "Message posted when someone leaves; empty channel turns it off.",
     "echoset": "Allow or block the /echo command server-wide.",
     "autoreact": "React with chosen emojis whenever a message contains a trigger word.",
     "autoreact add": "Add a trigger plus the emojis to react with, and whether it matches "
@@ -2234,9 +2265,14 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "sticky": "Keep a message pinned to the bottom of a channel as people talk.",
     "sticky off": "Stop the sticky message in a channel.",
     "sticky list": "Show every channel with a sticky message.",
-    "starboard": "Repost messages to a highlights channel once they hit a star threshold.",
-    "starboard set": "Choose the starboard channel, emoji and star threshold.",
-    "starboard off": "Turn the starboard off.",
+    "starboard": "Repost popular messages to a highlights channel, sent as the "
+    "original author via a webhook.",
+    "starboard set": "Choose the highlights channel and how many reactions are needed.",
+    "starboard threshold": "How many of any one emoji a message needs to be relayed.",
+    "starboard block": "Stop one emoji from ever triggering the starboard, or unblock it.",
+    "starboard ignore": "Stop watching reactions in one channel, or watch it again.",
+    "starboard options": "Count self-reactions, relay bot messages, show the count line.",
+    "starboard off": "Turn the starboard off, keeping the channel and settings.",
     "remind": "A recurring announcement posted to a channel on a fixed interval.",
     "remind set": "Create or update the recurring reminder.",
     "remind off": "Stop the recurring reminder.",
@@ -2252,13 +2288,27 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "screening test": "Score an existing member as if they had just joined, without acting.",
     "messagelog": "Log edited and deleted messages as embeds in a channel.",
     "messagelog ignore": "Stop or resume logging one channel.",
-    "modmail": "Private staff tickets members open from a button panel.",
-    "modmail setup": "Set the staff role, ticket category, log channel and ping behaviour.",
-    "modmail panel": "Post the panel members press to open a ticket.",
-    "modmail message": "Set the panel text or the welcome embed shown inside new tickets.",
-    "modmail close": "Close the ticket in this channel and archive it.",
-    "modmail add": "Give another member access to the current ticket.",
-    "modmail block": "Stop a member from opening tickets, or let them again.",
+    "ticket": "Private staff tickets members open from a button panel.",
+    "ticket setup": "Set the staff role, ticket category, log channel and ping behaviour.",
+    "ticket panel": "Post the panel members press to open a ticket.",
+    "ticket message": "Set the panel text or the welcome embed shown inside new tickets.",
+    "ticket config": "Auto-delete delay after closing, transcript DMs and staff pings.",
+    "ticket close": "Close the ticket in this channel; the channel is then deleted or archived.",
+    "ticket add": "Give another member access to the current ticket.",
+    "ticket block": "Stop a member from opening tickets, or let them again.",
+    "welcomer": "Greet members in a channel when they join.",
+    "welcomer set": "Choose the channel joins are announced in, and optionally the text.",
+    "welcomer message": "Set the join greeting, with placeholders for name, server and count.",
+    "welcomer style": "Embed mode, title, colour, banner image, thumbnail and ping.",
+    "welcomer dm": "Also send new members a private message when they join.",
+    "welcomer test": "Preview the greeting on yourself without waiting for a join.",
+    "welcomer off": "Stop announcing joins, keeping the message and styling.",
+    "leaver": "Announce in a channel when a member leaves.",
+    "leaver set": "Choose the channel leaves are announced in, and optionally the text.",
+    "leaver message": "Set the farewell text, with placeholders for name, server and count.",
+    "leaver style": "Embed mode, title, colour, banner image and thumbnail.",
+    "leaver test": "Preview the farewell on yourself.",
+    "leaver off": "Stop announcing leaves, keeping the message and styling.",
     "set messagelog": "Choose the channel edited and deleted messages are logged to.",
     "diagnose": "Health check: gateway latency, database reachability, background loops, "
     "cache hit rate and the bot's missing permissions.",
@@ -2856,7 +2906,7 @@ async def autopurge_status(ctx: commands.Context):
 # ================= /set =================
 @bot.hybrid_group(
     name="set",
-    description="Server configuration: prefix, mod log, welcome and goodbye",
+    description="Server configuration: prefix, mod log and message logging",
 )
 @commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -5822,99 +5872,7 @@ async def set_messagelog_cmd(
     await ctx.send(text if saved else text + " (database write failed)", ephemeral=True)
 
 
-@set_group.command(name="welcome", description="Message sent when someone joins")
-@app_commands.describe(
-    channel="Where to post it (leave empty to disable)",
-    message="Supports {user}, {mention}, {server}, {count}",
-)
-async def set_welcome_cmd(
-    ctx: commands.Context,
-    channel: Optional[discord.TextChannel] = None,
-    *,
-    message: Optional[str] = None,
-):
-    if not member_has_perms(ctx.author, administrator=True):
-        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
-    fields = {
-        "welcome.channel_id": str(channel.id) if channel else None,
-        "welcome.message": (message or "👋 Welcome {mention} to **{server}** — member #{count}!")[:1000],
-        "welcome.enabled": channel is not None,
-    }
-    saved = await bot.settings.push_fields(ctx.guild.id, fields)
-    await ctx.send(
-        (f"✅ Welcome messages will post in {channel.mention}." if channel else "✅ Welcome messages disabled.")
-        + ("" if saved else " (database write failed)"),
-        ephemeral=True,
-    )
 
-
-@set_group.command(name="goodbye", description="Message sent when someone leaves")
-@app_commands.describe(
-    channel="Where to post it (leave empty to disable)",
-    message="Supports {user}, {server}, {count}",
-)
-async def set_goodbye_cmd(
-    ctx: commands.Context,
-    channel: Optional[discord.TextChannel] = None,
-    *,
-    message: Optional[str] = None,
-):
-    if not member_has_perms(ctx.author, administrator=True):
-        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
-    fields = {
-        "goodbye.channel_id": str(channel.id) if channel else None,
-        "goodbye.message": (message or "👋 **{user}** left **{server}**. {count} members remain.")[:1000],
-        "goodbye.enabled": channel is not None,
-    }
-    saved = await bot.settings.push_fields(ctx.guild.id, fields)
-    await ctx.send(
-        (f"✅ Goodbye messages will post in {channel.mention}." if channel else "✅ Goodbye messages disabled.")
-        + ("" if saved else " (database write failed)"),
-        ephemeral=True,
-    )
-
-
-def _format_member_message(template: str, member: discord.Member) -> str:
-    return (
-        template.replace("{mention}", member.mention)
-        .replace("{user}", member.display_name)
-        .replace("{server}", member.guild.name)
-        .replace("{count}", str(member.guild.member_count or 0))
-    )[:2000]
-
-
-@bot.listen("on_member_join")
-async def _welcome_listener(member: discord.Member) -> None:
-    config = bot.settings.get_settings(member.guild.id).get("welcome") or {}
-    if not config.get("enabled") or not config.get("channel_id"):
-        return
-    channel = member.guild.get_channel(int(config["channel_id"]))
-    if channel is None:
-        return
-    try:
-        await channel.send(
-            _format_member_message(config.get("message") or "Welcome {mention}!", member),
-            allowed_mentions=discord.AllowedMentions(users=True),
-        )
-    except discord.DiscordException as exc:
-        bot.log_error("welcome", exc)
-
-
-@bot.listen("on_member_remove")
-async def _goodbye_listener(member: discord.Member) -> None:
-    config = bot.settings.get_settings(member.guild.id).get("goodbye") or {}
-    if not config.get("enabled") or not config.get("channel_id"):
-        return
-    channel = member.guild.get_channel(int(config["channel_id"]))
-    if channel is None:
-        return
-    try:
-        await channel.send(
-            _format_member_message(config.get("message") or "{user} left.", member),
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-    except discord.DiscordException as exc:
-        bot.log_error("goodbye", exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -6363,114 +6321,453 @@ async def poll_cmd(ctx: commands.Context, question: str, *, options: Optional[st
 # --------------------------------------------------------------------------- #
 
 
-@bot.hybrid_group(name="starboard", description="Highlight popular messages", fallback="status")
-@commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-async def starboard_group(ctx: commands.Context):
-    if ctx.invoked_subcommand is not None:
-        return
-    config = bot.settings.get_settings(ctx.guild.id).get("starboard") or {}
-    if not config.get("enabled"):
-        return await ctx.send("⭐ Starboard is off. Turn it on with `/starboard set`.", ephemeral=True)
-    await ctx.send(
-        f"⭐ Posting to <#{config.get('channel_id')}> at **{config.get('threshold', 3)}× "
-        f"{config.get('emoji', '⭐')}**.",
-        ephemeral=True,
+# --------------------------------------------------------------------------- #
+# Starboard - any emoji, relayed through a webhook as the original author
+# --------------------------------------------------------------------------- #
+
+STARBOARD_MAX_POSTED: int = 500
+STARBOARD_CONTENT_BUDGET: int = 1800
+_STARBOARD_DISCORD_RE: re.Pattern = re.compile(r"discord", re.IGNORECASE)
+_STARBOARD_INFLIGHT: set = set()
+
+
+def _starboard_config(guild_id: int) -> Dict[str, Any]:
+    stored: Dict[str, Any] = bot.settings.peek_settings(guild_id).get("starboard") or {}
+    config: Dict[str, Any] = copy.deepcopy(DEFAULT_SETTINGS["starboard"])
+    for key, value in stored.items():
+        if key in config:
+            config[key] = value
+    return config
+
+
+def _sanitize_webhook_name(raw: str) -> str:
+    """Discord rejects webhook usernames containing 'discord' or over 80 chars."""
+    cleaned: str = _STARBOARD_DISCORD_RE.sub("d\u200bscord", raw or "").strip()
+    cleaned = cleaned[:80].strip()
+    return cleaned or "Member"
+
+
+async def _starboard_webhook(channel: discord.TextChannel) -> Optional[discord.Webhook]:
+    """Reusable webhook for the board channel, cached in memory and in settings."""
+    cached: Optional[discord.Webhook] = bot.starboard_webhooks.get(channel.id)
+    if cached is not None:
+        return cached
+
+    config: Dict[str, Any] = _starboard_config(channel.guild.id)
+    stored_id: Any = config.get("webhook_id")
+    stored_token: Any = config.get("webhook_token")
+    if stored_id and stored_token and bot.http_session is not None:
+        hook: discord.Webhook = discord.Webhook.partial(
+            int(stored_id), str(stored_token), session=bot.http_session
+        )
+        bot.starboard_webhooks[channel.id] = hook
+        return hook
+
+    permissions: discord.Permissions = channel.permissions_for(channel.guild.me)
+    if not permissions.manage_webhooks:
+        log.warning(
+            "Starboard needs Manage Webhooks in channel %s (guild %s).",
+            channel.id,
+            channel.guild.id,
+        )
+        return None
+
+    try:
+        existing: List[discord.Webhook] = await channel.webhooks()
+        hook = discord.utils.find(
+            lambda w: w.token is not None
+            and w.user is not None
+            and bot.user is not None
+            and w.user.id == bot.user.id,
+            existing,
+        )
+        if hook is None:
+            hook = await channel.create_webhook(
+                name="Starboard", reason="Starboard message relay"
+            )
+    except discord.DiscordException as exc:
+        bot.log_error("starboard:webhook", exc, guild=channel.guild)
+        return None
+
+    bot.starboard_webhooks[channel.id] = hook
+    await bot.settings.push_fields(
+        channel.guild.id,
+        {"starboard.webhook_id": str(hook.id), "starboard.webhook_token": str(hook.token)},
     )
+    return hook
 
 
-@starboard_group.command(name="set", description="Configure the starboard")
-@app_commands.describe(channel="Where highlights go", threshold="How many reactions", emoji="Which emoji")
-async def starboard_set(
-    ctx: commands.Context,
-    channel: discord.TextChannel,
-    threshold: app_commands.Range[int, 1, 50] = 3,
-    emoji: str = "⭐",
-):
-    if not member_has_perms(ctx.author, manage_guild=True):
-        return await ctx.send("❌ You need the **Manage Server** permission.", ephemeral=True)
-    saved = await bot.settings.push_fields(
-        ctx.guild.id,
-        {
-            "starboard.enabled": True,
-            "starboard.channel_id": str(channel.id),
-            "starboard.threshold": int(threshold),
-            "starboard.emoji": emoji.strip()[:32],
-        },
-    )
-    await ctx.send(
-        f"{'✅' if saved else '⚠️'} Starboard set: {threshold}× {emoji} → {channel.mention}.",
-        ephemeral=True,
-    )
+async def _starboard_best_reaction(
+    message: discord.Message, config: Dict[str, Any]
+) -> Tuple[Optional[str], int]:
+    """Highest-counting eligible reaction on a message, as (emoji, count)."""
+    blocked: List[str] = [str(e) for e in (config.get("blocked_emojis") or [])]
+    allow_self: bool = bool(config.get("self_star"))
+
+    best_emoji: Optional[str] = None
+    best_count: int = 0
+    for reaction in message.reactions:
+        token: str = str(reaction.emoji)
+        if token in blocked:
+            continue
+        count: int = int(reaction.count or 0)
+        if not allow_self and count:
+            try:
+                async for user in reaction.users(limit=100):
+                    if user.id == message.author.id:
+                        count -= 1
+                        break
+            except discord.DiscordException:
+                pass
+        if count > best_count:
+            best_emoji, best_count = token, count
+    return best_emoji, best_count
 
 
-@starboard_group.command(name="off", description="Turn the starboard off")
-async def starboard_off(ctx: commands.Context):
-    if not member_has_perms(ctx.author, manage_guild=True):
-        return await ctx.send("❌ You need the **Manage Server** permission.", ephemeral=True)
-    saved = await bot.settings.push_fields(ctx.guild.id, {"starboard.enabled": False})
-    await ctx.send(f"{'✅' if saved else '⚠️'} Starboard turned off.", ephemeral=True)
+def _starboard_body(message: discord.Message) -> str:
+    """Original text plus attachment links, with the jump link appended last."""
+    parts: List[str] = []
+    content: str = (message.content or "").strip()
+    if content:
+        parts.append(content[:STARBOARD_CONTENT_BUDGET])
+
+    for attachment in message.attachments[:4]:
+        parts.append(attachment.url)
+    if message.stickers:
+        parts.append(
+            "*(sticker: " + ", ".join(s.name for s in message.stickers[:3])[:80] + ")*"
+        )
+    if not parts:
+        parts.append("*(no text content)*")
+
+    parts.append(f"\n[\u21aa jump to the original message]({message.jump_url})")
+    return "\n".join(parts)[:2000]
 
 
 @bot.listen("on_raw_reaction_add")
 async def _starboard_listener(payload: discord.RawReactionActionEvent) -> None:
     if payload.guild_id is None:
         return
-    guild = bot.get_guild(payload.guild_id)
+    guild: Optional[discord.Guild] = bot.get_guild(payload.guild_id)
     if guild is None:
         return
-    config = bot.settings.peek_settings(guild.id).get("starboard") or {}
+
+    config: Dict[str, Any] = _starboard_config(guild.id)
     if not config.get("enabled") or not config.get("channel_id"):
         return
-    if str(payload.emoji) != config.get("emoji", "⭐"):
+    if str(payload.emoji) in [str(e) for e in (config.get("blocked_emojis") or [])]:
+        return
+    if str(payload.channel_id) in [str(c) for c in (config.get("ignored_channels") or [])]:
         return
 
-    posted = dict(config.get("posted") or {})
-    if str(payload.message_id) in posted:
+    posted: Dict[str, Any] = dict(config.get("posted") or {})
+    if str(payload.message_id) in posted or payload.message_id in _STARBOARD_INFLIGHT:
         return
 
-    source = guild.get_channel(payload.channel_id)
-    board = guild.get_channel(int(config["channel_id"]))
-    if source is None or board is None or source.id == board.id:
+    source: Any = guild.get_channel(payload.channel_id)
+    board: Any = guild.get_channel(int(config["channel_id"]))
+    if not isinstance(source, discord.TextChannel) or not isinstance(board, discord.TextChannel):
         return
+    if source.id == board.id:
+        return
+    if getattr(source, "is_nsfw", lambda: False)() and not board.is_nsfw():
+        return  # never relay age-restricted content into a normal channel
 
     try:
-        message = await source.fetch_message(payload.message_id)
+        message: discord.Message = await source.fetch_message(payload.message_id)
     except discord.DiscordException:
         return
-
-    reaction = discord.utils.find(
-        lambda r: str(r.emoji) == config.get("emoji", "⭐"), message.reactions
-    )
-    if reaction is None or reaction.count < int(config.get("threshold", 3)):
+    if message.author.bot and not config.get("allow_bots"):
         return
 
-    embed = discord.Embed(
-        description=(message.content or "")[:2000],
-        color=discord.Color.gold(),
-        timestamp=message.created_at,
-    )
-    embed.set_author(
-        name=message.author.display_name,
-        icon_url=message.author.display_avatar.url,
-    )
-    embed.add_field(name="Jump", value=f"[go to message]({message.jump_url})", inline=False)
-    if message.attachments and message.attachments[0].content_type and message.attachments[0].content_type.startswith("image"):
-        embed.set_image(url=message.attachments[0].url)
+    emoji, count = await _starboard_best_reaction(message, config)
+    if emoji is None or count < int(config.get("threshold") or 3):
+        return
 
+    _STARBOARD_INFLIGHT.add(payload.message_id)
     try:
-        star_message = await board.send(
-            f"{config.get('emoji', '⭐')} **{reaction.count}** · {source.mention}", embed=embed
-        )
-    except discord.DiscordException as exc:
-        bot.log_error("starboard", exc)
-        return
+        hook: Optional[discord.Webhook] = await _starboard_webhook(board)
+        if hook is None:
+            return
 
-    posted[str(payload.message_id)] = str(star_message.id)
-    if len(posted) > 200:
-        for stale in list(posted)[: len(posted) - 200]:
-            posted.pop(stale, None)
-    await bot.settings.push_fields(guild.id, {"starboard.posted": posted})
+        author: Any = message.author
+        try:
+            relayed = await hook.send(
+                content=_starboard_body(message),
+                username=_sanitize_webhook_name(getattr(author, "display_name", str(author))),
+                avatar_url=author.display_avatar.url,
+                allowed_mentions=discord.AllowedMentions.none(),
+                wait=True,
+            )
+        except discord.NotFound:
+            # Webhook was deleted out from under us - drop it and retry next time.
+            bot.starboard_webhooks.pop(board.id, None)
+            await bot.settings.push_fields(
+                guild.id, {"starboard.webhook_id": None, "starboard.webhook_token": None}
+            )
+            return
+        except discord.DiscordException as exc:
+            bot.log_error("starboard:send", exc, guild=guild)
+            return
+
+        if config.get("show_count") and relayed is not None:
+            try:
+                await board.send(
+                    f"{emoji} **{count}** \u00b7 from {source.mention}",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.DiscordException:
+                pass
+
+        posted[str(payload.message_id)] = str(getattr(relayed, "id", "1"))
+        if len(posted) > STARBOARD_MAX_POSTED:
+            for stale in list(posted)[: len(posted) - STARBOARD_MAX_POSTED]:
+                posted.pop(stale, None)
+        await bot.settings.push_fields(guild.id, {"starboard.posted": posted})
+        log.info(
+            "Starboard relayed message %s (%s x%d) in guild %s.",
+            payload.message_id,
+            emoji,
+            count,
+            guild.id,
+        )
+    finally:
+        _STARBOARD_INFLIGHT.discard(payload.message_id)
+
+
+@bot.hybrid_group(
+    name="starboard",
+    description="Relay popular messages to a highlights channel",
+    fallback="status",
+)
+@commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@commands.has_permissions(manage_guild=True)
+async def starboard_group(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+
+    config: Dict[str, Any] = _starboard_config(ctx.guild.id)
+    channel: Any = (
+        ctx.guild.get_channel(int(config["channel_id"])) if config.get("channel_id") else None
+    )
+    blocked: List[str] = [str(e) for e in (config.get("blocked_emojis") or [])]
+    ignored: List[str] = [str(c) for c in (config.get("ignored_channels") or [])]
+
+    embed: discord.Embed = discord.Embed(
+        title="\u2b50 Starboard",
+        colour=discord.Colour.gold() if config.get("enabled") else discord.Colour.greyple(),
+    )
+    embed.add_field(
+        name="State",
+        value=(
+            f"\U0001f7e2 relaying to {channel.mention}"
+            if config.get("enabled") and channel is not None
+            else "\u26aa off"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Trigger",
+        value=(
+            f"**any** emoji reaching **{config.get('threshold', 3)}** reactions\n"
+            f"author's own reaction counts: "
+            f"{'yes' if config.get('self_star') else 'no'}\n"
+            f"relay bot messages: {'yes' if config.get('allow_bots') else 'no'}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"Blocked emojis ({len(blocked)})",
+        value=" ".join(blocked[:20]) or "*none*",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"Ignored channels ({len(ignored)})",
+        value=", ".join(f"<#{c}>" for c in ignored[:15]) or "*none*",
+        inline=False,
+    )
+    embed.set_footer(
+        text="Messages are reposted through a webhook using the author's name and avatar"
+    )
+    await ctx.send(embed=embed, ephemeral=True)
+
+
+@starboard_group.command(name="set", description="Choose the highlights channel and threshold")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(
+    channel="Where highlighted messages are relayed",
+    threshold="How many of any one emoji are needed",
+)
+async def starboard_set(
+    ctx: commands.Context,
+    channel: discord.TextChannel,
+    threshold: app_commands.Range[int, 1, 100] = 3,
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+
+    permissions: discord.Permissions = channel.permissions_for(ctx.guild.me)
+    missing: List[str] = [
+        name
+        for name, ok in (
+            ("Send Messages", permissions.send_messages),
+            ("Manage Webhooks", permissions.manage_webhooks),
+        )
+        if not ok
+    ]
+    if missing:
+        return await ctx.send(
+            f"\u274c I need {', '.join(f'**{m}**' for m in missing)} in {channel.mention}. "
+            "Manage Webhooks is what lets me repost as the original author.",
+            ephemeral=True,
+        )
+
+    bot.starboard_webhooks.pop(channel.id, None)
+    saved: bool = await bot.settings.push_fields(
+        ctx.guild.id,
+        {
+            "starboard.enabled": True,
+            "starboard.channel_id": str(channel.id),
+            "starboard.threshold": int(threshold),
+            "starboard.webhook_id": None,
+            "starboard.webhook_token": None,
+        },
+    )
+    log.info("Starboard set in guild %s by %s.", ctx.guild.id, ctx.author)
+    await ctx.send(
+        f"\u2705 Starboard on \u2014 any emoji reaching **{threshold}** reactions is "
+        f"reposted to {channel.mention} as the original author."
+        + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+    )
+
+
+@starboard_group.command(name="threshold", description="How many reactions are needed")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(count="Reactions of any single emoji required")
+async def starboard_threshold(
+    ctx: commands.Context, count: app_commands.Range[int, 1, 100]
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    saved: bool = await bot.settings.push_fields(
+        ctx.guild.id, {"starboard.threshold": int(count)}
+    )
+    await ctx.send(
+        f"\u2705 Threshold set to **{int(count)}** reactions."
+        + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+    )
+
+
+@starboard_group.command(name="block", description="Stop one emoji from ever triggering")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(emoji="Emoji to block, or block again to unblock it")
+async def starboard_block(ctx: commands.Context, emoji: str) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+
+    tokens: List[str] = _parse_emoji_tokens(emoji)
+    if not tokens:
+        return await ctx.send("\u274c I couldn't read an emoji in that.", ephemeral=True)
+
+    config: Dict[str, Any] = _starboard_config(ctx.guild.id)
+    blocked: List[str] = [str(e) for e in (config.get("blocked_emojis") or [])]
+    added: List[str] = []
+    removed: List[str] = []
+    for token in tokens[:10]:
+        if token in blocked:
+            blocked.remove(token)
+            removed.append(token)
+        elif len(blocked) < 50:
+            blocked.append(token)
+            added.append(token)
+
+    saved: bool = await bot.settings.push_fields(
+        ctx.guild.id, {"starboard.blocked_emojis": blocked}
+    )
+    lines: List[str] = []
+    if added:
+        lines.append("\U0001f6ab Blocked " + " ".join(added))
+    if removed:
+        lines.append("\u2705 Unblocked " + " ".join(removed))
+    await ctx.send(
+        "\n".join(lines) + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+    )
+
+
+@starboard_group.command(name="ignore", description="Stop watching reactions in a channel")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(channel="Channel to ignore, or run again to watch it")
+async def starboard_ignore(ctx: commands.Context, channel: discord.TextChannel) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+
+    config: Dict[str, Any] = _starboard_config(ctx.guild.id)
+    ignored: List[str] = [str(c) for c in (config.get("ignored_channels") or [])]
+    if str(channel.id) in ignored:
+        ignored.remove(str(channel.id))
+        outcome: str = f"\u2705 Watching {channel.mention} again."
+    else:
+        ignored.append(str(channel.id))
+        outcome = f"\U0001f507 Reactions in {channel.mention} will be ignored."
+
+    saved: bool = await bot.settings.push_fields(
+        ctx.guild.id, {"starboard.ignored_channels": ignored}
+    )
+    await ctx.send(
+        outcome + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+    )
+
+
+@starboard_group.command(name="options", description="Self-reactions, bot messages, count line")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(
+    self_star="Count the author's own reaction toward the threshold",
+    allow_bots="Also relay messages posted by bots",
+    show_count="Post a small line naming the emoji and count under each relay",
+)
+async def starboard_options(
+    ctx: commands.Context,
+    self_star: Optional[bool] = None,
+    allow_bots: Optional[bool] = None,
+    show_count: Optional[bool] = None,
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+
+    fields: Dict[str, Any] = {}
+    if self_star is not None:
+        fields["starboard.self_star"] = bool(self_star)
+    if allow_bots is not None:
+        fields["starboard.allow_bots"] = bool(allow_bots)
+    if show_count is not None:
+        fields["starboard.show_count"] = bool(show_count)
+    if not fields:
+        return await ctx.send("\u274c Give me at least one option to change.", ephemeral=True)
+
+    saved: bool = await bot.settings.push_fields(ctx.guild.id, fields)
+    await ctx.send(
+        f"\u2705 Updated **{len(fields)}** option(s)."
+        + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+    )
+
+
+@starboard_group.command(name="off", description="Turn the starboard off")
+@commands.has_permissions(manage_guild=True)
+async def starboard_off(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    saved: bool = await bot.settings.push_fields(ctx.guild.id, {"starboard.enabled": False})
+    await ctx.send(
+        "\u2705 Starboard turned off. Your channel and settings are kept."
+        + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -8376,7 +8673,7 @@ async def _modmail_next_number(guild_id: int) -> int:
         )
         return int((counter or {}).get("value", 1))
     except PyMongoError as exc:
-        bot.log_error("modmail:counter", exc)
+        bot.log_error("ticket:counter", exc)
         return int(time.time()) % 100000
 
 
@@ -8456,7 +8753,7 @@ async def _modmail_open(
     """Create a private ticket channel. Returns (channel, problem message)."""
     config: Dict[str, Any] = _modmail_config(guild.id)
     if not config.get("enabled"):
-        return None, "Modmail isn't set up in this server yet."
+        return None, "Tickets aren't set up in this server yet."
     if str(member.id) in [str(u) for u in (config.get("blocked") or [])]:
         return None, "You can't open tickets in this server."
 
@@ -8481,7 +8778,7 @@ async def _modmail_open(
 
     staff_roles: List[discord.Role] = _modmail_staff_roles(guild, config)
     if not staff_roles:
-        return None, "No staff role is configured for modmail."
+        return None, "No staff role is configured for tickets."
 
     category: Optional[discord.CategoryChannel] = None
     if config.get("category_id"):
@@ -8527,13 +8824,13 @@ async def _modmail_open(
             name=name[:100],
             category=category,
             overwrites=overwrites,
-            topic=f"Modmail ticket #{number} for {member} ({member.id})",
-            reason=f"Modmail ticket opened by {member}",
+            topic=f"Ticket #{number} for {member} ({member.id})",
+            reason=f"Ticket opened by {member}",
         )
     except discord.Forbidden:
         return None, "I'm not allowed to create a channel there."
     except discord.HTTPException as exc:
-        bot.log_error("modmail:create", exc, guild=guild, user=member)
+        bot.log_error("ticket:create", exc, guild=guild, user=member)
         return None, "Discord refused to create the ticket channel."
 
     _MODMAIL_LAST_OPEN[key] = now
@@ -8567,7 +8864,7 @@ async def _modmail_open(
         )
         await opener.pin(reason="Ticket header")
     except discord.DiscordException as exc:
-        bot.log_error("modmail:header", exc, guild=guild, user=member)
+        bot.log_error("ticket:header", exc, guild=guild, user=member)
 
     tickets: Dict[str, Any] = dict(config.get("tickets") or {})
     tickets[str(channel.id)] = {
@@ -8575,11 +8872,12 @@ async def _modmail_open(
         "number": number,
         "opened_at": int(now),
         "closed": False,
+        "participants": [str(member.id)],
     }
     await bot.settings.push_fields(guild.id, {"modmail.tickets": tickets})
 
     log.info(
-        "Modmail ticket #%d opened in guild %s by %s (channel %s).",
+        "Ticket #%d opened in guild %s by %s (channel %s).",
         number,
         guild.id,
         member,
@@ -8594,7 +8892,7 @@ async def _modmail_open(
     return channel, ""
 
 
-async def _modmail_transcript(channel: discord.TextChannel) -> Optional[discord.File]:
+async def _ticket_transcript_text(channel: discord.TextChannel) -> Optional[str]:
     """Plain-text transcript of a ticket, oldest first."""
     try:
         lines: List[str] = []
@@ -8608,11 +8906,39 @@ async def _modmail_transcript(channel: discord.TextChannel) -> Optional[discord.
             lines.append(f"[{stamp}] {message.author}: {body}")
         if not lines:
             return None
-        payload: bytes = "\n".join(lines).encode("utf-8")
-        return discord.File(io.BytesIO(payload), filename=f"{channel.name}.txt")
+        return "\n".join(lines)
     except discord.DiscordException as exc:
-        bot.log_error("modmail:transcript", exc, guild=channel.guild)
+        bot.log_error("ticket:transcript", exc, guild=channel.guild)
         return None
+
+
+def _transcript_file(text: str, name: str) -> discord.File:
+    """A fresh File per recipient - a BytesIO can only be sent once."""
+    return discord.File(io.BytesIO(text.encode("utf-8")), filename=f"{name}.txt")
+
+
+async def _ticket_delete_later(
+    channel: discord.TextChannel, delay: int, number: Any
+) -> None:
+    """Delete a closed ticket channel after the configured grace period."""
+    await asyncio.sleep(max(1, delay))
+    guild: discord.Guild = channel.guild
+    try:
+        await channel.delete(reason=f"Ticket #{number} closed")
+        log.info("Ticket #%s channel deleted in guild %s.", number, guild.id)
+    except discord.NotFound:
+        pass
+    except discord.Forbidden:
+        log.warning("Can't delete ticket channel %s - missing permissions.", channel.id)
+        return
+    except discord.HTTPException as exc:
+        bot.log_error("ticket:delete", exc, guild=guild)
+        return
+
+    config: Dict[str, Any] = _modmail_config(guild.id)
+    tickets: Dict[str, Any] = dict(config.get("tickets") or {})
+    if tickets.pop(str(channel.id), None) is not None:
+        await bot.settings.push_fields(guild.id, {"modmail.tickets": tickets})
 
 
 async def _modmail_close(
@@ -8633,10 +8959,13 @@ async def _modmail_close(
 
     number: Any = record.get("number", "?")
     opener: Optional[discord.Member] = guild.get_member(int(record.get("user_id") or 0))
+    participants: List[str] = [
+        str(p) for p in (record.get("participants") or [record.get("user_id")]) if p
+    ]
 
-    transcript: Optional[discord.File] = None
-    if config.get("transcripts"):
-        transcript = await _modmail_transcript(channel)
+    transcript_text: Optional[str] = None
+    if config.get("transcripts") or config.get("dm_transcript"):
+        transcript_text = await _ticket_transcript_text(channel)
 
     closing: discord.Embed = discord.Embed(
         title=f"\U0001f512 Ticket #{number} closed",
@@ -8645,18 +8974,36 @@ async def _modmail_close(
         timestamp=datetime.now(timezone.utc),
     )
     closing.add_field(name="Closed by", value=f"{closed_by.mention} (`{closed_by}`)", inline=True)
+
+    delete_after: int = int(config.get("delete_after") or 0)
+    if delete_after > 0:
+        closing.set_footer(text=f"This channel will be deleted in {delete_after} seconds.")
     try:
         await channel.send(embed=closing, allowed_mentions=discord.AllowedMentions.none())
     except discord.DiscordException:
         pass
 
-    if opener is not None:
-        try:
-            await channel.set_permissions(
-                opener, overwrite=None, reason="Ticket closed"
+    # Notify everyone who had access, with the transcript when enabled.
+    if config.get("dm_transcript"):
+        for raw_id in participants[:15]:
+            recipient: Optional[discord.abc.User] = guild.get_member(int(raw_id))
+            if recipient is None:
+                try:
+                    recipient = await bot.fetch_user(int(raw_id))
+                except discord.DiscordException:
+                    continue
+            attachment: Optional[discord.File] = (
+                _transcript_file(transcript_text, channel.name) if transcript_text else None
             )
-        except discord.DiscordException as exc:
-            bot.log_error("modmail:revoke", exc, guild=guild, user=opener)
+            try:
+                await recipient.send(
+                    f"Your ticket **#{number}** in **{guild.name}** has been closed.\n"
+                    f"**Reason:** {discord.utils.escape_mentions(reason)[:500]}",
+                    file=attachment,
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+    elif opener is not None:
         try:
             await opener.send(
                 f"Your ticket **#{number}** in **{guild.name}** has been closed.\n"
@@ -8665,11 +9012,11 @@ async def _modmail_close(
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-    if not channel.name.startswith("closed-"):
+    if opener is not None:
         try:
-            await channel.edit(name=f"closed-{channel.name}"[:100], reason="Ticket closed")
-        except discord.DiscordException:
-            pass
+            await channel.set_permissions(opener, overwrite=None, reason="Ticket closed")
+        except discord.DiscordException as exc:
+            bot.log_error("ticket:revoke", exc, guild=guild, user=opener)
 
     record["closed"] = True
     record["closed_at"] = int(time.time())
@@ -8686,29 +9033,44 @@ async def _modmail_close(
         try:
             await log_channel.send(
                 embed=closing,
-                file=transcript,
+                file=(
+                    _transcript_file(transcript_text, channel.name)
+                    if (transcript_text and config.get("transcripts"))
+                    else None
+                ),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except discord.DiscordException as exc:
-            bot.log_error("modmail:log", exc, guild=guild)
+            bot.log_error("ticket:log", exc, guild=guild)
 
     await send_modlog(
         guild,
         f"\U0001f512 Ticket #{number} closed",
-        f"{channel.mention} was closed by {closed_by.mention}.",
+        f"`{channel.name}` was closed by {closed_by.mention}.",
         discord.Color.greyple(),
     )
-    log.info("Modmail ticket #%s closed in guild %s by %s.", number, guild.id, closed_by)
+    log.info("Ticket #%s closed in guild %s by %s.", number, guild.id, closed_by)
+
+    if delete_after > 0:
+        bot.spawn(
+            _ticket_delete_later(channel, delete_after, number),
+            name=f"ticketdelete:{channel.id}",
+        )
+    elif not channel.name.startswith("closed-"):
+        try:
+            await channel.edit(name=f"closed-{channel.name}"[:100], reason="Ticket closed")
+        except discord.DiscordException:
+            pass
     return True
 
 
 @bot.hybrid_group(
-    name="modmail",
-    description="Private staff tickets opened from a button panel",
+    name="ticket",
+    description="Private staff tickets members open from a button panel",
     fallback="status",
 )
 @commands.guild_only()
-async def modmail_group(ctx: commands.Context) -> None:
+async def ticket_group(ctx: commands.Context) -> None:
     config: Dict[str, Any] = _modmail_config(ctx.guild.id)
     is_staff: bool = member_has_perms(ctx.author, manage_messages=True)
 
@@ -8719,9 +9081,9 @@ async def modmail_group(ctx: commands.Context) -> None:
                 f"\U0001f4e8 Your open ticket: <#{existing}>", ephemeral=True
             )
         state: str = (
-            "Press the **Open a ticket** button on the modmail panel to reach staff."
+            "Press the **Open a ticket** button on the ticket panel to reach staff."
             if config.get("enabled")
-            else "Modmail isn't set up in this server yet."
+            else "Tickets aren't set up in this server yet."
         )
         return await ctx.send(state, ephemeral=True)
 
@@ -8732,7 +9094,7 @@ async def modmail_group(ctx: commands.Context) -> None:
     staff_roles: List[discord.Role] = _modmail_staff_roles(ctx.guild, config)
 
     embed: discord.Embed = discord.Embed(
-        title="\U0001f4e8 Modmail",
+        title="\U0001f4e8 Tickets",
         color=discord.Color.blurple() if config.get("enabled") else discord.Color.greyple(),
     )
     embed.add_field(
@@ -8757,12 +9119,12 @@ async def modmail_group(ctx: commands.Context) -> None:
         ]
         embed.add_field(name="Currently open", value="\n".join(listing)[:1024], inline=False)
     embed.set_footer(
-        text=f"{ctx.clean_prefix}modmail setup \u00b7 {ctx.clean_prefix}modmail panel"
+        text=f"{ctx.clean_prefix}ticket setup \u00b7 {ctx.clean_prefix}ticket panel"
     )
     await ctx.send(embed=embed, ephemeral=True)
 
 
-@modmail_group.command(name="setup", description="Configure modmail staff role and category")
+@ticket_group.command(name="setup", description="Configure the ticket staff role and category")
 @app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
 @app_commands.describe(
@@ -8772,7 +9134,7 @@ async def modmail_group(ctx: commands.Context) -> None:
     ping_staff="Ping the staff role when a ticket opens",
     transcripts="Attach a text transcript when a ticket closes",
 )
-async def modmail_setup(
+async def ticket_setup(
     ctx: commands.Context,
     staff_role: discord.Role,
     category: Optional[discord.CategoryChannel] = None,
@@ -8784,7 +9146,7 @@ async def modmail_setup(
         return await ctx.send("\u274c You need Administrator permission.", ephemeral=True)
     if not ctx.guild.me.guild_permissions.manage_channels:
         return await ctx.send(
-            "\u274c I need the **Manage Channels** permission before modmail will work.",
+            "\u274c I need the **Manage Channels** permission before tickets will work.",
             ephemeral=True,
         )
 
@@ -8797,7 +9159,7 @@ async def modmail_setup(
         "modmail.transcripts": bool(transcripts),
     }
     saved: bool = await bot.settings.push_fields(ctx.guild.id, fields)
-    log.info("Modmail configured in guild %s by %s.", ctx.guild.id, ctx.author)
+    log.info("Tickets configured in guild %s by %s.", ctx.guild.id, ctx.author)
 
     detail: str = f"Staff role {staff_role.mention}"
     if category:
@@ -8805,19 +9167,19 @@ async def modmail_setup(
     if log_channel:
         detail += f", logs to {log_channel.mention}"
     await ctx.send(
-        f"\u2705 Modmail is set up. {detail}.\n"
-        f"Post the panel with `{ctx.clean_prefix}modmail panel`."
+        f"\u2705 Tickets are set up. {detail}.\n"
+        f"Post the panel with `{ctx.clean_prefix}ticket panel`."
         + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
-@modmail_group.command(name="panel", description="Post the ticket panel with its button")
+@ticket_group.command(name="panel", description="Post the ticket panel with its button")
 @app_commands.default_permissions(manage_guild=True)
 @commands.has_permissions(manage_guild=True)
 @app_commands.describe(channel="Where to post the panel (defaults to here)")
-async def modmail_panel(
+async def ticket_panel(
     ctx: commands.Context, channel: Optional[discord.TextChannel] = None
 ) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
@@ -8825,7 +9187,7 @@ async def modmail_panel(
     config: Dict[str, Any] = _modmail_config(ctx.guild.id)
     if not config.get("enabled"):
         return await ctx.send(
-            f"\u274c Run `{ctx.clean_prefix}modmail setup` first.", ephemeral=True
+            f"\u274c Run `{ctx.clean_prefix}ticket setup` first.", ephemeral=True
         )
 
     target: discord.TextChannel = channel or ctx.channel
@@ -8839,13 +9201,13 @@ async def modmail_panel(
     except discord.Forbidden:
         return await ctx.send(f"\u274c I can't post in {target.mention}.", ephemeral=True)
     except discord.HTTPException as exc:
-        bot.log_error("modmail:panel", exc, guild=ctx.guild)
+        bot.log_error("ticket:panel", exc, guild=ctx.guild)
         return await ctx.send("\u26a0\ufe0f Discord rejected the panel message.", ephemeral=True)
 
     await ctx.send(f"\u2705 Panel posted in {target.mention}.", ephemeral=True)
 
 
-@modmail_group.command(
+@ticket_group.command(
     name="message", description="Set the panel text or the ticket welcome embed"
 )
 @app_commands.default_permissions(manage_guild=True)
@@ -8855,7 +9217,7 @@ async def modmail_panel(
     title="Embed title",
     text="Embed body. Leave empty to restore the default.",
 )
-async def modmail_message(
+async def ticket_message(
     ctx: commands.Context,
     target: Literal["panel", "welcome"],
     title: Optional[str] = None,
@@ -8895,22 +9257,88 @@ async def modmail_message(
     )
     if target == "panel":
         await ctx.send(
-            f"Re-post the panel with `{ctx.clean_prefix}modmail panel` to apply it.",
+            f"Re-post the panel with `{ctx.clean_prefix}ticket panel` to apply it.",
             ephemeral=True,
         )
 
 
-@modmail_group.command(name="close", description="Close the ticket in this channel")
+@ticket_group.command(
+    name="config", description="Auto-delete delay, transcript DMs and staff pings"
+)
+@app_commands.default_permissions(manage_guild=True)
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(
+    delete_after="Seconds before a closed ticket channel is deleted. 0 keeps it archived.",
+    dm_transcript="DM everyone who had access a copy of the transcript on close",
+    transcripts="Attach a transcript to the ticket log channel",
+    ping_staff="Ping the staff role when a ticket opens",
+)
+async def ticket_config(
+    ctx: commands.Context,
+    delete_after: Optional[app_commands.Range[int, 0, 604800]] = None,
+    dm_transcript: Optional[bool] = None,
+    transcripts: Optional[bool] = None,
+    ping_staff: Optional[bool] = None,
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+
+    fields: Dict[str, Any] = {}
+    if delete_after is not None:
+        fields["modmail.delete_after"] = int(delete_after)
+    if dm_transcript is not None:
+        fields["modmail.dm_transcript"] = bool(dm_transcript)
+    if transcripts is not None:
+        fields["modmail.transcripts"] = bool(transcripts)
+    if ping_staff is not None:
+        fields["modmail.ping_staff"] = bool(ping_staff)
+
+    if not fields:
+        config: Dict[str, Any] = _modmail_config(ctx.guild.id)
+        delay: int = int(config.get("delete_after") or 0)
+        return await ctx.send(
+            "\U0001f39f\ufe0f **Ticket settings**\n"
+            f"\u2022 Auto-delete on close: "
+            f"{f'after **{delay}s**' if delay else '**off** (channel is archived instead)'}\n"
+            f"\u2022 DM transcript to participants: "
+            f"**{'on' if config.get('dm_transcript') else 'off'}**\n"
+            f"\u2022 Transcript in the log channel: "
+            f"**{'on' if config.get('transcripts') else 'off'}**\n"
+            f"\u2022 Ping staff on open: **{'on' if config.get('ping_staff') else 'off'}**",
+            ephemeral=True,
+        )
+
+    saved: bool = await bot.settings.push_fields(ctx.guild.id, fields)
+    log.info("Ticket config updated in guild %s by %s.", ctx.guild.id, ctx.author)
+    notes: List[str] = []
+    if delete_after is not None:
+        notes.append(
+            f"closed tickets are deleted after **{int(delete_after)}s**"
+            if int(delete_after) > 0
+            else "closed tickets are **archived**, not deleted"
+        )
+    if dm_transcript is not None:
+        notes.append(
+            f"transcript DMs **{'on' if dm_transcript else 'off'}**"
+        )
+    await ctx.send(
+        f"\u2705 Updated **{len(fields)}** setting(s)."
+        + (" \u2014 " + "; ".join(notes) if notes else "")
+        + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+    )
+
+@ticket_group.command(name="close", description="Close the ticket in this channel")
 @commands.guild_only()
 @app_commands.describe(reason="Why the ticket is being closed")
-async def modmail_close(
+async def ticket_close_cmd(
     ctx: commands.Context, *, reason: Optional[str] = "No reason given"
 ) -> None:
     config: Dict[str, Any] = _modmail_config(ctx.guild.id)
     record: Optional[Dict[str, Any]] = (config.get("tickets") or {}).get(str(ctx.channel.id))
     if record is None or record.get("closed"):
         return await ctx.send(
-            "\u274c This channel isn't an open modmail ticket.", ephemeral=True
+            "\u274c This channel isn't an open ticket.", ephemeral=True
         )
     if str(ctx.author.id) != str(record.get("user_id")) and not member_has_perms(
         ctx.author, manage_messages=True
@@ -8929,18 +9357,18 @@ async def modmail_close(
         await ctx.send("\u26a0\ufe0f I couldn't close that ticket.", ephemeral=True)
 
 
-@modmail_group.command(name="add", description="Give another member access to this ticket")
+@ticket_group.command(name="add", description="Give another member access to this ticket")
 @app_commands.default_permissions(manage_messages=True)
 @commands.has_permissions(manage_messages=True)
 @app_commands.describe(user="Who to add to this ticket")
-async def modmail_add(ctx: commands.Context, user: discord.Member) -> None:
+async def ticket_add(ctx: commands.Context, user: discord.Member) -> None:
     if not member_has_perms(ctx.author, manage_messages=True):
         return await ctx.send(
             "\u274c You need the **Manage Messages** permission.", ephemeral=True
         )
     config: Dict[str, Any] = _modmail_config(ctx.guild.id)
     if str(ctx.channel.id) not in (config.get("tickets") or {}):
-        return await ctx.send("\u274c This channel isn't a modmail ticket.", ephemeral=True)
+        return await ctx.send("\u274c This channel isn't a ticket channel.", ephemeral=True)
     try:
         await ctx.channel.set_permissions(
             user,
@@ -8952,14 +9380,24 @@ async def modmail_add(ctx: commands.Context, user: discord.Member) -> None:
         )
     except discord.Forbidden:
         return await ctx.send("\u274c I can't change permissions here.", ephemeral=True)
+
+    tickets: Dict[str, Any] = dict(config.get("tickets") or {})
+    record: Dict[str, Any] = dict(tickets.get(str(ctx.channel.id)) or {})
+    people: List[str] = [str(p) for p in (record.get("participants") or []) if p]
+    if str(user.id) not in people:
+        people.append(str(user.id))
+        record["participants"] = people
+        tickets[str(ctx.channel.id)] = record
+        await bot.settings.push_fields(ctx.guild.id, {"modmail.tickets": tickets})
+
     await ctx.send(f"\u2705 {user.mention} can now see this ticket.", ephemeral=True)
 
 
-@modmail_group.command(name="block", description="Stop a member from opening tickets")
+@ticket_group.command(name="block", description="Stop a member from opening tickets")
 @app_commands.default_permissions(manage_guild=True)
 @commands.has_permissions(manage_guild=True)
 @app_commands.describe(user="Who to block or unblock")
-async def modmail_block(ctx: commands.Context, user: discord.Member) -> None:
+async def ticket_block(ctx: commands.Context, user: discord.Member) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
     config: Dict[str, Any] = _modmail_config(ctx.guild.id)
@@ -8973,12 +9411,490 @@ async def modmail_block(ctx: commands.Context, user: discord.Member) -> None:
         outcome = f"\U0001f6ab {user.mention} can no longer open tickets."
 
     saved: bool = await bot.settings.push_fields(ctx.guild.id, {"modmail.blocked": blocked})
-    log.info("Modmail block toggled for %s in guild %s.", user.id, ctx.guild.id)
+    log.info("Ticket block toggled for %s in guild %s.", user.id, ctx.guild.id)
     await ctx.send(
         outcome + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Welcomer / leaver greetings
+# --------------------------------------------------------------------------- #
+
+GREETER_KEYS: Dict[str, Dict[str, str]] = {
+    "welcome": {
+        "label": "Welcomer",
+        "icon": "\U0001f44b",
+        "event": "joins",
+        "command": "welcomer",
+        "default": "\U0001f44b Welcome {mention} to **{server}** \u2014 you're our {ordinal} member!",
+    },
+    "goodbye": {
+        "label": "Leaver",
+        "icon": "\U0001f6aa",
+        "event": "leaves",
+        "command": "leaver",
+        "default": "\U0001f6aa **{user}** left **{server}**. {count} members remain.",
+    },
+}
+
+GREETER_PLACEHOLDERS: str = (
+    "`{mention}` `{user}` `{tag}` `{id}` `{server}` `{count}` `{ordinal}` "
+    "`{created}` `{joined}` `{avatar}`"
+)
+
+
+def _ordinal(number: int) -> str:
+    """1 -> 1st, 2 -> 2nd, 13 -> 13th."""
+    if 10 <= (number % 100) <= 20:
+        suffix: str = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
+    return f"{number}{suffix}"
+
+
+def _format_member_message(template: str, member: discord.Member) -> str:
+    """Substitute greeter placeholders against a member."""
+    count: int = int(member.guild.member_count or 0)
+    joined: Any = getattr(member, "joined_at", None) or discord.utils.utcnow()
+    replacements: Dict[str, str] = {
+        "{mention}": member.mention,
+        "{user}": member.display_name,
+        "{tag}": str(member),
+        "{id}": str(member.id),
+        "{server}": member.guild.name,
+        "{count}": str(count),
+        "{ordinal}": _ordinal(count),
+        "{created}": f"<t:{int(member.created_at.timestamp())}:R>",
+        "{joined}": f"<t:{int(joined.timestamp())}:R>",
+        "{avatar}": member.display_avatar.url,
+    }
+    text: str = template or ""
+    for token, value in replacements.items():
+        text = text.replace(token, value)
+    return text[:2000]
+
+
+def _greeter_config(guild_id: int, key: str) -> Dict[str, Any]:
+    stored: Dict[str, Any] = bot.settings.peek_settings(guild_id).get(key) or {}
+    config: Dict[str, Any] = copy.deepcopy(DEFAULT_SETTINGS[key])
+    for field, value in stored.items():
+        if field in config:
+            config[field] = value
+    return config
+
+
+def _greeter_colour(raw: Any) -> discord.Colour:
+    try:
+        return discord.Colour(int(str(raw).lstrip("#"), 16))
+    except (TypeError, ValueError):
+        return discord.Colour.blurple()
+
+
+def _render_greeter(
+    config: Dict[str, Any], member: discord.Member, key: str
+) -> Tuple[str, Optional[discord.Embed]]:
+    """Build the outgoing content and embed for one greeting."""
+    template: str = str(config.get("message") or GREETER_KEYS[key]["default"])
+    body: str = _format_member_message(template, member)
+
+    if not config.get("embed"):
+        return body, None
+
+    embed: discord.Embed = discord.Embed(
+        description=body,
+        colour=_greeter_colour(config.get("color")),
+        timestamp=datetime.now(timezone.utc),
+    )
+    title: str = str(config.get("title") or "")
+    if title:
+        embed.title = _format_member_message(title, member)[:256]
+    if config.get("thumbnail"):
+        embed.set_thumbnail(url=member.display_avatar.url)
+    image: str = str(config.get("image") or "")
+    if image.startswith("http"):
+        embed.set_image(url=image)
+    embed.set_footer(text=f"{member} \u00b7 {member.id}")
+
+    content: str = member.mention if config.get("ping") and key == "welcome" else ""
+    return content, embed
+
+
+async def _fire_greeter(member: discord.Member, key: str) -> None:
+    config: Dict[str, Any] = _greeter_config(member.guild.id, key)
+    if not config.get("enabled") or not config.get("channel_id"):
+        return
+    channel: Any = member.guild.get_channel(int(config["channel_id"]))
+    if not isinstance(channel, discord.TextChannel):
+        return
+    permissions: discord.Permissions = channel.permissions_for(member.guild.me)
+    if not permissions.send_messages:
+        return
+    if config.get("embed") and not permissions.embed_links:
+        config = dict(config)
+        config["embed"] = False
+
+    content, embed = _render_greeter(config, member, key)
+    try:
+        await channel.send(
+            content or None,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except discord.DiscordException as exc:
+        bot.log_error(key, exc, guild=member.guild, user=member)
+
+    dm_text: str = str(config.get("dm_message") or "")
+    if key == "welcome" and dm_text:
+        try:
+            await member.send(_format_member_message(dm_text, member))
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+@bot.listen("on_member_join")
+async def _welcome_listener(member: discord.Member) -> None:
+    if member.bot:
+        return
+    await _fire_greeter(member, "welcome")
+
+
+@bot.listen("on_member_remove")
+async def _goodbye_listener(member: discord.Member) -> None:
+    if member.bot:
+        return
+    await _fire_greeter(member, "goodbye")
+
+
+async def _greeter_status(ctx: commands.Context, key: str) -> None:
+    meta: Dict[str, str] = GREETER_KEYS[key]
+    config: Dict[str, Any] = _greeter_config(ctx.guild.id, key)
+    channel: Any = (
+        ctx.guild.get_channel(int(config["channel_id"])) if config.get("channel_id") else None
+    )
+
+    embed: discord.Embed = discord.Embed(
+        title=f"{meta['icon']} {meta['label']}",
+        colour=discord.Colour.green() if config.get("enabled") else discord.Colour.greyple(),
+    )
+    embed.add_field(
+        name="State",
+        value=(
+            f"\U0001f7e2 posting in {channel.mention}"
+            if config.get("enabled") and channel is not None
+            else "\u26aa off"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Style",
+        value=(
+            f"embed: {'on' if config.get('embed') else 'off'}\n"
+            f"thumbnail: {'on' if config.get('thumbnail') else 'off'}\n"
+            + (f"ping on join: {'on' if config.get('ping') else 'off'}" if key == "welcome" else "")
+        ).strip(),
+        inline=True,
+    )
+    embed.add_field(
+        name="Message",
+        value=f"```{str(config.get('message') or meta['default'])[:400]}```",
+        inline=False,
+    )
+    if key == "welcome" and config.get("dm_message"):
+        embed.add_field(
+            name="Also DMs them",
+            value=f"```{str(config['dm_message'])[:300]}```",
+            inline=False,
+        )
+    embed.set_footer(
+        text=f"{ctx.clean_prefix}{meta['command']} test to preview it on yourself"
+    )
+    await ctx.send(embed=embed, ephemeral=True)
+
+
+async def _greeter_set(
+    ctx: commands.Context,
+    key: str,
+    channel: discord.TextChannel,
+    message: Optional[str],
+) -> None:
+    meta: Dict[str, str] = GREETER_KEYS[key]
+    permissions: discord.Permissions = channel.permissions_for(ctx.guild.me)
+    if not permissions.send_messages:
+        return await ctx.send(
+            f"\u274c I can't send messages in {channel.mention}.", ephemeral=True
+        )
+
+    fields: Dict[str, Any] = {
+        f"{key}.channel_id": str(channel.id),
+        f"{key}.enabled": True,
+    }
+    if message:
+        fields[f"{key}.message"] = message[:1000]
+    saved: bool = await bot.settings.push_fields(ctx.guild.id, fields)
+    log.info("%s channel set in guild %s by %s.", meta["label"], ctx.guild.id, ctx.author)
+
+    await ctx.send(
+        f"\u2705 {meta['label']} is on \u2014 messages post in {channel.mention} "
+        f"when someone {meta['event']}."
+        + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+    )
+
+
+async def _greeter_message(
+    ctx: commands.Context, key: str, message: Optional[str]
+) -> None:
+    meta: Dict[str, str] = GREETER_KEYS[key]
+    text: str = (message or meta["default"])[:1000]
+    saved: bool = await bot.settings.push_fields(ctx.guild.id, {f"{key}.message": text})
+    preview: str = _format_member_message(text, ctx.author)
+    await ctx.send(
+        f"\u2705 {meta['label']} message updated.\n**Preview:** {preview[:500]}"
+        + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def _greeter_style(
+    ctx: commands.Context,
+    key: str,
+    embed_mode: Optional[bool],
+    title: Optional[str],
+    colour: Optional[str],
+    image: Optional[str],
+    thumbnail: Optional[bool],
+    ping: Optional[bool],
+) -> None:
+    fields: Dict[str, Any] = {}
+    if embed_mode is not None:
+        fields[f"{key}.embed"] = bool(embed_mode)
+    if title is not None:
+        fields[f"{key}.title"] = title[:200]
+    if thumbnail is not None:
+        fields[f"{key}.thumbnail"] = bool(thumbnail)
+    if ping is not None and key == "welcome":
+        fields[f"{key}.ping"] = bool(ping)
+    if image is not None:
+        if image and not image.startswith("http"):
+            return await ctx.send("\u274c The image must be a direct URL.", ephemeral=True)
+        fields[f"{key}.image"] = image[:400]
+    if colour is not None:
+        cleaned: str = colour.strip().lstrip("#")
+        try:
+            int(cleaned, 16)
+        except ValueError:
+            return await ctx.send(
+                "\u274c Give me a hex colour like `5865F2`.", ephemeral=True
+            )
+        fields[f"{key}.color"] = cleaned[:6]
+
+    if not fields:
+        return await ctx.send("\u274c Give me at least one thing to change.", ephemeral=True)
+    saved: bool = await bot.settings.push_fields(ctx.guild.id, fields)
+    await ctx.send(
+        f"\u2705 Updated **{len(fields)}** style setting(s)."
+        + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+    )
+
+
+async def _greeter_test(ctx: commands.Context, key: str) -> None:
+    meta: Dict[str, str] = GREETER_KEYS[key]
+    config: Dict[str, Any] = _greeter_config(ctx.guild.id, key)
+    content, embed = _render_greeter(config, ctx.author, key)
+    await ctx.send(
+        content=f"**Preview \u2014 {meta['label']}**\n{content}".strip(),
+        embed=embed,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def _greeter_off(ctx: commands.Context, key: str) -> None:
+    meta: Dict[str, str] = GREETER_KEYS[key]
+    saved: bool = await bot.settings.push_fields(ctx.guild.id, {f"{key}.enabled": False})
+    await ctx.send(
+        f"\u2705 {meta['label']} turned off. Your message and styling are kept."
+        + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+    )
+
+
+@bot.hybrid_group(
+    name="welcomer",
+    description="Greet members when they join",
+    fallback="status",
+)
+@app_commands.default_permissions(manage_guild=True)
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def welcomer_group(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await _greeter_status(ctx, "welcome")
+
+
+@welcomer_group.command(name="set", description="Choose the channel joins are announced in")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(
+    channel="Where to post the greeting",
+    message=f"Optional greeting text. Placeholders: {GREETER_PLACEHOLDERS}",
+)
+async def welcomer_set(
+    ctx: commands.Context, channel: discord.TextChannel, *, message: Optional[str] = None
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await _greeter_set(ctx, "welcome", channel, message)
+
+
+@welcomer_group.command(name="message", description="Set the join greeting text")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(message=f"Leave empty to restore the default. {GREETER_PLACEHOLDERS}")
+async def welcomer_message(ctx: commands.Context, *, message: Optional[str] = None) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await _greeter_message(ctx, "welcome", message)
+
+
+@welcomer_group.command(name="style", description="Embed, colour, image and ping options")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(
+    embed="Send as an embed instead of plain text",
+    title="Embed title",
+    colour="Hex colour, e.g. 5865F2",
+    image="Direct image URL for the embed banner",
+    thumbnail="Show the member's avatar as the thumbnail",
+    ping="Mention the member so they get a notification",
+)
+async def welcomer_style(
+    ctx: commands.Context,
+    embed: Optional[bool] = None,
+    title: Optional[str] = None,
+    colour: Optional[str] = None,
+    image: Optional[str] = None,
+    thumbnail: Optional[bool] = None,
+    ping: Optional[bool] = None,
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await _greeter_style(ctx, "welcome", embed, title, colour, image, thumbnail, ping)
+
+
+@welcomer_group.command(name="dm", description="Also DM new members a private message")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(message="Leave empty to stop DMing new members")
+async def welcomer_dm(ctx: commands.Context, *, message: Optional[str] = None) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    saved: bool = await bot.settings.push_fields(
+        ctx.guild.id, {"welcome.dm_message": (message or "")[:1000]}
+    )
+    body: str = (
+        f"\u2705 New members will also be DMed:\n{_format_member_message(message, ctx.author)[:500]}"
+        if message
+        else "\u2705 Welcome DMs turned off."
+    )
+    await ctx.send(
+        body + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@welcomer_group.command(name="test", description="Preview the greeting on yourself")
+@commands.has_permissions(manage_guild=True)
+async def welcomer_test(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await _greeter_test(ctx, "welcome")
+
+
+@welcomer_group.command(name="off", description="Stop announcing joins")
+@commands.has_permissions(manage_guild=True)
+async def welcomer_off(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await _greeter_off(ctx, "welcome")
+
+
+@bot.hybrid_group(
+    name="leaver",
+    description="Announce members when they leave",
+    fallback="status",
+)
+@app_commands.default_permissions(manage_guild=True)
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def leaver_group(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await _greeter_status(ctx, "goodbye")
+
+
+@leaver_group.command(name="set", description="Choose the channel leaves are announced in")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(
+    channel="Where to post the farewell",
+    message=f"Optional farewell text. Placeholders: {GREETER_PLACEHOLDERS}",
+)
+async def leaver_set(
+    ctx: commands.Context, channel: discord.TextChannel, *, message: Optional[str] = None
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await _greeter_set(ctx, "goodbye", channel, message)
+
+
+@leaver_group.command(name="message", description="Set the leave announcement text")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(message=f"Leave empty to restore the default. {GREETER_PLACEHOLDERS}")
+async def leaver_message(ctx: commands.Context, *, message: Optional[str] = None) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await _greeter_message(ctx, "goodbye", message)
+
+
+@leaver_group.command(name="style", description="Embed, colour and image options")
+@commands.has_permissions(manage_guild=True)
+@app_commands.describe(
+    embed="Send as an embed instead of plain text",
+    title="Embed title",
+    colour="Hex colour, e.g. ED4245",
+    image="Direct image URL for the embed banner",
+    thumbnail="Show the member's avatar as the thumbnail",
+)
+async def leaver_style(
+    ctx: commands.Context,
+    embed: Optional[bool] = None,
+    title: Optional[str] = None,
+    colour: Optional[str] = None,
+    image: Optional[str] = None,
+    thumbnail: Optional[bool] = None,
+) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await _greeter_style(ctx, "goodbye", embed, title, colour, image, thumbnail, None)
+
+
+@leaver_group.command(name="test", description="Preview the farewell on yourself")
+@commands.has_permissions(manage_guild=True)
+async def leaver_test(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await _greeter_test(ctx, "goodbye")
+
+
+@leaver_group.command(name="off", description="Stop announcing leaves")
+@commands.has_permissions(manage_guild=True)
+async def leaver_off(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send("\u274c You need the **Manage Server** permission.", ephemeral=True)
+    await _greeter_off(ctx, "goodbye")
 
 
 if __name__ == "__main__":
