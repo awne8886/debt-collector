@@ -5944,13 +5944,13 @@ async def _handle_automod(message: discord.Message) -> bool:
     bot.automod_strikes[strike_key] = strikes
 
     try:
-        notice = await message.channel.send(
+        await message.channel.send(
             f"🛡️ {message.author.mention} — that message was removed ({violation}).",
             delete_after=6.0,
             allowed_mentions=discord.AllowedMentions(users=True),
         )
     except discord.DiscordException:
-        notice = None
+        pass
 
     await send_modlog(
         message.guild,
@@ -9480,9 +9480,9 @@ def _format_member_message(template: str, member: discord.Member) -> str:
 def _greeter_config(guild_id: int, key: str) -> Dict[str, Any]:
     stored: Dict[str, Any] = bot.settings.peek_settings(guild_id).get(key) or {}
     config: Dict[str, Any] = copy.deepcopy(DEFAULT_SETTINGS[key])
-    for field, value in stored.items():
-        if field in config:
-            config[field] = value
+    for setting_field, value in stored.items():
+        if setting_field in config:
+            config[setting_field] = value
     return config
 
 
