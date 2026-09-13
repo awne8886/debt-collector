@@ -84,7 +84,7 @@ class TestAIRateLimitHandling(unittest.IsolatedAsyncioTestCase):
             mock_bot.user.id = 999
             mock_bot.user.display_name = "BotName"
             mock_bot.user.mentioned_in.return_value = True
-            mock_bot.settings.get_settings.return_value = {"prefix": "!"}
+            mock_bot.settings.peek_settings.return_value = {"prefix": "!"}
             mock_bot.ai_active_conversations = {}
             mock_bot.ai_next_fire = {}
             mock_bot.ai_locks = {}
@@ -134,7 +134,7 @@ class TestAITargeting(unittest.IsolatedAsyncioTestCase):
 
             mock_bot.user = MagicMock(id=999, display_name="BotName")
             mock_bot.user.mentioned_in.return_value = True
-            mock_bot.settings.get_settings.return_value = {"prefix": "!"}
+            mock_bot.settings.peek_settings.return_value = {"prefix": "!"}
             mock_bot.ai_active_conversations = {}
             mock_bot.ai_next_fire = {}
             mock_bot.ai_locks = {}
@@ -185,7 +185,7 @@ class TestConcurrentAIMessages(unittest.IsolatedAsyncioTestCase):
 
             mock_bot.user = MagicMock(id=999, display_name="BotName")
             mock_bot.user.mentioned_in.return_value = True
-            mock_bot.settings.get_settings.return_value = {"prefix": "!"}
+            mock_bot.settings.peek_settings.return_value = {"prefix": "!"}
             mock_bot.ai_active_conversations = {}
             mock_bot.ai_next_fire = {}
             mock_bot.ai_locks = {}
