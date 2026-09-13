@@ -1435,6 +1435,23 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
             bot.log_error("reactionrole:remove", exc, guild=guild, user=member)
 
 
+
+async def _cache_single_attachment(message_id: int, attachment: discord.Attachment) -> None:
+    try:
+        data = await attachment.read()
+        if not hasattr(bot, "attachment_cache"):
+            bot.attachment_cache = {}
+        if message_id not in bot.attachment_cache:
+            bot.attachment_cache[message_id] = []
+        bot.attachment_cache[message_id].append({
+            "filename": attachment.filename,
+            "content_type": attachment.content_type,
+            "data": data,
+        })
+    except Exception as exc:
+        log.debug("Failed to cache attachment: %s", exc)
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot or message.guild is None:
@@ -2609,6 +2626,7 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "screening test": "Score an existing member as if they had just joined, without acting.",
     "messagelog": "Log edited and deleted messages as embeds in a channel.",
     "messagelog ignore": "Stop or resume logging one channel.",
+    "messagelog cache": "Hold deleted attachments in memory to prevent broken images.",
     "ticket": "Private staff tickets members open from a button panel.",
     "ticket setup": "Set the staff role, ticket category, log channel and ping behaviour.",
     "ticket panel": "Post the panel members press to open a ticket.",
@@ -9775,6 +9793,34 @@ async def messagelog_ignore(
     saved: bool = await bot.settings.push_fields(
         ctx.guild.id, {"messagelog.ignored_channels": ignored}
     )
+    await ctx.send(
+        outcome + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
+        ephemeral=True,
+    )
+
+
+@messagelog_group.command(
+    name="cache", description="Toggle holding deleted attachments in memory to prevent broken images"
+)
+@commands.has_permissions(manage_guild=True)
+async def messagelog_cache(ctx: commands.Context) -> None:
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send(
+            "\u274c You need the **Manage Server** permission.", ephemeral=True
+        )
+
+    config: Dict[str, Any] = _messagelog_config(ctx.guild.id)
+    cache_enabled = not config.get("cache_attachments", False)
+
+    saved = await bot.settings.push_fields(
+        ctx.guild.id, {"messagelog.cache_attachments": cache_enabled}
+    )
+
+    if cache_enabled:
+        outcome = "\u2705 I will now cache small image and video attachments to ensure they are visible if deleted."
+    else:
+        outcome = "\U0001f507 Attachment caching disabled."
+
     await ctx.send(
         outcome + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
         ephemeral=True,
