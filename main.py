@@ -1444,6 +1444,36 @@ async def on_message(message: discord.Message) -> None:
         await _handle_afk_return(message)
         await _handle_afk_mentions(message)
 
+        if message.attachments:
+            config = (
+                bot.settings.peek_settings(message.guild.id).get("messagelog") or {}
+            )
+            if config.get("cache_attachments"):
+                # limit cache size
+                if len(getattr(bot, "attachment_cache", {})) > 500:
+                    bot.attachment_cache = {}
+
+                cached_files = []
+                for a in message.attachments:
+                    if (
+                        a.content_type
+                        and (
+                            a.content_type.startswith("image/")
+                            or a.content_type.startswith("video/")
+                        )
+                        and a.size < 5_000_000
+                    ):
+                        try:
+                            # We can just store the proxy URL or bytes, but to send we need bytes.
+                            # It's better to fetch and store bytes in memory.
+                            # But wait! If we do it synchronously here we block on_message.
+                            # Let's spawn a task.
+                            bot.loop.create_task(
+                                _cache_single_attachment(message.id, a)
+                            )
+                        except Exception:
+                            pass
+
         settings: Dict[str, Any] = bot.settings.peek_settings(message.guild.id)
         autopurge: Dict[str, Any] = settings.get("autopurge") or {
             "channels": {},
@@ -1890,12 +1920,20 @@ async def ban_cmd(
     user: discord.Member,
     *,
     reason: Optional[str] = "No reason given",
+    dm: bool = False,
 ):
     if not member_has_perms(ctx.author, ban_members=True):
         return await ctx.send("❌ You need Ban Members permission.", ephemeral=True)
     err = mod_block_reason(ctx.author, user, ctx.guild.me)
     if err:
         return await ctx.send(err, ephemeral=True)
+    if dm:
+        try:
+            await user.send(
+                f"You have been banned from **{ctx.guild.name}**. Reason: {reason}"
+            )
+        except discord.DiscordException:
+            pass
     await user.ban(reason=reason)
     await ctx.send(f"🔨 **{user}** was banned. Reason: {reason}")
 
@@ -1925,12 +1963,20 @@ async def kick_cmd(
     user: discord.Member,
     *,
     reason: Optional[str] = "No reason given",
+    dm: bool = False,
 ):
     if not member_has_perms(ctx.author, kick_members=True):
         return await ctx.send("❌ You need Kick Members permission.", ephemeral=True)
     err = mod_block_reason(ctx.author, user, ctx.guild.me)
     if err:
         return await ctx.send(err, ephemeral=True)
+    if dm:
+        try:
+            await user.send(
+                f"You have been kicked from **{ctx.guild.name}**. Reason: {reason}"
+            )
+        except discord.DiscordException:
+            pass
     await user.kick(reason=reason)
     await ctx.send(f"👢 **{user}** was kicked. Reason: {reason}")
 
@@ -1944,12 +1990,20 @@ async def timeout_cmd(
     minutes: int,
     *,
     reason: Optional[str] = "No reason given",
+    dm: bool = False,
 ):
     if not member_has_perms(ctx.author, moderate_members=True):
         return await ctx.send("❌ You need Timeout permission.", ephemeral=True)
     err = mod_block_reason(ctx.author, user, ctx.guild.me)
     if err:
         return await ctx.send(err, ephemeral=True)
+    if dm:
+        try:
+            await user.send(
+                f"You have been timed out in **{ctx.guild.name}** for {minutes}m. Reason: {reason}"
+            )
+        except discord.DiscordException:
+            pass
     await user.timeout(
         discord.utils.utcnow() + timedelta(minutes=minutes), reason=reason
     )
@@ -1965,6 +2019,13 @@ async def untimeout_cmd(ctx: commands.Context, user: discord.Member):
     err = mod_block_reason(ctx.author, user, ctx.guild.me)
     if err:
         return await ctx.send(err, ephemeral=True)
+    if dm:
+        try:
+            await user.send(
+                f"You have been timed out in **{ctx.guild.name}** for {minutes}m. Reason: {reason}"
+            )
+        except discord.DiscordException:
+            pass
     await user.timeout(None)
     await ctx.send(f"🔊 **{user}**'s timeout was removed.")
 
@@ -1980,12 +2041,20 @@ async def warn_cmd(
     user: discord.Member,
     *,
     reason: Optional[str] = "No reason given",
+    dm: bool = False,
 ):
     if not member_has_perms(ctx.author, manage_messages=True):
         return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
     settings = bot.settings.get_settings(ctx.guild.id)
     warns = settings.setdefault("warns", {})
     uw = warns.setdefault(str(user.id), [])
+    if dm:
+        try:
+            await user.send(
+                f"You have been warned in **{ctx.guild.name}**. Reason: {reason}"
+            )
+        except discord.DiscordException:
+            pass
     uw.append({"reason": reason, "by": ctx.author.id, "at": int(time.time())})
     bot.settings.update_settings(ctx.guild.id, {"warns": warns})
     await ctx.send(f"⚠️ **{user}** was warned. Reason: {reason}")
@@ -5058,6 +5127,18 @@ async def _handle_ai(message: discord.Message) -> None:
             )
             return
 
+        if (
+            "I’m sorry, but I can’t help with that" in reply
+            or "I'm sorry, but I can't help with that" in reply
+        ):
+            bot.log_error(
+                "ai:refusal",
+                "AI responded with a refusal. Resetting channel history.",
+                guild=trigger_message.guild,
+            )
+            await _clear_ai_history(channel_id)
+            return
+
         safe = sanitize_mass_pings(reply)
         chunks = chunk_text(safe)
         if not chunks:
@@ -6494,34 +6575,138 @@ async def _handle_automod(message: discord.Message) -> bool:
         [("Rule", violation), ("Strikes (10 min)", str(len(strikes)))],
     )
 
-    if len(strikes) >= 3:
+    threshold = config.get("action_threshold", 3)
+    if len(strikes) >= threshold:
         bot.automod_strikes[strike_key] = []
-        settings = bot.settings.get_settings(message.guild.id)
-        warns = dict(settings.get("warns") or {})
-        entries = list(warns.get(str(message.author.id)) or [])
-        entries.append(
-            {
-                "reason": f"Automod: repeated {violation}",
-                "by": str(bot.user),
-                "at": int(time.time()),
-            }
-        )
-        warns[str(message.author.id)] = entries[-25:]
-        await bot.settings.push_fields(message.guild.id, {"warns": warns})
-        await record_case(
-            message.guild,
-            "warn",
-            bot.user,
-            message.author,
-            f"Automod: repeated {violation}",
-        )
-        try:
-            await message.channel.send(
-                f"⚠️ {message.author.mention} has been warned for repeated {violation}.",
-                allowed_mentions=discord.AllowedMentions.none(),
+        action = config.get("action", "warn")
+        duration = config.get("action_duration", 10)
+        reason = f"Automod: repeated {violation}"
+        dm_reason = config.get("dm_reason", False)
+
+        # DM reason if enabled
+        if dm_reason:
+            try:
+                await message.author.send(
+                    f"You have received a {action} in **{message.guild.name}**. Reason: {reason}"
+                )
+            except discord.DiscordException:
+                pass
+
+        # Helper to warn
+        async def apply_warn():
+            settings = bot.settings.get_settings(message.guild.id)
+            warns = dict(settings.get("warns") or {})
+            entries = list(warns.get(str(message.author.id)) or [])
+            entries.append(
+                {
+                    "reason": reason,
+                    "by": str(bot.user),
+                    "at": int(time.time()),
+                }
             )
-        except discord.DiscordException:
-            pass
+            warns[str(message.author.id)] = entries[-25:]
+            await bot.settings.push_fields(message.guild.id, {"warns": warns})
+            await record_case(message.guild, "warn", bot.user, message.author, reason)
+            try:
+                await message.channel.send(
+                    f"⚠️ {message.author.mention} has been warned for repeated {violation}.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.DiscordException:
+                pass
+
+        if action == "warn":
+            await apply_warn()
+            # Escalate if needed
+            escalate_threshold = config.get("escalate_threshold")
+            if escalate_threshold:
+                settings = bot.settings.get_settings(message.guild.id)
+                warns = settings.get("warns", {})
+                entries = warns.get(str(message.author.id), [])
+                if len(entries) >= escalate_threshold:
+                    escalate_action = config.get("escalate_action", "timeout")
+                    escalate_duration = config.get("escalate_duration", 10)
+                    action = escalate_action
+                    duration = escalate_duration
+                    reason = f"Automod: reached {escalate_threshold} warns (repeated {violation})"
+                    # Fall through to execute the escalated action
+
+        if action == "timeout":
+            try:
+                await message.author.timeout(
+                    discord.utils.utcnow() + timedelta(minutes=duration), reason=reason
+                )
+                try:
+                    await message.channel.send(
+                        f"🤐 {message.author.mention} has been timed out for {duration}m for repeated {violation}.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except discord.DiscordException:
+                    pass
+            except discord.Forbidden:
+                pass
+        elif action == "quarantine":
+            try:
+                role: Optional[discord.Role] = await _ensure_quarantine_role(
+                    message.guild
+                )
+                if role and role not in message.author.roles:
+                    removable: List[discord.Role] = [
+                        r
+                        for r in message.author.roles
+                        if not r.is_default()
+                        and not r.managed
+                        and r < message.guild.me.top_role
+                    ]
+                    snapshot: List[str] = [str(r.id) for r in removable]
+                    if removable:
+                        await message.author.remove_roles(*removable, reason=reason)
+                    await message.author.add_roles(role, reason=reason)
+                    quarantined = dict(
+                        bot.settings.peek_settings(message.guild.id).get("quarantined")
+                        or {}
+                    )
+                    quarantined[str(message.author.id)] = {
+                        "roles": snapshot,
+                        "at": int(time.time()),
+                    }
+                    await bot.settings.push_fields(
+                        message.guild.id, {"quarantined": quarantined}
+                    )
+
+                    try:
+                        await message.channel.send(
+                            f"🛑 {message.author.mention} has been quarantined for repeated {violation}.",
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except discord.DiscordException:
+                        pass
+            except discord.Forbidden:
+                pass
+        elif action == "kick":
+            try:
+                await message.author.kick(reason=reason)
+                try:
+                    await message.channel.send(
+                        f"👢 {message.author.mention} has been kicked for repeated {violation}.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except discord.DiscordException:
+                    pass
+            except discord.Forbidden:
+                pass
+        elif action == "ban":
+            try:
+                await message.author.ban(reason=reason)
+                try:
+                    await message.channel.send(
+                        f"🔨 {message.author.mention} has been banned for repeated {violation}.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except discord.DiscordException:
+                    pass
+            except discord.Forbidden:
+                pass
     return True
 
 
@@ -6563,13 +6748,13 @@ async def automod_group(ctx: commands.Context):
     name="action", description="Set what happens after repeated automod removals"
 )
 @app_commands.describe(
-    action="What to do (warn, timeout, kick, ban)",
+    action="What to do (warn, timeout, quarantine, kick, ban)",
     threshold="How many removals trigger the action (default 3)",
     duration="How long timeouts should last in minutes (default 10)",
 )
 async def automod_action(
     ctx: commands.Context,
-    action: Literal["warn", "timeout", "kick", "ban"],
+    action: Literal["warn", "timeout", "kick", "ban", "quarantine"],
     threshold: Optional[app_commands.Range[int, 1, 10]] = None,
     duration: Optional[app_commands.Range[int, 1, 1440]] = None,
 ):
@@ -6596,6 +6781,66 @@ async def automod_action(
 
     await ctx.send(
         msg if saved else msg + " (database write failed)",
+        ephemeral=True,
+    )
+
+
+@automod_group.command(
+    name="escalate", description="Set what happens after reaching a warn threshold"
+)
+@app_commands.describe(
+    threshold="How many warns trigger the action (e.g. 5)",
+    action="What to do (timeout, quarantine, kick, ban)",
+    duration="How long timeouts/quarantines should last in minutes",
+)
+async def automod_escalate(
+    ctx: commands.Context,
+    threshold: app_commands.Range[int, 1, 100],
+    action: Literal["timeout", "quarantine", "kick", "ban"],
+    duration: Optional[app_commands.Range[int, 1, 1440]] = None,
+):
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send(
+            "❌ You need the **Manage Server** permission.", ephemeral=True
+        )
+
+    fields = {
+        "automod.escalate_threshold": threshold,
+        "automod.escalate_action": action,
+    }
+    if duration is not None:
+        fields["automod.escalate_duration"] = duration
+
+    saved = await bot.settings.push_fields(ctx.guild.id, fields)
+
+    msg = f"✅ Automod will now **{action}** members after reaching **{threshold}** warnings"
+    if action in ("timeout", "quarantine") and duration:
+        msg += f" for **{duration}m**."
+    else:
+        msg += "."
+
+    await ctx.send(
+        msg if saved else msg + " (database write failed)",
+        ephemeral=True,
+    )
+
+
+@automod_group.command(
+    name="dm",
+    description="Whether automod should DM the user the reason for the action",
+)
+@app_commands.describe(state="on or off")
+async def automod_dm(ctx: commands.Context, state: Literal["on", "off"]):
+    if not member_has_perms(ctx.author, manage_guild=True):
+        return await ctx.send(
+            "❌ You need the **Manage Server** permission.", ephemeral=True
+        )
+
+    saved = await bot.settings.push_fields(
+        ctx.guild.id, {"automod.dm_reason": state == "on"}
+    )
+    await ctx.send(
+        f"{'✅' if saved else '⚠️'} Automod DM reason is now **{state}**.",
         ephemeral=True,
     )
 
@@ -8636,6 +8881,7 @@ async def quarantine_cmd(
     user: discord.Member,
     *,
     reason: Optional[str] = "No reason given",
+    dm: bool = False,
 ) -> None:
     if not member_has_perms(ctx.author, moderate_members=True):
         return await ctx.send(
@@ -8658,6 +8904,14 @@ async def quarantine_cmd(
         return await ctx.send(
             f"\u2139\ufe0f {user.mention} is already quarantined.", ephemeral=True
         )
+
+    if dm:
+        try:
+            await user.send(
+                f"You have been quarantined in **{ctx.guild.name}**. Reason: {reason}"
+            )
+        except discord.DiscordException:
+            pass
 
     removable: List[discord.Role] = [
         r
@@ -9273,12 +9527,18 @@ def _describe_attachments(items: List[Any]) -> str:
     return ", ".join(names)
 
 
-async def _post_messagelog(guild: discord.Guild, embed: discord.Embed) -> None:
+async def _post_messagelog(
+    guild: discord.Guild, embed: discord.Embed, files: List[discord.File] = None
+) -> None:
     channel: Optional[discord.TextChannel] = _messagelog_channel(guild)
     if channel is None:
         return
     try:
-        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        await channel.send(
+            embed=embed,
+            files=files or [],
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
     except discord.DiscordException as exc:
         bot.log_error("messagelog:send", exc, guild=guild)
 
@@ -9371,6 +9631,25 @@ async def messagelog_delete(payload: discord.RawMessageDeleteEvent) -> None:
             else "*no text content*"
         )
         attachments: str = _describe_attachments(list(cached.attachments))
+        files = []
+        cached_attachments = getattr(bot, "attachment_cache", {}).get(
+            payload.message_id, []
+        )
+        for i, a in enumerate(cached_attachments):
+            if a["data"]:
+                try:
+                    f = discord.File(io.BytesIO(a["data"]), filename=a["filename"])
+                    files.append(f)
+                    # We can optionally set the first image as the embed image
+                    if (
+                        i == 0
+                        and a["content_type"]
+                        and a["content_type"].startswith("image/")
+                    ):
+                        embed.set_image(url=f"attachment://{a['filename']}")
+                except Exception:
+                    pass
+
         if attachments:
             embed.add_field(name="Attachments", value=attachments[:1024], inline=False)
         if cached.stickers:
@@ -9392,7 +9671,7 @@ async def messagelog_delete(payload: discord.RawMessageDeleteEvent) -> None:
         embed.set_footer(text=f"Message ID {payload.message_id}")
 
     embed.add_field(name="Channel", value=f"<#{payload.channel_id}>", inline=True)
-    await _post_messagelog(guild, embed)
+    await _post_messagelog(guild, embed, files=files if "files" in locals() else None)
 
 
 @bot.listen("on_raw_bulk_message_delete")
