@@ -1747,6 +1747,16 @@ async def roleall_cmd(ctx: commands.Context, role: str, *, time: Optional[str] =
     success = 0
     failed = 0
 
+    try:
+        if not ctx.guild.chunked:
+            await ctx.guild.chunk()
+    except Exception as exc:
+        bot.log_error("roleall:chunk", exc, guild=ctx.guild)
+        return await ctx.send(
+            "❌ Failed to fetch all members from Discord. Please try again later.",
+            ephemeral=True,
+        )
+
     if threshold_time:
         members_to_update = [
             m
@@ -1760,7 +1770,8 @@ async def roleall_cmd(ctx: commands.Context, role: str, *, time: Optional[str] =
         try:
             await m.add_roles(resolved, reason=f"roleall by {ctx.author}")
             return True
-        except Exception:
+        except Exception as exc:
+            bot.log_error("roleall:add", exc, guild=ctx.guild, user=m)
             return False
 
     chunk_size = 10
