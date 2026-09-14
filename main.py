@@ -289,24 +289,62 @@ async def backup_guild(guild: discord.Guild, bot: commands.Bot) -> dict:
         )
 
     for category in guild.categories:
+        overwrites_data = []
+        for target, overwrite in category.overwrites.items():
+            if isinstance(target, discord.Role):
+                target_type = "role"
+            elif isinstance(target, discord.Member):
+                target_type = "member"
+            else:
+                continue
+            overwrites_data.append(
+                {
+                    "target_type": target_type,
+                    "target_id": target.id,
+                    "is_default": getattr(target, "is_default", lambda: False)(),
+                    "allow": overwrite.pair()[0].value,
+                    "deny": overwrite.pair()[1].value,
+                }
+            )
+
         backup_data["categories"].append(
             {
                 "id": category.id,
                 "name": category.name,
                 "position": category.position,
                 "nsfw": category.nsfw,
+                "overwrites": overwrites_data,
             }
         )
 
     for channel in guild.channels:
         if isinstance(channel, discord.CategoryChannel):
             continue
+        overwrites_data = []
+        for target, overwrite in channel.overwrites.items():
+            if isinstance(target, discord.Role):
+                target_type = "role"
+            elif isinstance(target, discord.Member):
+                target_type = "member"
+            else:
+                continue
+            overwrites_data.append(
+                {
+                    "target_type": target_type,
+                    "target_id": target.id,
+                    "is_default": getattr(target, "is_default", lambda: False)(),
+                    "allow": overwrite.pair()[0].value,
+                    "deny": overwrite.pair()[1].value,
+                }
+            )
+
         chan_data = {
             "id": channel.id,
             "name": channel.name,
             "position": channel.position,
             "type": str(channel.type),
             "category_id": channel.category.id if channel.category else None,
+            "overwrites": overwrites_data,
         }
         if isinstance(channel, discord.TextChannel):
             chan_data["topic"] = channel.topic
@@ -11452,7 +11490,13 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
             await channel.delete()
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("clone_server:delete_channel", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "clone_server:delete_channel",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     # Categories
     for category in ctx.guild.categories:
@@ -11460,7 +11504,13 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
             await category.delete()
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("clone_server:delete_category", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "clone_server:delete_category",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     # Roles
     for role in ctx.guild.roles:
@@ -11475,7 +11525,13 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
             await role.delete()
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("clone_server:delete_role", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "clone_server:delete_role",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     # Emojis
     for emoji in ctx.guild.emojis:
@@ -11483,10 +11539,38 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
             await emoji.delete()
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("clone_server:delete_emoji", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "clone_server:delete_emoji",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     # Dictionary to map old IDs to new IDs
     id_map = {}
+
+    def map_overwrites(old_overwrites, id_map, guild):
+        import discord
+
+        new_overwrites = {}
+        for target, overwrite in old_overwrites.items():
+            if isinstance(target, discord.Role):
+                if target.is_default():
+                    new_overwrites[guild.default_role] = overwrite
+                else:
+                    new_id = id_map.get(str(target.id))
+                    if new_id:
+                        new_role = guild.get_role(int(new_id))
+                        if new_role:
+                            new_overwrites[new_role] = overwrite
+            elif isinstance(target, discord.Member):
+                new_id = id_map.get(str(target.id))
+                if new_id:
+                    new_member = guild.get_member(int(new_id))
+                    if new_member:
+                        new_overwrites[new_member] = overwrite
+        return new_overwrites
 
     # 3. Creation Process
     # Guild Info
@@ -11500,7 +11584,13 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
             name=reference_guild.name, icon=icon_bytes, banner=banner_bytes
         )
     except Exception as e:
-        bot.log_error("clone_server:edit_guild", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+        bot.log_error(
+            "clone_server:edit_guild",
+            e,
+            guild=ctx.guild,
+            channel=ctx.channel,
+            user=ctx.author,
+        )
 
     # Roles
     roles_to_copy = [
@@ -11532,19 +11622,34 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
 
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("clone_server:create_role", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "clone_server:create_role",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     # Categories
     categories_to_copy = sorted(reference_guild.categories, key=lambda c: c.position)
     for old_cat in categories_to_copy:
         try:
             new_cat = await ctx.guild.create_category(
-                name=old_cat.name, position=old_cat.position, nsfw=old_cat.nsfw
+                name=old_cat.name,
+                position=old_cat.position,
+                nsfw=old_cat.nsfw,
+                overwrites=map_overwrites(old_cat.overwrites, id_map, ctx.guild),
             )
             id_map[str(old_cat.id)] = str(new_cat.id)
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("clone_server:create_category", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "clone_server:create_category",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     # Channels
     channels_to_copy = [
@@ -11561,6 +11666,8 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
                 if new_cat_id:
                     category = ctx.guild.get_channel(int(new_cat_id))
 
+            chan_overwrites = map_overwrites(old_chan.overwrites, id_map, ctx.guild)
+
             if isinstance(old_chan, discord.TextChannel):
                 new_chan = await ctx.guild.create_text_channel(
                     name=old_chan.name,
@@ -11569,6 +11676,7 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
                     topic=old_chan.topic,
                     nsfw=old_chan.nsfw,
                     slowmode_delay=old_chan.slowmode_delay,
+                    overwrites=chan_overwrites,
                 )
             elif isinstance(old_chan, discord.VoiceChannel):
                 new_chan = await ctx.guild.create_voice_channel(
@@ -11577,6 +11685,7 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
                     position=old_chan.position,
                     bitrate=old_chan.bitrate,
                     user_limit=old_chan.user_limit,
+                    overwrites=chan_overwrites,
                 )
             elif isinstance(old_chan, discord.StageChannel):
                 new_chan = await ctx.guild.create_stage_channel(
@@ -11584,6 +11693,7 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
                     category=category,
                     position=old_chan.position,
                     topic=old_chan.topic,
+                    overwrites=chan_overwrites,
                 )
             elif isinstance(old_chan, discord.ForumChannel):
                 new_chan = await ctx.guild.create_forum(
@@ -11592,6 +11702,7 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
                     position=old_chan.position,
                     topic=old_chan.topic,
                     nsfw=old_chan.nsfw,
+                    overwrites=chan_overwrites,
                 )
             else:
                 continue
@@ -11599,7 +11710,13 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
             id_map[str(old_chan.id)] = str(new_chan.id)
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("clone_server:create_channel", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "clone_server:create_channel",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     # Emojis
     for old_emoji in reference_guild.emojis:
@@ -11610,7 +11727,13 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
             await ctx.guild.create_custom_emoji(name=old_emoji.name, image=emoji_bytes)
             await asyncio.sleep(1)
         except Exception as e:
-            bot.log_error("clone_server:create_emoji", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "clone_server:create_emoji",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     # Migrate Settings
     try:
@@ -11642,7 +11765,13 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
         await bot.settings.push_settings(ctx.guild.id, new_settings)
 
     except Exception as e:
-        bot.log_error("clone_server:migrate_settings", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+        bot.log_error(
+            "clone_server:migrate_settings",
+            e,
+            guild=ctx.guild,
+            channel=ctx.channel,
+            user=ctx.author,
+        )
 
     # Find any existing channel to send completion ping, if we deleted all channels there might be none.
     # We should have created new channels. Let's find the first text channel.
@@ -11682,7 +11811,13 @@ async def rollback_clone(ctx: commands.Context):
             sort=[("createdAt", -1)],
         )
     except Exception as e:
-        bot.log_error("rollback_clone:fetch_backup", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+        bot.log_error(
+            "rollback_clone:fetch_backup",
+            e,
+            guild=ctx.guild,
+            channel=ctx.channel,
+            user=ctx.author,
+        )
         return await ctx.send("Failed to query backups.")
 
     if not backup:
@@ -11698,14 +11833,26 @@ async def rollback_clone(ctx: commands.Context):
             await channel.delete()
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("rollback_clone:delete_channel", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "rollback_clone:delete_channel",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     for category in ctx.guild.categories:
         try:
             await category.delete()
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("rollback_clone:delete_category", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "rollback_clone:delete_category",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     for role in ctx.guild.roles:
         if (
@@ -11719,14 +11866,26 @@ async def rollback_clone(ctx: commands.Context):
             await role.delete()
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("rollback_clone:delete_role", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "rollback_clone:delete_role",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     for emoji in ctx.guild.emojis:
         try:
             await emoji.delete()
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("rollback_clone:delete_emoji", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "rollback_clone:delete_emoji",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     id_map = {}
 
@@ -11738,7 +11897,13 @@ async def rollback_clone(ctx: commands.Context):
             banner=backup.get("banner"),
         )
     except Exception as e:
-        bot.log_error("rollback_clone:edit_guild", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+        bot.log_error(
+            "rollback_clone:edit_guild",
+            e,
+            guild=ctx.guild,
+            channel=ctx.channel,
+            user=ctx.author,
+        )
 
     bot_highest_role = ctx.guild.me.top_role
 
@@ -11758,7 +11923,41 @@ async def rollback_clone(ctx: commands.Context):
                 await new_role.edit(position=bot_highest_role.position - 1)
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("rollback_clone:create_role", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "rollback_clone:create_role",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
+
+    def restore_overwrites(overwrites_data, id_map, guild):
+        import discord
+
+        new_overwrites = {}
+        for ow_data in overwrites_data:
+            target = None
+            if ow_data.get("is_default"):
+                target = guild.default_role
+            else:
+                new_id_str = id_map.get(str(ow_data["target_id"]))
+                if not new_id_str:
+                    continue
+
+                new_id = int(new_id_str)
+                if ow_data["target_type"] == "role":
+                    target = guild.get_role(new_id)
+                elif ow_data["target_type"] == "member":
+                    target = guild.get_member(new_id)
+
+            if target:
+                allow = discord.Permissions(ow_data["allow"])
+                deny = discord.Permissions(ow_data["deny"])
+                new_overwrites[target] = discord.PermissionOverwrite.from_pair(
+                    allow, deny
+                )
+
+        return new_overwrites
 
     categories_data = backup.get("categories", [])
     categories_data.sort(key=lambda c: c.get("position", 0))
@@ -11768,11 +11967,20 @@ async def rollback_clone(ctx: commands.Context):
                 name=c_data["name"],
                 position=c_data.get("position"),
                 nsfw=c_data.get("nsfw", False),
+                overwrites=restore_overwrites(
+                    c_data.get("overwrites", []), id_map, ctx.guild
+                ),
             )
             id_map[str(c_data["id"])] = str(new_cat.id)
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("rollback_clone:create_category", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "rollback_clone:create_category",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     channels_data = backup.get("channels", [])
     channels_data.sort(key=lambda c: c.get("position", 0))
@@ -11786,6 +11994,10 @@ async def rollback_clone(ctx: commands.Context):
 
             ch_type = ch_data.get("type", "text")
 
+            chan_overwrites = restore_overwrites(
+                ch_data.get("overwrites", []), id_map, ctx.guild
+            )
+
             if "text" in ch_type:
                 new_chan = await ctx.guild.create_text_channel(
                     name=ch_data["name"],
@@ -11794,6 +12006,7 @@ async def rollback_clone(ctx: commands.Context):
                     topic=ch_data.get("topic"),
                     nsfw=ch_data.get("nsfw", False),
                     slowmode_delay=ch_data.get("slowmode_delay", 0),
+                    overwrites=chan_overwrites,
                 )
             elif "voice" in ch_type:
                 new_chan = await ctx.guild.create_voice_channel(
@@ -11802,6 +12015,7 @@ async def rollback_clone(ctx: commands.Context):
                     position=ch_data.get("position"),
                     bitrate=ch_data.get("bitrate", 64000),
                     user_limit=ch_data.get("user_limit", 0),
+                    overwrites=chan_overwrites,
                 )
             elif "stage" in ch_type:
                 new_chan = await ctx.guild.create_stage_channel(
@@ -11809,6 +12023,7 @@ async def rollback_clone(ctx: commands.Context):
                     category=category,
                     position=ch_data.get("position"),
                     topic=ch_data.get("topic"),
+                    overwrites=chan_overwrites,
                 )
             elif "forum" in ch_type:
                 new_chan = await ctx.guild.create_forum(
@@ -11817,6 +12032,7 @@ async def rollback_clone(ctx: commands.Context):
                     position=ch_data.get("position"),
                     topic=ch_data.get("topic"),
                     nsfw=ch_data.get("nsfw", False),
+                    overwrites=chan_overwrites,
                 )
             else:
                 continue
@@ -11824,7 +12040,13 @@ async def rollback_clone(ctx: commands.Context):
             id_map[str(ch_data["id"])] = str(new_chan.id)
             await asyncio.sleep(0.5)
         except Exception as e:
-            bot.log_error("rollback_clone:create_channel", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "rollback_clone:create_channel",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     for emoji_data in backup.get("emojis", []):
         try:
@@ -11834,7 +12056,13 @@ async def rollback_clone(ctx: commands.Context):
                 )
                 await asyncio.sleep(1)
         except Exception as e:
-            bot.log_error("rollback_clone:create_emoji", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+            bot.log_error(
+                "rollback_clone:create_emoji",
+                e,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                user=ctx.author,
+            )
 
     try:
         old_settings = backup.get("bot_settings")
@@ -11861,7 +12089,13 @@ async def rollback_clone(ctx: commands.Context):
             new_settings.pop("_id", None)
             await bot.settings.push_settings(ctx.guild.id, new_settings)
     except Exception as e:
-        bot.log_error("rollback_clone:migrate_settings", e, guild=ctx.guild, channel=ctx.channel, user=ctx.author)
+        bot.log_error(
+            "rollback_clone:migrate_settings",
+            e,
+            guild=ctx.guild,
+            channel=ctx.channel,
+            user=ctx.author,
+        )
 
     completion_channel = next(
         (
