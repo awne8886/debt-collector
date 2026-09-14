@@ -1435,19 +1435,22 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
             bot.log_error("reactionrole:remove", exc, guild=guild, user=member)
 
 
-
-async def _cache_single_attachment(message_id: int, attachment: discord.Attachment) -> None:
+async def _cache_single_attachment(
+    message_id: int, attachment: discord.Attachment
+) -> None:
     try:
         data = await attachment.read()
         if not hasattr(bot, "attachment_cache"):
             bot.attachment_cache = {}
         if message_id not in bot.attachment_cache:
             bot.attachment_cache[message_id] = []
-        bot.attachment_cache[message_id].append({
-            "filename": attachment.filename,
-            "content_type": attachment.content_type,
-            "data": data,
-        })
+        bot.attachment_cache[message_id].append(
+            {
+                "filename": attachment.filename,
+                "content_type": attachment.content_type,
+                "data": data,
+            }
+        )
     except Exception as exc:
         log.debug("Failed to cache attachment: %s", exc)
 
@@ -1687,11 +1690,17 @@ async def joinrole_cmd(ctx: commands.Context, *, role: str):
         await ctx.send(f"✅ **{resolved.name}** will now be given to all new joiners.")
 
 
-@bot.hybrid_command(name="roleall", description="Give every member a specific role.")
+@bot.hybrid_command(
+    name="roleall",
+    description="Give members a role, optionally filtering by how recently they joined.",
+)
 @app_commands.default_permissions(administrator=True)
 @commands.guild_only()
-@app_commands.describe(role="Role mention, role ID, or exact role name.")
-async def roleall_cmd(ctx: commands.Context, *, role: str):
+@app_commands.describe(
+    role="Role mention, role ID, or exact role name.",
+    time="Optional time period (e.g., '2 hours', '1d', '30m') to only give role to recent joiners.",
+)
+async def roleall_cmd(ctx: commands.Context, role: str, *, time: Optional[str] = None):
     if not member_has_perms(ctx.author, manage_roles=True, administrator=True):
         await ctx.send("❌ You need Administrator permission.", ephemeral=True)
         return
@@ -1716,13 +1725,36 @@ async def roleall_cmd(ctx: commands.Context, *, role: str):
             ephemeral=True,
         )
 
-    await ctx.send(
-        f"⏳ Adding **{resolved.name}** to all members... This may take a while depending on server size."
-    )
+    threshold_time = None
+    if time:
+        duration_seconds = parse_duration(time)
+        if duration_seconds is None:
+            return await ctx.send(
+                f"❌ Invalid time format: `{time}`. Use things like `2 hours`, `30m`, `1d`.",
+                ephemeral=True,
+            )
+        threshold_time = datetime.now(timezone.utc) - timedelta(
+            seconds=duration_seconds
+        )
+        await ctx.send(
+            f"⏳ Adding **{resolved.name}** to members who joined in the last **{time}**... This may take a while."
+        )
+    else:
+        await ctx.send(
+            f"⏳ Adding **{resolved.name}** to all members... This may take a while depending on server size."
+        )
 
     success = 0
     failed = 0
-    members_to_update = [m for m in ctx.guild.members if resolved not in m.roles]
+
+    if threshold_time:
+        members_to_update = [
+            m
+            for m in ctx.guild.members
+            if resolved not in m.roles and m.joined_at and m.joined_at >= threshold_time
+        ]
+    else:
+        members_to_update = [m for m in ctx.guild.members if resolved not in m.roles]
 
     async def _add_role(m: discord.Member):
         try:
@@ -9800,7 +9832,8 @@ async def messagelog_ignore(
 
 
 @messagelog_group.command(
-    name="cache", description="Toggle holding deleted attachments in memory to prevent broken images"
+    name="cache",
+    description="Toggle holding deleted attachments in memory to prevent broken images",
 )
 @commands.has_permissions(manage_guild=True)
 async def messagelog_cache(ctx: commands.Context) -> None:
