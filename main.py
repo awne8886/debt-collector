@@ -995,6 +995,20 @@ bot: DebtCollectorBot = DebtCollectorBot(settings_manager)
 logging.getLogger().addHandler(ErrorRecorderHandler(bot.errors))
 
 
+class _DiscordReconnectFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name == "discord.client" and record.getMessage().startswith(
+            "Attempting a reconnect"
+        ):
+            record.levelno = logging.WARNING
+            record.levelname = "WARNING"
+            record.exc_info = None
+        return True
+
+
+logging.getLogger("discord.client").addFilter(_DiscordReconnectFilter())
+
+
 # --------------------------------------------------------------------------- #
 # Global rate limiting
 # --------------------------------------------------------------------------- #
@@ -2190,7 +2204,9 @@ async def ban_cmd(
     await ctx.send(f"🔨 **{user}** was banned. Reason: {reason}")
     embed = discord.Embed(title="Member Banned", color=discord.Color.red())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(
+        name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+    )
     embed.add_field(name="Reason", value=reason, inline=False)
     await post_modlog(ctx.guild, embed)
 
@@ -2207,7 +2223,9 @@ async def unban_cmd(ctx: commands.Context, user_id: str):
         await ctx.send(f"✅ **{user}** was unbanned.")
         embed = discord.Embed(title="Member Unbanned", color=discord.Color.green())
         embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-        embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+        embed.add_field(
+            name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+        )
         await post_modlog(ctx.guild, embed)
     except Exception as e:
         await ctx.send(f"❌ Failed to unban: {e}", ephemeral=True)
@@ -2242,7 +2260,9 @@ async def kick_cmd(
     await ctx.send(f"👢 **{user}** was kicked. Reason: {reason}")
     embed = discord.Embed(title="Member Kicked", color=discord.Color.orange())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(
+        name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+    )
     embed.add_field(name="Reason", value=reason, inline=False)
     await post_modlog(ctx.guild, embed)
 
@@ -2279,15 +2299,15 @@ async def softban_cmd(
         await ctx.send(f"🔨 **{user}** was softbanned. Reason: {reason}")
         embed = discord.Embed(title="Member Softbanned", color=discord.Color.orange())
         embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-        embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+        embed.add_field(
+            name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+        )
         embed.add_field(name="Reason", value=reason, inline=False)
         await post_modlog(ctx.guild, embed)
     except discord.Forbidden:
         await ctx.send("❌ I do not have permission to ban that user.", ephemeral=True)
     except discord.HTTPException as e:
         await ctx.send(f"❌ Failed to softban: {e}", ephemeral=True)
-
-
 
 
 @bot.hybrid_command(name="timeout", description="Time a member out (mute)")
@@ -2319,7 +2339,9 @@ async def timeout_cmd(
     await ctx.send(f"🤐 **{user}** is timed out for {minutes}m. Reason: {reason}")
     embed = discord.Embed(title="Member Timed Out", color=discord.Color.orange())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(
+        name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+    )
     embed.add_field(name="Duration", value=f"{minutes} minutes", inline=False)
     embed.add_field(name="Reason", value=reason, inline=False)
     await post_modlog(ctx.guild, embed)
@@ -2338,7 +2360,9 @@ async def untimeout_cmd(ctx: commands.Context, user: discord.Member):
     await ctx.send(f"🔊 **{user}**'s timeout was removed.")
     embed = discord.Embed(title="Member Timeout Removed", color=discord.Color.green())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(
+        name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+    )
     await post_modlog(ctx.guild, embed)
 
 
@@ -2372,7 +2396,9 @@ async def warn_cmd(
     await ctx.send(f"⚠️ **{user}** was warned. Reason: {reason}")
     embed = discord.Embed(title="Member Warned", color=discord.Color.gold())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(
+        name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+    )
     embed.add_field(name="Reason", value=reason, inline=False)
     await post_modlog(ctx.guild, embed)
 
@@ -2421,7 +2447,9 @@ async def clearwarns_cmd(ctx: commands.Context, user: discord.Member):
     await ctx.send(f"✅ Cleared warnings for **{user}**.")
     embed = discord.Embed(title="Warnings Cleared", color=discord.Color.green())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(
+        name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+    )
     await post_modlog(ctx.guild, embed)
 
 
@@ -6770,10 +6798,11 @@ async def set_modlog_cmd(
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
     saved = await bot.settings.push_fields(
-        ctx.guild.id, {
+        ctx.guild.id,
+        {
             "modlog.channel_id": str(channel.id) if channel else None,
-            "modlog.enabled": channel is not None
-        }
+            "modlog.enabled": channel is not None,
+        },
     )
     text = (
         f"✅ Moderation actions will be logged to {channel.mention}."
@@ -9856,7 +9885,6 @@ def _describe_attachments(items: List[Any]) -> str:
         if name:
             names.append(str(name))
     return ", ".join(names)
-
 
 
 async def post_modlog(guild: discord.Guild, embed: discord.Embed) -> None:
