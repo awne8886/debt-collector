@@ -11637,9 +11637,13 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
             new_cat = await ctx.guild.create_category(
                 name=old_cat.name,
                 position=old_cat.position,
-                nsfw=old_cat.nsfw,
                 overwrites=map_overwrites(old_cat.overwrites, id_map, ctx.guild),
             )
+            try:
+                if old_cat.nsfw:
+                    await new_cat.edit(nsfw=old_cat.nsfw)
+            except Exception:
+                pass
             id_map[str(old_cat.id)] = str(new_cat.id)
             await asyncio.sleep(0.5)
         except Exception as e:
@@ -11966,11 +11970,15 @@ async def rollback_clone(ctx: commands.Context):
             new_cat = await ctx.guild.create_category(
                 name=c_data["name"],
                 position=c_data.get("position"),
-                nsfw=c_data.get("nsfw", False),
                 overwrites=restore_overwrites(
                     c_data.get("overwrites", []), id_map, ctx.guild
                 ),
             )
+            try:
+                if c_data.get("nsfw", False):
+                    await new_cat.edit(nsfw=True)
+            except Exception:
+                pass
             id_map[str(c_data["id"])] = str(new_cat.id)
             await asyncio.sleep(0.5)
         except Exception as e:
