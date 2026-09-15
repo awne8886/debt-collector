@@ -461,7 +461,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "message": "Reminder!",
     },
     "autopurge": {"channels": {}, "exempt_roles": []},
-    "counting": {"channel_id": None, "default_saves": 3},
+    "counting": {"channel_id": None, "default_saves": 3, "ruiner_role_id": None},
     "ai": {
         "enabled": False,
         "channels": [],
@@ -618,10 +618,10 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return base
 
 
-
 # --------------------------------------------------------------------------- #
 # Counting System
 # --------------------------------------------------------------------------- #
+
 
 class CountingSaveView(discord.ui.View):
     def __init__(self, state: dict, guild_id: int, channel_id: int):
@@ -630,38 +630,47 @@ class CountingSaveView(discord.ui.View):
         self.guild_id = guild_id
         self.channel_id = channel_id
 
-    @discord.ui.button(label="Save Streak (-1 Save)", style=discord.ButtonStyle.success, emoji="🚑")
-    async def save_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(
+        label="Save Streak (-1 Save)", style=discord.ButtonStyle.success, emoji="🚑"
+    )
+    async def save_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         settings = bot.settings.peek_settings(self.guild_id)
         max_saves = settings.get("counting", {}).get("default_saves", 3)
 
         import datetime
+
         today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         user_id = interaction.user.id
 
-        save_record = bot.settings.counting_saves.find_one({"user_id": user_id, "date": today})
+        save_record = bot.settings.counting_saves.find_one(
+            {"user_id": user_id, "date": today}
+        )
         used_saves = save_record["used"] if save_record else 0
 
         if used_saves >= max_saves:
-            await interaction.response.send_message(f"You have already used all {max_saves} of your saves today!", ephemeral=True)
+            await interaction.response.send_message(
+                f"You have already used all {max_saves} of your saves today!",
+                ephemeral=True,
+            )
             return
 
         current_state = bot.settings.counting.find_one({"guild_id": self.guild_id})
         if not current_state or not current_state.get("broken"):
-            await interaction.response.send_message("The streak is no longer broken!", ephemeral=True)
+            await interaction.response.send_message(
+                "The streak is no longer broken!", ephemeral=True
+            )
             return
 
         bot.settings.counting_saves.update_one(
-            {"user_id": user_id, "date": today},
-            {"$inc": {"used": 1}},
-            upsert=True
+            {"user_id": user_id, "date": today}, {"$inc": {"used": 1}}, upsert=True
         )
 
         current_state["broken"] = False
         current_state["broken_time"] = None
         bot.settings.counting.update_one(
-            {"guild_id": self.guild_id},
-            {"$set": current_state}
+            {"guild_id": self.guild_id}, {"$set": current_state}
         )
 
         for item in self.children:
@@ -677,79 +686,163 @@ class CountingSaveView(discord.ui.View):
 
 
 def _parse_counting_number(text: str):
-    if not text: return None
+    if not text:
+        return None
     text = text.lower().strip()
-    if text.isdigit(): return int(text)
+    if text.isdigit():
+        return int(text)
     try:
         expr = sympy.sympify(text)
-        if expr.is_real and expr.is_integer: return int(expr)
-        elif expr.is_real and float(expr).is_integer(): return int(float(expr))
-    except Exception: pass
+        if expr.is_real and expr.is_integer:
+            return int(expr)
+        elif expr.is_real and float(expr).is_integer():
+            return int(float(expr))
+    except Exception:
+        pass
     try:
         val = w2n.word_to_num(text)
-        if isinstance(val, (int, float)) and float(val).is_integer(): return int(val)
-    except Exception: pass
+        if isinstance(val, (int, float)) and float(val).is_integer():
+            return int(val)
+    except Exception:
+        pass
     return None
+
 
 def _extract_and_parse_number(content: str):
     words = content.split()
     for i in range(len(words), 0, -1):
         prefix = " ".join(words[:i]).rstrip(",.!?")
         parsed = _parse_counting_number(prefix)
-        if parsed is not None: return parsed
+        if parsed is not None:
+            return parsed
     return None
+
 
 async def _break_counting_streak(message: discord.Message, state: dict, reason: str):
     import time
+
     state["broken"] = True
     state["broken_time"] = time.time()
-    bot.settings.counting.update_one({"guild_id": message.guild.id}, {"$set": state}, upsert=True)
+    bot.settings.counting.update_one(
+        {"guild_id": message.guild.id}, {"$set": state}, upsert=True
+    )
+
+    # Handle streak ruiner role
+    settings = bot.settings.peek_settings(message.guild.id)
+    counting_settings = settings.get("counting") or {}
+    ruiner_role_id = counting_settings.get("ruiner_role_id")
+    if ruiner_role_id:
+        role = message.guild.get_role(int(ruiner_role_id))
+        if role:
+            # Remove role from anyone who currently has it
+            for member in role.members:
+                try:
+                    if member.id != message.author.id:
+                        await member.remove_roles(
+                            role, reason="Someone else ruined the counting streak"
+                        )
+                except discord.HTTPException:
+                    pass
+            # Add role to the new ruiner
+            try:
+                if isinstance(message.author, discord.Member):
+                    await message.author.add_roles(
+                        role, reason="Ruined the counting streak"
+                    )
+            except discord.HTTPException:
+                pass
+
     embed = discord.Embed(
         title="Streak Broken!",
         description=f"{message.author.mention} ruined the streak at **{state['streak']}**.\n\n{reason}\n\nYou have 3 saves per day to restore the streak. Click below to use one!",
-        color=discord.Color.red()
+        color=discord.Color.red(),
     )
-    try: await message.add_reaction("❌")
-    except discord.HTTPException: pass
+    try:
+        await message.add_reaction("❌")
+    except discord.HTTPException:
+        pass
     view = CountingSaveView(state, message.guild.id, message.channel.id)
     await message.channel.send(embed=embed, view=view)
 
+
 async def handle_counting(message: discord.Message) -> None:
-    if message.author.bot or not message.guild: return
+    if message.author.bot or not message.guild:
+        return
     settings = bot.settings.peek_settings(message.guild.id)
     counting_settings = settings.get("counting") or {}
-    if not counting_settings.get("channel_id") or message.channel.id != int(counting_settings["channel_id"]): return
+    if not counting_settings.get("channel_id") or message.channel.id != int(
+        counting_settings["channel_id"]
+    ):
+        return
 
     parsed = _extract_and_parse_number(message.content)
-    if parsed is None: return
+    if parsed is None:
+        return
 
     state = bot.settings.counting.find_one({"guild_id": message.guild.id})
     if not state:
-        state = {"guild_id": message.guild.id, "current": 0, "last_user": None, "streak": 0, "broken": False, "broken_time": None}
+        state = {
+            "guild_id": message.guild.id,
+            "current": 0,
+            "last_user": None,
+            "streak": 0,
+            "broken": False,
+            "broken_time": None,
+        }
 
     if state.get("broken"):
         import time
+
         if state.get("broken_time") and time.time() - state["broken_time"] > 86400:
             state["broken"] = False
             state["current"] = 0
             state["last_user"] = None
             state["streak"] = 0
             state["broken_time"] = None
-            bot.settings.counting.update_one({"guild_id": message.guild.id}, {"$set": state}, upsert=True)
-        else: return
+            bot.settings.counting.update_one(
+                {"guild_id": message.guild.id}, {"$set": state}, upsert=True
+            )
+        else:
+            return
 
     expected = state["current"] + 1
     if parsed != expected:
-        await _break_counting_streak(message, state, f"Expected {expected}, but got {parsed}.")
+        await _break_counting_streak(
+            message, state, f"Expected {expected}, but got {parsed}."
+        )
     elif state["last_user"] == message.author.id:
-        await _break_counting_streak(message, state, f"{message.author.mention} tried to count twice in a row!")
+        await _break_counting_streak(
+            message, state, f"{message.author.mention} tried to count twice in a row!"
+        )
     else:
         state["current"] = expected
         state["last_user"] = message.author.id
         state["streak"] += 1
-        bot.settings.counting.update_one({"guild_id": message.guild.id}, {"$set": state}, upsert=True)
-        try: await message.add_reaction("✅")
-        except discord.HTTPException: pass
+        bot.settings.counting.update_one(
+            {"guild_id": message.guild.id}, {"$set": state}, upsert=True
+        )
+
+        # Add dynamic milestone reactions
+        reaction = "✅"
+        if expected == 69:
+            reaction = "😏"
+        elif expected == 77:
+            reaction = "🎰"
+        elif expected == 100:
+            reaction = "💯"
+        elif expected == 420:
+            reaction = "🌿"
+        elif expected == 666:
+            reaction = "😈"
+        elif expected % 1000 == 0:
+            reaction = "🎉"
+        elif expected % 100 == 0:
+            reaction = "🌟"
+
+        try:
+            await message.add_reaction(reaction)
+        except discord.HTTPException:
+            pass
 
 
 class MultiTenantSettingsManager:
@@ -2331,7 +2424,9 @@ async def ban_cmd(
     await ctx.send(f"🔨 **{user}** was banned. Reason: {reason}")
     embed = discord.Embed(title="Member Banned", color=discord.Color.red())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(
+        name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+    )
     embed.add_field(name="Reason", value=reason, inline=False)
     await post_modlog(ctx.guild, embed)
 
@@ -2348,7 +2443,9 @@ async def unban_cmd(ctx: commands.Context, user_id: str):
         await ctx.send(f"✅ **{user}** was unbanned.")
         embed = discord.Embed(title="Member Unbanned", color=discord.Color.green())
         embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-        embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+        embed.add_field(
+            name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+        )
         await post_modlog(ctx.guild, embed)
     except Exception as e:
         await ctx.send(f"❌ Failed to unban: {e}", ephemeral=True)
@@ -2383,7 +2480,9 @@ async def kick_cmd(
     await ctx.send(f"👢 **{user}** was kicked. Reason: {reason}")
     embed = discord.Embed(title="Member Kicked", color=discord.Color.orange())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(
+        name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+    )
     embed.add_field(name="Reason", value=reason, inline=False)
     await post_modlog(ctx.guild, embed)
 
@@ -2420,15 +2519,15 @@ async def softban_cmd(
         await ctx.send(f"🔨 **{user}** was softbanned. Reason: {reason}")
         embed = discord.Embed(title="Member Softbanned", color=discord.Color.orange())
         embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-        embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+        embed.add_field(
+            name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+        )
         embed.add_field(name="Reason", value=reason, inline=False)
         await post_modlog(ctx.guild, embed)
     except discord.Forbidden:
         await ctx.send("❌ I do not have permission to ban that user.", ephemeral=True)
     except discord.HTTPException as e:
         await ctx.send(f"❌ Failed to softban: {e}", ephemeral=True)
-
-
 
 
 @bot.hybrid_command(name="timeout", description="Time a member out (mute)")
@@ -2460,7 +2559,9 @@ async def timeout_cmd(
     await ctx.send(f"🤐 **{user}** is timed out for {minutes}m. Reason: {reason}")
     embed = discord.Embed(title="Member Timed Out", color=discord.Color.orange())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(
+        name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+    )
     embed.add_field(name="Duration", value=f"{minutes} minutes", inline=False)
     embed.add_field(name="Reason", value=reason, inline=False)
     await post_modlog(ctx.guild, embed)
@@ -2479,7 +2580,9 @@ async def untimeout_cmd(ctx: commands.Context, user: discord.Member):
     await ctx.send(f"🔊 **{user}**'s timeout was removed.")
     embed = discord.Embed(title="Member Timeout Removed", color=discord.Color.green())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(
+        name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+    )
     await post_modlog(ctx.guild, embed)
 
 
@@ -2513,7 +2616,9 @@ async def warn_cmd(
     await ctx.send(f"⚠️ **{user}** was warned. Reason: {reason}")
     embed = discord.Embed(title="Member Warned", color=discord.Color.gold())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(
+        name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+    )
     embed.add_field(name="Reason", value=reason, inline=False)
     await post_modlog(ctx.guild, embed)
 
@@ -2562,7 +2667,9 @@ async def clearwarns_cmd(ctx: commands.Context, user: discord.Member):
     await ctx.send(f"✅ Cleared warnings for **{user}**.")
     embed = discord.Embed(title="Warnings Cleared", color=discord.Color.green())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(
+        name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False
+    )
     await post_modlog(ctx.guild, embed)
 
 
@@ -6911,10 +7018,11 @@ async def set_modlog_cmd(
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
     saved = await bot.settings.push_fields(
-        ctx.guild.id, {
+        ctx.guild.id,
+        {
             "modlog.channel_id": str(channel.id) if channel else None,
-            "modlog.enabled": channel is not None
-        }
+            "modlog.enabled": channel is not None,
+        },
     )
     text = (
         f"✅ Moderation actions will be logged to {channel.mention}."
@@ -8433,13 +8541,18 @@ counting_group = app_commands.Group(
 )
 bot.tree.add_command(counting_group)
 
+
 @counting_group.command(name="set_channel", description="Set the counting channel")
 @app_commands.describe(channel="The channel for counting (or leave empty to disable)")
-async def counting_set_channel(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+async def counting_set_channel(
+    interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None
+):
     guild_id = interaction.guild_id
-    if not guild_id: return
+    if not guild_id:
+        return
     settings = await bot.settings.fetch_settings(guild_id)
-    if "counting" not in settings: settings["counting"] = copy.deepcopy(DEFAULT_SETTINGS["counting"])
+    if "counting" not in settings:
+        settings["counting"] = copy.deepcopy(DEFAULT_SETTINGS["counting"])
     if channel:
         settings["counting"]["channel_id"] = channel.id
         msg = f"Counting channel set to {channel.mention}."
@@ -8449,19 +8562,85 @@ async def counting_set_channel(interaction: discord.Interaction, channel: Option
     await bot.settings.push_settings(guild_id, settings)
     await interaction.response.send_message(msg, ephemeral=True)
 
-@counting_group.command(name="set_saves", description="Set the number of saves members get per day")
+
+@counting_group.command(
+    name="set_saves", description="Set the number of saves members get per day"
+)
 @app_commands.describe(saves="Number of saves (default is 3)")
-async def counting_set_saves(interaction: discord.Interaction, saves: app_commands.Range[int, 0, 100]):
+async def counting_set_saves(
+    interaction: discord.Interaction, saves: app_commands.Range[int, 0, 100]
+):
     guild_id = interaction.guild_id
-    if not guild_id: return
+    if not guild_id:
+        return
     settings = await bot.settings.fetch_settings(guild_id)
-    if "counting" not in settings: settings["counting"] = copy.deepcopy(DEFAULT_SETTINGS["counting"])
+    if "counting" not in settings:
+        settings["counting"] = copy.deepcopy(DEFAULT_SETTINGS["counting"])
     settings["counting"]["default_saves"] = saves
     await bot.settings.push_settings(guild_id, settings)
-    await interaction.response.send_message(f"Counting default saves per day set to {saves}.", ephemeral=True)
+    await interaction.response.send_message(
+        f"Counting default saves per day set to {saves}.", ephemeral=True
+    )
+
+
+@counting_group.command(
+    name="set_ruiner_role", description="Set the streak ruiner role"
+)
+@app_commands.describe(
+    role="The role to give to whoever ruins the streak (or leave empty to disable)"
+)
+async def counting_set_ruiner_role(
+    interaction: discord.Interaction, role: Optional[discord.Role] = None
+):
+    guild_id = interaction.guild_id
+    if not guild_id:
+        return
+    settings = await bot.settings.fetch_settings(guild_id)
+    if "counting" not in settings:
+        settings["counting"] = copy.deepcopy(DEFAULT_SETTINGS["counting"])
+    if role:
+        settings["counting"]["ruiner_role_id"] = role.id
+        msg = f"Streak ruiner role set to {role.mention}."
+    else:
+        settings["counting"]["ruiner_role_id"] = None
+        msg = "Streak ruiner role disabled."
+    await bot.settings.push_settings(guild_id, settings)
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@counting_group.command(
+    name="reset", description="Reset the counting streak and current number"
+)
+async def counting_reset(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    if not guild_id:
+        return
+    state = bot.settings.counting.find_one({"guild_id": guild_id})
+    if not state:
+        state = {
+            "guild_id": guild_id,
+            "current": 0,
+            "last_user": None,
+            "streak": 0,
+            "broken": False,
+            "broken_time": None,
+        }
+    else:
+        state["current"] = 0
+        state["last_user"] = None
+        state["streak"] = 0
+        state["broken"] = False
+        state["broken_time"] = None
+    bot.settings.counting.update_one(
+        {"guild_id": guild_id}, {"$set": state}, upsert=True
+    )
+    await interaction.response.send_message(
+        "The counting streak has been reset to 0.", ephemeral=True
+    )
 
 
 # Settings restore
+
 # --------------------------------------------------------------------------- #
 
 IMPORTABLE_KEYS: frozenset = frozenset(DEFAULT_SETTINGS.keys())
@@ -10033,7 +10212,6 @@ def _describe_attachments(items: List[Any]) -> str:
         if name:
             names.append(str(name))
     return ", ".join(names)
-
 
 
 async def post_modlog(guild: discord.Guild, embed: discord.Embed) -> None:
