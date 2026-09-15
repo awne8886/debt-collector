@@ -1870,6 +1870,7 @@ async def on_message(message: discord.Message) -> None:
             await _apply_guild_automations(message)
             await _handle_sticky(message)
             await _handle_ai(message)
+            await handle_counting(message)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
