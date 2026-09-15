@@ -476,7 +476,6 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "models": {},
         "provider_order": ["openrouter", "gemini", "groq"],
     },
-    "modlog": {"channel_id": None},
     "automod": {
         "invites": False,
         "links": False,
@@ -551,6 +550,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "name_patterns": [],
     },
     "messagelog": {"enabled": False, "channel_id": None, "ignored_channels": []},
+    "modlog": {"enabled": False, "channel_id": None},
     "modmail": {
         "enabled": False,
         "staff_roles": [],
@@ -1116,6 +1116,21 @@ def _gif_tiers(reaction: str) -> List[Tuple[str, str, JsonExtractor]]:
             "waifu.im",
             f"https://api.waifu.im/search?included_tags={reaction}",
             lambda d: (d.get("images") or [{}])[0].get("url"),
+        ),
+        (
+            "nekos.best",
+            f"https://nekos.best/api/v2/{reaction}",
+            lambda d: (d.get("results") or [{}])[0].get("url"),
+        ),
+        (
+            "nekos.life",
+            f"https://nekos.life/api/v2/img/{reaction}",
+            lambda d: d.get("url"),
+        ),
+        (
+            "waifu.pics",
+            f"https://api.waifu.pics/sfw/{reaction}",
+            lambda d: d.get("url"),
         ),
         (
             "nekos.life",
@@ -2173,6 +2188,11 @@ async def ban_cmd(
             pass
     await user.ban(reason=reason)
     await ctx.send(f"🔨 **{user}** was banned. Reason: {reason}")
+    embed = discord.Embed(title="Member Banned", color=discord.Color.red())
+    embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
+    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    await post_modlog(ctx.guild, embed)
 
 
 @bot.hybrid_command(name="unban", description="Unban a user by their ID")
@@ -2185,6 +2205,10 @@ async def unban_cmd(ctx: commands.Context, user_id: str):
         user = await bot.fetch_user(int(user_id))
         await ctx.guild.unban(user)
         await ctx.send(f"✅ **{user}** was unbanned.")
+        embed = discord.Embed(title="Member Unbanned", color=discord.Color.green())
+        embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
+        embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+        await post_modlog(ctx.guild, embed)
     except Exception as e:
         await ctx.send(f"❌ Failed to unban: {e}", ephemeral=True)
 
@@ -2216,6 +2240,54 @@ async def kick_cmd(
             pass
     await user.kick(reason=reason)
     await ctx.send(f"👢 **{user}** was kicked. Reason: {reason}")
+    embed = discord.Embed(title="Member Kicked", color=discord.Color.orange())
+    embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
+    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    await post_modlog(ctx.guild, embed)
+
+
+@bot.hybrid_command(
+    name="softban",
+    description="Ban and immediately unban a member to delete their recent messages",
+)
+@app_commands.default_permissions(ban_members=True)
+@commands.guild_only()
+async def softban_cmd(
+    ctx: commands.Context,
+    user: discord.Member,
+    *,
+    reason: Optional[str] = "No reason given",
+    dm: bool = False,
+):
+    if not member_has_perms(ctx.author, ban_members=True):
+        return await ctx.send("❌ You need Ban Members permission.", ephemeral=True)
+    err = mod_block_reason(ctx.author, user, ctx.guild.me)
+    if err:
+        return await ctx.send(err, ephemeral=True)
+    if dm:
+        try:
+            await user.send(
+                f"You have been softbanned from **{ctx.guild.name}**. Reason: {reason}\nThis removes your recent messages, but you can rejoin with a new invite."
+            )
+        except discord.DiscordException:
+            pass
+
+    try:
+        await user.ban(reason=f"Softban: {reason}", delete_message_days=7)
+        await ctx.guild.unban(user, reason=f"Softban release")
+        await ctx.send(f"🔨 **{user}** was softbanned. Reason: {reason}")
+        embed = discord.Embed(title="Member Softbanned", color=discord.Color.orange())
+        embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
+        embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await post_modlog(ctx.guild, embed)
+    except discord.Forbidden:
+        await ctx.send("❌ I do not have permission to ban that user.", ephemeral=True)
+    except discord.HTTPException as e:
+        await ctx.send(f"❌ Failed to softban: {e}", ephemeral=True)
+
+
 
 
 @bot.hybrid_command(name="timeout", description="Time a member out (mute)")
@@ -2245,6 +2317,12 @@ async def timeout_cmd(
         discord.utils.utcnow() + timedelta(minutes=minutes), reason=reason
     )
     await ctx.send(f"🤐 **{user}** is timed out for {minutes}m. Reason: {reason}")
+    embed = discord.Embed(title="Member Timed Out", color=discord.Color.orange())
+    embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
+    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(name="Duration", value=f"{minutes} minutes", inline=False)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    await post_modlog(ctx.guild, embed)
 
 
 @bot.hybrid_command(name="untimeout", description="Remove a member's timeout")
@@ -2256,15 +2334,12 @@ async def untimeout_cmd(ctx: commands.Context, user: discord.Member):
     err = mod_block_reason(ctx.author, user, ctx.guild.me)
     if err:
         return await ctx.send(err, ephemeral=True)
-    if dm:
-        try:
-            await user.send(
-                f"You have been timed out in **{ctx.guild.name}** for {minutes}m. Reason: {reason}"
-            )
-        except discord.DiscordException:
-            pass
     await user.timeout(None)
     await ctx.send(f"🔊 **{user}**'s timeout was removed.")
+    embed = discord.Embed(title="Member Timeout Removed", color=discord.Color.green())
+    embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
+    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    await post_modlog(ctx.guild, embed)
 
 
 @bot.hybrid_command(
@@ -2295,6 +2370,11 @@ async def warn_cmd(
     uw.append({"reason": reason, "by": ctx.author.id, "at": int(time.time())})
     bot.settings.update_settings(ctx.guild.id, {"warns": warns})
     await ctx.send(f"⚠️ **{user}** was warned. Reason: {reason}")
+    embed = discord.Embed(title="Member Warned", color=discord.Color.gold())
+    embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
+    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    await post_modlog(ctx.guild, embed)
 
 
 @bot.hybrid_command(name="warnings", description="Show a member's warnings")
@@ -2339,6 +2419,10 @@ async def clearwarns_cmd(ctx: commands.Context, user: discord.Member):
         bot.automod_strikes[strike_key] = []
 
     await ctx.send(f"✅ Cleared warnings for **{user}**.")
+    embed = discord.Embed(title="Warnings Cleared", color=discord.Color.green())
+    embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
+    embed.add_field(name="Moderator", value=f"{ctx.author} ({ctx.author.id})", inline=False)
+    await post_modlog(ctx.guild, embed)
 
 
 PURGE_HARD_LIMIT: int = 500
@@ -2660,6 +2744,7 @@ COMMAND_CATEGORY: Dict[str, str] = {
     "ban": "moderation",
     "unban": "moderation",
     "kick": "moderation",
+    "softban": "moderation",
     "timeout": "moderation",
     "untimeout": "moderation",
     "warn": "moderation",
@@ -2723,6 +2808,7 @@ COMMAND_CATEGORY: Dict[str, str] = {
     "diagnose": "config",
     "screening": "config",
     "messagelog": "config",
+    "modlog": "config",
     # AI
     "ai": "ai",
     "ask": "ai",
@@ -2736,6 +2822,7 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "ban": "Permanently ban a member; they cannot rejoin until unbanned.",
     "unban": "Lift a ban using the user's numeric ID (they are no longer in the member list).",
     "kick": "Remove a member from the server; they can rejoin with a new invite.",
+    "softban": "Ban and immediately unban a member to wipe their recent messages. They can rejoin.",
     "timeout": "Mute a member for a number of minutes; they cannot talk, react or join voice.",
     "untimeout": "End a member's timeout immediately.",
     "warn": "Log a warning against a member and DM them the reason.",
@@ -2855,6 +2942,8 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "ticket close": "Close the ticket in this channel; the channel is then deleted or archived.",
     "ticket add": "Give another member access to the current ticket.",
     "ticket block": "Stop a member from opening tickets, or let them again.",
+    "clone_server": "Clone roles, channels, emojis, and settings from a reference server.",
+    "rollback_clone": "Restore the server back to its state before the last clone operation.",
     "welcomer": "Greet members in a channel when they join.",
     "welcomer set": "Choose the channel joins are announced in, and optionally the text.",
     "welcomer message": "Set the join greeting, with placeholders for name, server and count.",
@@ -2869,6 +2958,7 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "leaver test": "Preview the farewell on yourself.",
     "leaver off": "Stop announcing leaves, keeping the message and styling.",
     "set messagelog": "Choose the channel edited and deleted messages are logged to.",
+    "set modlog": "Choose the channel moderation actions are logged to.",
     "diagnose": "Health check: gateway latency, database reachability, background loops, "
     "cache hit rate and the bot's missing permissions.",
     # --- AI ---
@@ -6680,7 +6770,10 @@ async def set_modlog_cmd(
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
     saved = await bot.settings.push_fields(
-        ctx.guild.id, {"modlog.channel_id": str(channel.id) if channel else None}
+        ctx.guild.id, {
+            "modlog.channel_id": str(channel.id) if channel else None,
+            "modlog.enabled": channel is not None
+        }
     )
     text = (
         f"✅ Moderation actions will be logged to {channel.mention}."
@@ -9763,6 +9856,30 @@ def _describe_attachments(items: List[Any]) -> str:
         if name:
             names.append(str(name))
     return ", ".join(names)
+
+
+
+async def post_modlog(guild: discord.Guild, embed: discord.Embed) -> None:
+    settings = bot.settings.peek_settings(guild.id)
+    modlog = settings.get("modlog") or {}
+
+    if not modlog.get("enabled"):
+        return
+
+    channel_id_str = modlog.get("channel_id")
+    if not channel_id_str:
+        return
+
+    channel = guild.get_channel(int(channel_id_str))
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        await channel.send(embed=embed)
+    except discord.Forbidden:
+        pass
+    except discord.HTTPException as exc:
+        bot.log_error("modlog:send", exc, guild=guild)
 
 
 async def _post_messagelog(
