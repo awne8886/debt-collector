@@ -1118,6 +1118,21 @@ def _gif_tiers(reaction: str) -> List[Tuple[str, str, JsonExtractor]]:
             lambda d: (d.get("images") or [{}])[0].get("url"),
         ),
         (
+            "nekos.best",
+            f"https://nekos.best/api/v2/{reaction}",
+            lambda d: (d.get("results") or [{}])[0].get("url"),
+        ),
+        (
+            "nekos.life",
+            f"https://nekos.life/api/v2/img/{reaction}",
+            lambda d: d.get("url"),
+        ),
+        (
+            "waifu.pics",
+            f"https://api.waifu.pics/sfw/{reaction}",
+            lambda d: d.get("url"),
+        ),
+        (
             "nekos.life",
             f"https://nekos.life/api/v2/img/{reaction}",
             lambda d: d.get("url"),
