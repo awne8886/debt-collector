@@ -200,3 +200,31 @@ class TestConcurrentAIMessages(unittest.IsolatedAsyncioTestCase):
 
             mock_msg1.reply.assert_called_once_with("Reply 1", mention_author=False, allowed_mentions=unittest.mock.ANY)
             mock_msg2.reply.assert_called_once_with("Reply 2", mention_author=False, allowed_mentions=unittest.mock.ANY)
+
+class TestSanitizeMassPings(unittest.TestCase):
+    def test_sanitize_mass_pings(self):
+        from main import sanitize_mass_pings
+
+        # Test basic replacements
+        self.assertEqual(sanitize_mass_pings("@everyone"), "@\u200beveryone")
+        self.assertEqual(sanitize_mass_pings("@here"), "@\u200bhere")
+
+        # Test strings containing pings
+        self.assertEqual(sanitize_mass_pings("Hello @everyone!"), "Hello @\u200beveryone!")
+        self.assertEqual(sanitize_mass_pings("Is anyone @here?"), "Is anyone @\u200bhere?")
+
+        # Test multiple and mixed
+        self.assertEqual(
+            sanitize_mass_pings("@everyone and @here please read"),
+            "@\u200beveryone and @\u200bhere please read"
+        )
+        self.assertEqual(
+            sanitize_mass_pings("@everyone@everyone"),
+            "@\u200beveryone@\u200beveryone"
+        )
+
+        # Test no pings
+        self.assertEqual(sanitize_mass_pings("Hello world"), "Hello world")
+        self.assertEqual(sanitize_mass_pings(""), "")
+        self.assertEqual(sanitize_mass_pings("user@example.com"), "user@example.com")
+        self.assertEqual(sanitize_mass_pings("@ everyone"), "@ everyone") # Only exact matches
