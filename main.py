@@ -686,7 +686,7 @@ class CountingSaveView(discord.ui.View):
 
 
 def _parse_counting_number(text: str):
-    if not text:
+    if not text or len(text) > 100:
         return None
     text = text.lower().strip()
     if text.isdigit():
@@ -1751,6 +1751,27 @@ async def on_guild_remove(guild: discord.Guild) -> None:
     bot.settings._cache.pop(guild.id, None)
 
 
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
+    if before.guild is None or before.author.bot:
+        return
+    if before.content == after.content:
+        return
+    try:
+        settings = bot.settings.peek_settings(before.guild.id)
+        counting_settings = settings.get("counting") or {}
+        if counting_settings.get("channel_id") and before.channel.id == int(counting_settings["channel_id"]):
+            parsed = _extract_and_parse_number(before.content)
+            if parsed is not None:
+                state = bot.settings.counting.find_one({"guild_id": before.guild.id})
+                if state and not state.get("broken") and parsed == state.get("current"):
+                    await _break_counting_streak(
+                        after, state, f"{after.author.mention} edited their valid count!"
+                    )
+    except Exception as exc:
+        log.error("on_message_edit counting error: %s", exc)
+
 @bot.event
 async def on_message_delete(message: discord.Message) -> None:
     if message.guild is None or message.author.bot:
@@ -1769,6 +1790,20 @@ async def on_message_delete(message: discord.Message) -> None:
         )
     except discord.DiscordException as exc:
         log.error("on_message_delete error: %s", exc)
+
+    try:
+        settings = bot.settings.peek_settings(message.guild.id)
+        counting_settings = settings.get("counting") or {}
+        if counting_settings.get("channel_id") and message.channel.id == int(counting_settings["channel_id"]):
+            parsed = _extract_and_parse_number(message.content)
+            if parsed is not None:
+                state = bot.settings.counting.find_one({"guild_id": message.guild.id})
+                if state and not state.get("broken") and parsed == state.get("current"):
+                    await _break_counting_streak(
+                        message, state, f"{message.author.mention} deleted their valid count!"
+                    )
+    except Exception as exc:
+        log.error("on_message_delete counting error: %s", exc)
 
 
 @bot.event
