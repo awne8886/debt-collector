@@ -719,7 +719,6 @@ def _extract_and_parse_number(content: str):
 
 
 async def _break_counting_streak(message: discord.Message, state: dict, reason: str):
-    import time
 
     state["broken"] = True
     state["broken_time"] = time.time()
@@ -791,7 +790,6 @@ async def handle_counting(message: discord.Message) -> None:
         }
 
     if state.get("broken"):
-        import time
 
         if state.get("broken_time") and time.time() - state["broken_time"] > 86400:
             state["broken"] = False
@@ -1751,7 +1749,6 @@ async def on_guild_remove(guild: discord.Guild) -> None:
     bot.settings._cache.pop(guild.id, None)
 
 
-
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
     if before.guild is None or before.author.bot:
@@ -1761,16 +1758,21 @@ async def on_message_edit(before: discord.Message, after: discord.Message) -> No
     try:
         settings = bot.settings.peek_settings(before.guild.id)
         counting_settings = settings.get("counting") or {}
-        if counting_settings.get("channel_id") and before.channel.id == int(counting_settings["channel_id"]):
+        if counting_settings.get("channel_id") and before.channel.id == int(
+            counting_settings["channel_id"]
+        ):
             parsed = _extract_and_parse_number(before.content)
             if parsed is not None:
                 state = bot.settings.counting.find_one({"guild_id": before.guild.id})
                 if state and not state.get("broken") and parsed == state.get("current"):
                     await _break_counting_streak(
-                        after, state, f"{after.author.mention} edited their valid count!"
+                        after,
+                        state,
+                        f"{after.author.mention} edited their valid count!",
                     )
     except Exception as exc:
         log.error("on_message_edit counting error: %s", exc)
+
 
 @bot.event
 async def on_message_delete(message: discord.Message) -> None:
@@ -1794,13 +1796,17 @@ async def on_message_delete(message: discord.Message) -> None:
     try:
         settings = bot.settings.peek_settings(message.guild.id)
         counting_settings = settings.get("counting") or {}
-        if counting_settings.get("channel_id") and message.channel.id == int(counting_settings["channel_id"]):
+        if counting_settings.get("channel_id") and message.channel.id == int(
+            counting_settings["channel_id"]
+        ):
             parsed = _extract_and_parse_number(message.content)
             if parsed is not None:
                 state = bot.settings.counting.find_one({"guild_id": message.guild.id})
                 if state and not state.get("broken") and parsed == state.get("current"):
                     await _break_counting_streak(
-                        message, state, f"{message.author.mention} deleted their valid count!"
+                        message,
+                        state,
+                        f"{message.author.mention} deleted their valid count!",
                     )
     except Exception as exc:
         log.error("on_message_delete counting error: %s", exc)
@@ -7923,11 +7929,19 @@ async def _starboard_best_reaction(
 
     best_emoji: Optional[str] = None
     best_count: int = 0
-    for reaction in message.reactions:
+
+    sorted_reactions = sorted(
+        message.reactions, key=lambda r: int(r.count or 0), reverse=True
+    )
+    for reaction in sorted_reactions:
         token: str = str(reaction.emoji)
         if token in blocked:
             continue
         count: int = int(reaction.count or 0)
+
+        if count <= best_count:
+            break
+
         if not allow_self and count:
             try:
                 async for user in reaction.users(limit=100):
@@ -7936,8 +7950,10 @@ async def _starboard_best_reaction(
                         break
             except discord.DiscordException:
                 pass
+
         if count > best_count:
             best_emoji, best_count = token, count
+
     return best_emoji, best_count
 
 
@@ -7980,8 +7996,21 @@ async def _starboard_listener(payload: discord.RawReactionActionEvent) -> None:
         return
 
     posted: Dict[str, Any] = dict(config.get("posted") or {})
-    if str(payload.message_id) in posted or payload.message_id in _STARBOARD_INFLIGHT:
+    for k, v in list(posted.items()):
+        if isinstance(v, str):
+            posted[k] = {"relayed": v, "last": 0, "count_msg": None}
+
+    if payload.message_id in _STARBOARD_INFLIGHT:
         return
+
+    already_posted = str(payload.message_id) in posted
+    if already_posted:
+        posted_data = posted[str(payload.message_id)]
+        last_update = posted_data.get("last", 0)
+        if time.time() - last_update < 7200:
+            return
+        if not posted_data.get("count_msg"):
+            return
 
     source: Any = guild.get_channel(payload.channel_id)
     board: Any = guild.get_channel(int(config["channel_id"]))
@@ -8007,6 +8036,21 @@ async def _starboard_listener(payload: discord.RawReactionActionEvent) -> None:
 
     _STARBOARD_INFLIGHT.add(payload.message_id)
     try:
+        if already_posted:
+            posted_data = posted[str(payload.message_id)]
+            count_msg_id = posted_data.get("count_msg")
+            if count_msg_id:
+                try:
+                    count_msg = await board.fetch_message(int(count_msg_id))
+                    await count_msg.edit(
+                        content=f"{emoji} **{count}** · from {source.mention}"
+                    )
+                except discord.DiscordException:
+                    pass
+            posted_data["last"] = int(time.time())
+            await bot.settings.push_fields(guild.id, {"starboard.posted": posted})
+            return
+
         hook: Optional[discord.Webhook] = await _starboard_webhook(board)
         if hook is None:
             return
@@ -8034,16 +8078,22 @@ async def _starboard_listener(payload: discord.RawReactionActionEvent) -> None:
             bot.log_error("starboard:send", exc, guild=guild)
             return
 
+        count_msg_id = None
         if config.get("show_count") and relayed is not None:
             try:
-                await board.send(
-                    f"{emoji} **{count}** \u00b7 from {source.mention}",
+                count_msg = await board.send(
+                    f"{emoji} **{count}** · from {source.mention}",
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
+                count_msg_id = str(count_msg.id)
             except discord.DiscordException:
                 pass
 
-        posted[str(payload.message_id)] = str(getattr(relayed, "id", "1"))
+        posted[str(payload.message_id)] = {
+            "relayed": str(getattr(relayed, "id", "1")),
+            "last": int(time.time()),
+            "count_msg": count_msg_id,
+        }
         if len(posted) > STARBOARD_MAX_POSTED:
             for stale in list(posted)[: len(posted) - STARBOARD_MAX_POSTED]:
                 posted.pop(stale, None)
