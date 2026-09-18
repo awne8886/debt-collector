@@ -284,3 +284,31 @@ class TestHumanizeSeconds(unittest.TestCase):
         for seconds, expected in cases:
             with self.subTest(seconds=seconds):
                 self.assertEqual(humanize_seconds(seconds), expected)
+
+class TestPaginateLines(unittest.TestCase):
+    def test_empty_lines(self):
+        from main import paginate_lines
+        self.assertEqual(paginate_lines([]), ["*Nothing to show.*"])
+
+    def test_single_page(self):
+        from main import paginate_lines
+        lines = ["line 1", "line 2", "line 3"]
+        self.assertEqual(paginate_lines(lines, per_page=5, char_budget=100), ["line 1\nline 2\nline 3"])
+
+    def test_per_page_limit(self):
+        from main import paginate_lines
+        lines = ["1", "2", "3", "4", "5"]
+        self.assertEqual(paginate_lines(lines, per_page=2, char_budget=100), ["1\n2", "3\n4", "5"])
+
+    def test_char_budget_limit(self):
+        from main import paginate_lines
+        # If budget is smaller than two lines combined, they should split
+        lines = ["aaaaa", "bbbbb"]
+        self.assertEqual(paginate_lines(lines, per_page=5, char_budget=11), ["aaaaa", "bbbbb"])
+        self.assertEqual(paginate_lines(lines, per_page=5, char_budget=12), ["aaaaa\nbbbbb"])
+
+    def test_line_truncation(self):
+        from main import paginate_lines
+        # A single line exceeding char_budget should be truncated
+        lines = ["a" * 20]
+        self.assertEqual(paginate_lines(lines, per_page=5, char_budget=10), ["a" * 10])
