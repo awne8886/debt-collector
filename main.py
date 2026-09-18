@@ -2720,38 +2720,34 @@ BULK_DELETE_AGE_DAYS: int = 14
 LINK_RE = re.compile(r"(https?://\S+|discord\.gg/\S+)", re.IGNORECASE)
 
 
-async def _run_purge(
-    ctx: commands.Context,
-    amount: int,
-    check: Optional[Callable[[discord.Message], bool]] = None,
-    label: str = "messages",
-) -> None:
-    """Shared engine behind every /purge variant."""
+async def _check_purge_permissions(ctx: commands.Context) -> bool:
+    """Check if the user and bot have the required permissions for purging."""
     if not isinstance(ctx.author, discord.Member) or not member_has_perms(
         ctx.author, manage_messages=True
     ):
-        return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
+        await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
+        return False
     if not ctx.channel.permissions_for(ctx.me).manage_messages:
-        return await ctx.send(
+        await ctx.send(
             "❌ I need the **Manage Messages** permission in this channel.",
             ephemeral=True,
         )
+        return False
+    return True
 
-    amount = min(max(amount, 1), PURGE_HARD_LIMIT)
-    cutoff: datetime = datetime.now(timezone.utc) - timedelta(days=BULK_DELETE_AGE_DAYS)
-    invoking_id: int = ctx.message.id if ctx.message is not None else 0
 
-    if ctx.interaction is not None:
-        await ctx.defer(ephemeral=True)
-    else:
-        try:
-            await ctx.message.delete()
-        except discord.HTTPException:
-            pass
-
+async def _gather_purge_messages(
+    ctx: commands.Context,
+    amount: int,
+    check: Optional[Callable[[discord.Message], bool]],
+    cutoff: datetime,
+    invoking_id: int,
+) -> Tuple[List[discord.Message], bool, int]:
+    """Scan channel history to gather messages to delete."""
     scan_limit: int = (
         min(max(amount * 6, 100), PURGE_SCAN_CEILING) if check is not None else amount
     )
+
     matched: List[discord.Message] = []
     hit_age_limit: bool = False
     skipped_pins: int = 0
@@ -2773,10 +2769,16 @@ async def _run_purge(
                 break
     except discord.HTTPException as exc:
         bot.log_error("purge:history", exc)
-        return await ctx.send(
-            "❌ Couldn't read this channel's history.", ephemeral=True
-        )
+        await ctx.send("❌ Couldn't read this channel's history.", ephemeral=True)
+        raise  # Re-raise to signal failure so the parent handles it
 
+    return matched, hit_age_limit, skipped_pins
+
+
+async def _delete_purge_messages(
+    ctx: commands.Context, matched: List[discord.Message]
+) -> int:
+    """Delete the gathered messages in chunks."""
     deleted: int = 0
     for start in range(0, len(matched), 100):
         chunk: List[discord.Message] = matched[start : start + 100]
@@ -2790,7 +2792,19 @@ async def _run_purge(
             bot.log_error("purge:delete", exc)
         if start + 100 < len(matched):
             await asyncio.sleep(0.5)
+    return deleted
 
+
+async def _send_purge_summary(
+    ctx: commands.Context,
+    deleted: int,
+    amount: int,
+    hit_age_limit: bool,
+    skipped_pins: int,
+    check: Optional[Callable[[discord.Message], bool]],
+    label: str,
+) -> None:
+    """Generate and send the final summary message."""
     notes: List[str] = []
     if hit_age_limit:
         notes.append(
@@ -2807,6 +2821,42 @@ async def _run_purge(
         await ctx.send(summary, ephemeral=True)
     else:
         await ctx.send(summary, delete_after=8)
+
+
+async def _run_purge(
+    ctx: commands.Context,
+    amount: int,
+    check: Optional[Callable[[discord.Message], bool]] = None,
+    label: str = "messages",
+) -> None:
+    """Shared engine behind every /purge variant."""
+    if not await _check_purge_permissions(ctx):
+        return
+
+    amount = min(max(amount, 1), PURGE_HARD_LIMIT)
+    cutoff: datetime = datetime.now(timezone.utc) - timedelta(days=BULK_DELETE_AGE_DAYS)
+    invoking_id: int = ctx.message.id if ctx.message is not None else 0
+
+    if ctx.interaction is not None:
+        await ctx.defer(ephemeral=True)
+    else:
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
+
+    try:
+        matched, hit_age_limit, skipped_pins = await _gather_purge_messages(
+            ctx, amount, check, cutoff, invoking_id
+        )
+    except discord.HTTPException:
+        return
+
+    deleted = await _delete_purge_messages(ctx, matched)
+
+    await _send_purge_summary(
+        ctx, deleted, amount, hit_age_limit, skipped_pins, check, label
+    )
 
 
 @bot.hybrid_group(
