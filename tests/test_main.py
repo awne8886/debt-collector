@@ -265,3 +265,22 @@ class TestDeepMerge(unittest.TestCase):
         result = _deep_merge(base, override)
         self.assertIs(result, base)
         self.assertEqual(base, {"a": {"x": 1, "y": 2}})
+
+class TestHumanizeSeconds(unittest.TestCase):
+    def test_humanize_seconds(self):
+        from main import humanize_seconds
+        cases = [
+            (-5, "0s"),
+            (0, "0s"),
+            (45, "45s"),
+            (60, "1m 0s"),
+            (65, "1m 5s"),
+            (3600, "1h 0m"),
+            (3665, "1h 1m"),
+            (86400, "1d 0h"),
+            (90000, "1d 1h"),
+            (100000, "1d 3h"),
+        ]
+        for seconds, expected in cases:
+            with self.subTest(seconds=seconds):
+                self.assertEqual(humanize_seconds(seconds), expected)
