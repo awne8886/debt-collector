@@ -165,10 +165,6 @@ class MultiTenantSettingsManager:
     def evict_cache(self, guild_id: int) -> None:
         self._cache.pop(guild_id, None)
 
-    async def fetch_settings(self, guild_id: int) -> Dict[str, Any]:
-        if guild_id in self._cache:
-            return self._cache[guild_id]
-        return await asyncio.to_thread(self.get_settings, guild_id)
 
     async def push_settings(self, guild_id: int, payload: Dict[str, Any]) -> bool:
         return await asyncio.to_thread(self.update_settings, guild_id, payload)
