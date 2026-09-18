@@ -228,3 +228,40 @@ class TestSanitizeMassPings(unittest.TestCase):
         self.assertEqual(sanitize_mass_pings(""), "")
         self.assertEqual(sanitize_mass_pings("user@example.com"), "user@example.com")
         self.assertEqual(sanitize_mass_pings("@ everyone"), "@ everyone") # Only exact matches
+
+class TestDeepMerge(unittest.TestCase):
+    def test_deep_merge_basic(self):
+        from main import _deep_merge
+        base = {"a": 1, "b": 2}
+        override = {"b": 3, "c": 4}
+        result = _deep_merge(base, override)
+        self.assertEqual(result, {"a": 1, "b": 3, "c": 4})
+
+    def test_deep_merge_nested(self):
+        from main import _deep_merge
+        base = {"a": {"x": 1, "y": 2}, "b": 2}
+        override = {"a": {"y": 3, "z": 4}, "c": 5}
+        result = _deep_merge(base, override)
+        self.assertEqual(result, {"a": {"x": 1, "y": 3, "z": 4}, "b": 2, "c": 5})
+
+    def test_deep_merge_type_mismatch(self):
+        from main import _deep_merge
+        # Override dict with scalar
+        base1 = {"a": {"x": 1}}
+        override1 = {"a": 2}
+        result1 = _deep_merge(base1, override1)
+        self.assertEqual(result1, {"a": 2})
+
+        # Override scalar with dict
+        base2 = {"a": 1}
+        override2 = {"a": {"x": 2}}
+        result2 = _deep_merge(base2, override2)
+        self.assertEqual(result2, {"a": {"x": 2}})
+
+    def test_deep_merge_in_place_modification(self):
+        from main import _deep_merge
+        base = {"a": {"x": 1}}
+        override = {"a": {"y": 2}}
+        result = _deep_merge(base, override)
+        self.assertIs(result, base)
+        self.assertEqual(base, {"a": {"x": 1, "y": 2}})
