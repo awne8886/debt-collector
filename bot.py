@@ -3024,6 +3024,37 @@ async def emojis_cmd(ctx: commands.Context):
     await send_pages(ctx, pages)
 
 
+async def _create_stolen_emoji(
+    ctx: commands.Context,
+    session: Optional[aiohttp.ClientSession],
+    animated: bool,
+    emoji_name: str,
+    emoji_id: str,
+    target_name: str,
+) -> Tuple[str, bool]:
+    url: str = (
+        f"https://cdn.discordapp.com/emojis/{emoji_id}.{'gif' if animated else 'png'}"
+    )
+    try:
+        if session is None or session.closed:
+            return f"❌ `{emoji_name}` — no network session available.", False
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10.0)) as resp:
+            if resp.status != 200:
+                return f"❌ `{emoji_name}` — couldn't download it.", False
+            payload: bytes = await resp.read()
+        created = await ctx.guild.create_custom_emoji(
+            name=target_name, image=payload, reason=f"Stolen by {ctx.author}"
+        )
+    except discord.HTTPException as exc:
+        bot.log_error("steal", exc)
+        return f"❌ `{emoji_name}` — Discord rejected it ({exc.status}).", False
+    except Exception as exc:
+        bot.log_error("steal", exc)
+        return f"❌ `{emoji_name}` — {type(exc).__name__}.", False
+
+    return f"✅ {created} added as `:{created.name}:`", True
+
+
 @bot.hybrid_command(name="steal", description="Copy custom emojis into this server")
 @app_commands.default_permissions(manage_emojis=True)
 @commands.guild_only()
@@ -3073,37 +3104,15 @@ async def steal_cmd(ctx: commands.Context, emojis: str, name: Optional[str] = No
         if len(target_name) < 2:
             target_name = "stolen_emoji"
 
-        url: str = (
-            f"https://cdn.discordapp.com/emojis/{emoji_id}.{'gif' if animated else 'png'}"
+        result_msg, success = await _create_stolen_emoji(
+            ctx, session, animated, emoji_name, emoji_id, target_name
         )
-        try:
-            if session is None or session.closed:
-                results.append(f"❌ `{emoji_name}` — no network session available.")
-                continue
-            async with session.get(
-                url, timeout=aiohttp.ClientTimeout(total=10.0)
-            ) as resp:
-                if resp.status != 200:
-                    results.append(f"❌ `{emoji_name}` — couldn't download it.")
-                    continue
-                payload: bytes = await resp.read()
-            created = await ctx.guild.create_custom_emoji(
-                name=target_name, image=payload, reason=f"Stolen by {ctx.author}"
-            )
-        except discord.HTTPException as exc:
-            bot.log_error("steal", exc)
-            results.append(f"❌ `{emoji_name}` — Discord rejected it ({exc.status}).")
-            continue
-        except Exception as exc:
-            bot.log_error("steal", exc)
-            results.append(f"❌ `{emoji_name}` — {type(exc).__name__}.")
-            continue
-
-        if animated:
-            animated_used += 1
-        else:
-            static_used += 1
-        results.append(f"✅ {created} added as `:{created.name}:`")
+        results.append(result_msg)
+        if success:
+            if animated:
+                animated_used += 1
+            else:
+                static_used += 1
 
     await ctx.send("\n".join(results)[:2000], ephemeral=True)
 
