@@ -1970,6 +1970,7 @@ async def on_message(message: discord.Message) -> None:
         autopurge: Dict[str, Any] = settings.get("autopurge") or {
             "channels": {},
             "exempt_roles": [],
+            "users": {},
         }
         entry: Optional[Dict[str, Any]] = (autopurge.get("channels") or {}).get(
             str(message.channel.id)
@@ -1992,6 +1993,26 @@ async def on_message(message: discord.Message) -> None:
                 except discord.HTTPException as exc:
                     bot.log_error(
                         "autopurge", exc, guild=message.guild, user=message.author
+                    )
+                return
+
+        user_entry = (autopurge.get("users") or {}).get(str(message.author.id))
+        if user_entry and message.author.id != bot.user.id:
+            until: Optional[float] = user_entry.get("until")
+            if until and time.time() > until:
+                users_dict = dict(autopurge.get("users") or {})
+                users_dict.pop(str(message.author.id), None)
+                await bot.settings.push_fields(
+                    message.guild.id, {"autopurge.users": users_dict}
+                )
+            elif str(message.channel.id) not in (
+                user_entry.get("exempt_channels") or []
+            ):
+                try:
+                    await message.delete()
+                except discord.HTTPException as exc:
+                    bot.log_error(
+                        "autopurge_user", exc, guild=message.guild, user=message.author
                     )
                 return
 
@@ -3914,6 +3935,121 @@ async def autopurge_exempt(
 
 
 @autopurge_group.command(
+    name="user_on",
+    description="Start auto-deleting every new message from a specific user",
+)
+@app_commands.describe(
+    user="The user to auto-purge",
+    hours="Optional: automatically stop after this many hours",
+    days="Optional: automatically stop after this many days",
+)
+async def autopurge_user_on(
+    ctx: commands.Context,
+    user: discord.Member,
+    hours: Optional[app_commands.Range[int, 1, 720]] = None,
+    days: Optional[app_commands.Range[int, 1, 365]] = None,
+):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    until = None
+    if hours or days:
+        until = int(time.time()) + (hours or 0) * 3600 + (days or 0) * 86400
+
+    settings = bot.settings.get_settings(ctx.guild.id)
+    ap = settings.setdefault(
+        "autopurge", {"channels": {}, "exempt_roles": [], "users": {}}
+    )
+    users = ap.setdefault("users", {})
+
+    users[str(user.id)] = {"until": until, "exempt_channels": []}
+    bot.settings.update_settings(ctx.guild.id, settings)
+
+    when = (
+        f"until <t:{until}:f>"
+        if until
+        else "until you run `/autopurge user_off <user>`"
+    )
+    await ctx.send(
+        f"🧹 Auto-purge is now **on** for {user.mention} {when}. "
+        "Every new message they send will be deleted, except in exempt channels "
+        "(`/autopurge user_exempt add <user> <channel>`).",
+        ephemeral=True,
+    )
+
+
+@autopurge_group.command(
+    name="user_off", description="Stop auto-deleting messages from a user"
+)
+@app_commands.describe(user="The user to stop auto-purging")
+async def autopurge_user_off(ctx: commands.Context, user: discord.Member):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    settings = bot.settings.get_settings(ctx.guild.id)
+    ap = settings.get("autopurge", {"channels": {}, "exempt_roles": [], "users": {}})
+    users = ap.get("users", {})
+
+    removed = users.pop(str(user.id), None)
+
+    if removed:
+        bot.settings.update_settings(ctx.guild.id, settings)
+
+    msg = (
+        f"✅ Auto-purge turned off for {user.mention}."
+        if removed
+        else f"Auto-purge wasn't active for {user.mention}."
+    )
+    await ctx.send(msg, ephemeral=True)
+
+
+@autopurge_group.command(
+    name="user_exempt",
+    description="Add/remove a channel where a user's messages are spared",
+)
+@app_commands.describe(
+    action="add or remove", user="The auto-purged user", channel="The channel to exempt"
+)
+async def autopurge_user_exempt(
+    ctx: commands.Context,
+    action: Literal["add", "remove"],
+    user: discord.Member,
+    channel: discord.TextChannel,
+):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    settings = bot.settings.get_settings(ctx.guild.id)
+    ap = settings.setdefault(
+        "autopurge", {"channels": {}, "exempt_roles": [], "users": {}}
+    )
+    users = ap.setdefault("users", {})
+
+    user_entry = users.get(str(user.id))
+    if not user_entry:
+        return await ctx.send(
+            f"❌ {user.mention} is not currently being auto-purged.", ephemeral=True
+        )
+
+    exempt_channels = user_entry.setdefault("exempt_channels", [])
+
+    if action == "add":
+        if str(channel.id) not in exempt_channels:
+            exempt_channels.append(str(channel.id))
+        msg = (
+            f"✅ Messages from {user.mention} will be left alone in {channel.mention}."
+        )
+    elif str(channel.id) in exempt_channels:
+        exempt_channels.remove(str(channel.id))
+        msg = f"✅ {channel.mention} is no longer exempt for {user.mention}."
+    else:
+        msg = f"{channel.mention} wasn't exempt for {user.mention}."
+
+    bot.settings.update_settings(ctx.guild.id, settings)
+    await ctx.send(msg, ephemeral=True)
+
+
+@autopurge_group.command(
     name="status", description="Where auto-purge is active and which roles are exempt"
 )
 async def autopurge_status(ctx: commands.Context):
@@ -3921,16 +4057,31 @@ async def autopurge_status(ctx: commands.Context):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
     settings = bot.settings.get_settings(ctx.guild.id)
-    ap = settings.get("autopurge", {"channels": {}, "exempt_roles": []})
+    ap = settings.get("autopurge", {"channels": {}, "exempt_roles": [], "users": {}})
     now = time.time()
     lines = []
 
-    for cid, c in ap["channels"].items():
+    for cid, c in ap.get("channels", {}).items():
         until = c.get("until")
         if until and now > until:
             continue  # expired, will be cleaned up automatically
         lines.append(
             f"<#{cid}> — " + (f"until <t:{until}:f>" if until else "until turned off")
+        )
+
+    user_lines = []
+    for uid, u in ap.get("users", {}).items():
+        until = u.get("until")
+        if until and now > until:
+            continue
+        exempt = u.get("exempt_channels", [])
+        exempt_str = (
+            f" (Exempt: {', '.join(f'<#{c}>' for c in exempt)})" if exempt else ""
+        )
+        user_lines.append(
+            f"<@{uid}> — "
+            + (f"until <t:{until}:f>" if until else "until turned off")
+            + exempt_str
         )
 
     embed = discord.Embed(title="Auto-purge status", color=discord.Color.blurple())
@@ -3941,9 +4092,15 @@ async def autopurge_status(ctx: commands.Context):
     )
     embed.add_field(
         name="Exempt roles",
-        value=" ".join(f"<@&{r}>" for r in ap["exempt_roles"])[:1024] or "None",
+        value=" ".join(f"<@&{r}>" for r in ap.get("exempt_roles", []))[:1024] or "None",
         inline=False,
     )
+    if user_lines:
+        embed.add_field(
+            name="Auto-purged Users",
+            value="\n".join(user_lines)[:1024],
+            inline=False,
+        )
     await ctx.send(embed=embed, ephemeral=True)
 
 
