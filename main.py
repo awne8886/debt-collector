@@ -2266,15 +2266,13 @@ async def roleall_cmd(ctx: commands.Context, role: str, *, time: Optional[str] =
     link="Link to the message", emoji="Reaction emoji", role="Role to assign"
 )
 async def reactionrole_group(
-    ctx: commands.Context, link: str, emoji: str, *, role: str
+    ctx: commands.Context, link: str, emoji: str, *, role: discord.Role
 ):
     if not member_has_perms(ctx.author, manage_roles=True, administrator=True):
         await ctx.send("❌ You need Administrator permission.", ephemeral=True)
         return
 
-    resolved: Optional[discord.Role] = resolve_role(ctx.guild, role)
-    if resolved is None:
-        return await ctx.send("❌ No role found.", ephemeral=True)
+    resolved = role
 
     msg = await extract_message_from_link(ctx, link)
     if not msg:
