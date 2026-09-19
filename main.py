@@ -1858,9 +1858,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     guild = bot.get_guild(payload.guild_id)
     if not guild:
         return
-    member = guild.get_member(payload.user_id)
+    member = payload.member or guild.get_member(payload.user_id)
     if not member:
-        return
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except discord.HTTPException:
+            return
     role = guild.get_role(int(role_id))
     if role and role < guild.me.top_role:
         try:
@@ -1888,7 +1891,10 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
         return
     member = guild.get_member(payload.user_id)
     if not member:
-        return
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except discord.HTTPException:
+            return
     role = guild.get_role(int(role_id))
     if role and role < guild.me.top_role:
         try:
