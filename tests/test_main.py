@@ -339,3 +339,23 @@ class TestParseCountingNumber(unittest.TestCase):
         self.assertIsNone(_parse_counting_number("not a number"))
         self.assertIsNone(_parse_counting_number("1.5"))
         self.assertIsNone(_parse_counting_number("2.5 + 3.1"))
+
+class TestParseIdSet(unittest.TestCase):
+    def test_parse_id_set(self):
+        from main import _parse_id_set
+
+        cases = [
+            (None, frozenset()),
+            ("", frozenset()),
+            ("   ", frozenset()),
+            ("123", frozenset({123})),
+            ("123, 456", frozenset({123, 456})),
+            ("123 456", frozenset({123, 456})),
+            ("123,abc,456", frozenset({123, 456})),
+            ("123, 456, 123", frozenset({123, 456})), # Dedup
+            ("abc", frozenset()),
+        ]
+
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(_parse_id_set(raw), expected)
