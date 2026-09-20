@@ -312,3 +312,30 @@ class TestPaginateLines(unittest.TestCase):
         # A single line exceeding char_budget should be truncated
         lines = ["a" * 20]
         self.assertEqual(paginate_lines(lines, per_page=5, char_budget=10), ["a" * 10])
+
+class TestParseCountingNumber(unittest.TestCase):
+    def test_parse_counting_number(self):
+        from main import _parse_counting_number
+
+        # Test basic numeric strings
+        self.assertEqual(_parse_counting_number("123"), 123)
+        self.assertEqual(_parse_counting_number("  456  "), 456)
+
+        # Test math expressions
+        self.assertEqual(_parse_counting_number("2+2"), 4)
+        self.assertEqual(_parse_counting_number("10 * 5"), 50)
+        self.assertEqual(_parse_counting_number("10 / 2"), 5)
+        self.assertEqual(_parse_counting_number("2**3"), 8)
+
+        # Test word to number conversions
+        self.assertEqual(_parse_counting_number("twenty two"), 22)
+        self.assertEqual(_parse_counting_number("one hundred"), 100)
+        self.assertEqual(_parse_counting_number("zero"), 0)
+
+        # Test invalid strings and edge cases
+        self.assertIsNone(_parse_counting_number(None))
+        self.assertIsNone(_parse_counting_number(""))
+        self.assertIsNone(_parse_counting_number("   "))
+        self.assertIsNone(_parse_counting_number("not a number"))
+        self.assertIsNone(_parse_counting_number("1.5"))
+        self.assertIsNone(_parse_counting_number("2.5 + 3.1"))
