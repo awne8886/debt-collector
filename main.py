@@ -2271,10 +2271,15 @@ async def roleall_cmd(ctx: commands.Context, role: str, *, time: Optional[str] =
     chunk_size = 10
     for i in range(0, len(members_to_update), chunk_size):
         chunk = members_to_update[i : i + chunk_size]
-        results = await asyncio.gather(*(_add_role(m) for m in chunk))
+
+        # Run API calls and the rate-limit delay concurrently
+        results, _ = await asyncio.gather(
+            asyncio.gather(*(_add_role(m) for m in chunk)),
+            asyncio.sleep(0.1)  # Minimum time per chunk to avoid rate limits
+        )
+
         success += sum(1 for r in results if r)
         failed += sum(1 for r in results if not r)
-        await asyncio.sleep(0.1)  # Avoid rate limits
 
     await ctx.channel.send(
         f"✅ Finished adding **{resolved.name}**! Success: {success}, Failed: {failed}"
