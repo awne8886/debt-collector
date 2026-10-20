@@ -1568,164 +1568,7 @@ def humanize_seconds(seconds: float) -> str:
     return f"{d:.0f}d {h:.0f}h"
 
 
-# --------------------------------------------------------------------------- #
-# Pagination
-# --------------------------------------------------------------------------- #
-
-EMBED_DESCRIPTION_LIMIT: int = 4000
-
-
-def paginate_lines(
-    lines: List[str],
-    per_page: int = 10,
-    char_budget: int = EMBED_DESCRIPTION_LIMIT,
-) -> List[str]:
-    """Group pre-formatted lines into page bodies that respect Discord's limits."""
-    pages: List[str] = []
-    current: List[str] = []
-    size: int = 0
-    for raw in lines:
-        line: str = raw[:char_budget]
-        if current and (len(current) >= per_page or size + len(line) + 1 > char_budget):
-            pages.append("\n".join(current))
-            current = []
-            size = 0
-        current.append(line)
-        size += len(line) + 1
-    if current:
-        pages.append("\n".join(current))
-    return pages or ["*Nothing to show.*"]
-
-
-class Paginator(discord.ui.View):
-    """First / prev / next / last controls over a list of pre-rendered embeds."""
-
-    def __init__(
-        self,
-        embeds: List[discord.Embed],
-        author_id: int,
-        timeout: float = 180.0,
-    ) -> None:
-        super().__init__(timeout=timeout)
-        self.embeds: List[discord.Embed] = embeds
-        self.author_id: int = author_id
-        self.index: int = 0
-        self.message: Optional[discord.Message] = None
-        self._sync_buttons()
-
-    def _sync_buttons(self) -> None:
-        at_start: bool = self.index == 0
-        at_end: bool = self.index >= len(self.embeds) - 1
-        self.first_page.disabled = at_start
-        self.prev_page.disabled = at_start
-        self.next_page.disabled = at_end
-        self.last_page.disabled = at_end
-        self.counter.label = f"{self.index + 1}/{len(self.embeds)}"
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.author_id or is_superuser(interaction.user):
-            return True
-        await interaction.response.send_message(
-            "❌ Only the person who ran the command can page through this.",
-            ephemeral=True,
-        )
-        return False
-
-    async def _show(self, interaction: discord.Interaction) -> None:
-        self._sync_buttons()
-        await interaction.response.edit_message(
-            embed=self.embeds[self.index], view=self
-        )
-
-    async def on_timeout(self) -> None:
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-        if self.message is not None:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary)
-    async def first_page(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        self.index = 0
-        await self._show(interaction)
-
-    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.primary)
-    async def prev_page(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        self.index = max(0, self.index - 1)
-        await self._show(interaction)
-
-    @discord.ui.button(label="1/1", style=discord.ButtonStyle.secondary, disabled=True)
-    async def counter(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        await interaction.response.defer()
-
-    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.primary)
-    async def next_page(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        self.index = min(len(self.embeds) - 1, self.index + 1)
-        await self._show(interaction)
-
-    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary)
-    async def last_page(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        self.index = len(self.embeds) - 1
-        await self._show(interaction)
-
-
-def build_pages(
-    title: str,
-    lines: List[str],
-    color: Union[discord.Color, int],
-    per_page: int = 10,
-    thumbnail: Optional[str] = None,
-    footer: Optional[str] = None,
-) -> List[discord.Embed]:
-    """Turn a flat list of lines into one embed per page."""
-    embeds: List[discord.Embed] = []
-    for body in paginate_lines(lines, per_page=per_page):
-        embed: discord.Embed = discord.Embed(title=title, description=body, color=color)
-        if thumbnail is not None:
-            embed.set_thumbnail(url=thumbnail)
-        if footer is not None:
-            embed.set_footer(text=footer)
-        embeds.append(embed)
-    return embeds
-
-
-async def send_pages(
-    ctx: commands.Context,
-    embeds: List[discord.Embed],
-    ephemeral: bool = False,
-) -> None:
-    """Send a single embed plainly, or several behind a Paginator view."""
-    if not embeds:
-        await ctx.send("*Nothing to show.*", ephemeral=ephemeral)
-        return
-
-    total: int = len(embeds)
-    if total > 1:
-        for position, embed in enumerate(embeds, start=1):
-            existing: str = embed.footer.text or ""
-            marker: str = f"Page {position}/{total}"
-            embed.set_footer(text=f"{existing} · {marker}" if existing else marker)
-
-    if total == 1:
-        await ctx.send(embed=embeds[0], ephemeral=ephemeral)
-        return
-
-    view: Paginator = Paginator(embeds, ctx.author.id)
-    view.message = await ctx.send(embed=embeds[0], view=view, ephemeral=ephemeral)
-
+from utils.pagination import EMBED_DESCRIPTION_LIMIT, paginate_lines, Paginator, build_pages, send_pages
 
 # --------------------------------------------------------------------------- #
 # Events
@@ -1995,6 +1838,43 @@ async def on_message(message: discord.Message) -> None:
                         "autopurge", exc, guild=message.guild, user=message.author
                     )
                 return
+
+
+        msg_entries = autopurge.get("messages") or {}
+        for key, m_entry in list(msg_entries.items()):
+            if message.author.id == bot.user.id:
+                break
+
+            until: Optional[float] = m_entry.get("until")
+            if until and time.time() > until:
+                msgs_dict = dict(autopurge.get("messages") or {})
+                msgs_dict.pop(key, None)
+                await bot.settings.push_fields(
+                    message.guild.id, {"autopurge.messages": msgs_dict}
+                )
+                continue
+
+            txt = m_entry.get("text", "")
+            mtype = m_entry.get("match_type", "contains")
+            content_lower = message.content.casefold()
+            needle = txt.casefold()
+
+            is_match = False
+            if mtype == "starts_with" and content_lower.startswith(needle):
+                is_match = True
+            elif mtype == "ends_with" and content_lower.endswith(needle):
+                is_match = True
+            elif mtype == "contains" and needle in content_lower:
+                is_match = True
+
+            if is_match:
+                try:
+                    await message.delete()
+                    return  # Stop processing this message since it's deleted
+                except discord.HTTPException as exc:
+                    bot.log_error(
+                        "autopurge_msg", exc, guild=message.guild, user=message.author
+                    )
 
         user_entry = (autopurge.get("users") or {}).get(str(message.author.id))
         if user_entry and message.author.id != bot.user.id:
@@ -2901,6 +2781,31 @@ async def _run_purge(
 async def purge_group(ctx: commands.Context, amount: int = 10):
     await _run_purge(ctx, amount, None, "messages")
 
+
+
+@purge_group.command(name="msg", aliases=["purgemsg"], description="Delete recent messages matching text criteria")
+@app_commands.describe(
+    text="Text to match",
+    match_type="How to match: 'contains', 'starts_with', or 'ends_with'",
+    amount="How many to delete (1-500)",
+)
+async def purge_msg(
+    ctx: commands.Context,
+    text: str,
+    match_type: Literal["contains", "starts_with", "ends_with"] = "contains",
+    amount: int = 10,
+):
+    needle = text.casefold()
+    if match_type == "starts_with":
+        check = lambda m: m.content.casefold().startswith(needle)
+        label = f"messages starting with `{text[:60]}`"
+    elif match_type == "ends_with":
+        check = lambda m: m.content.casefold().endswith(needle)
+        label = f"messages ending with `{text[:60]}`"
+    else:
+        check = lambda m: needle in m.content.casefold()
+        label = f"messages containing `{text[:60]}`"
+    await _run_purge(ctx, amount, check, label)
 
 @purge_group.command(name="user", description="Delete a member's recent messages")
 @app_commands.describe(
@@ -3939,6 +3844,94 @@ async def autopurge_exempt(
     await ctx.send(msg, ephemeral=True)
 
 
+
+@autopurge_group.command(
+    name="msg_on",
+    description="Start auto-deleting every new message matching text criteria",
+)
+@app_commands.describe(
+    text="Text to match",
+    match_type="How to match: 'contains', 'starts_with', or 'ends_with'",
+    hours="Optional: automatically stop after this many hours",
+    days="Optional: automatically stop after this many days",
+)
+async def autopurge_msg_on(
+    ctx: commands.Context,
+    text: str,
+    match_type: Literal["contains", "starts_with", "ends_with"] = "contains",
+    hours: Optional[app_commands.Range[int, 1, 720]] = None,
+    days: Optional[app_commands.Range[int, 1, 365]] = None,
+):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    until = None
+    if hours or days:
+        until = int(time.time()) + (hours or 0) * 3600 + (days or 0) * 86400
+
+    settings = bot.settings.get_settings(ctx.guild.id)
+    ap = settings.setdefault(
+        "autopurge", {"channels": {}, "exempt_roles": [], "users": {}, "messages": {}}
+    )
+    messages_dict = ap.setdefault("messages", {})
+
+    key = f"{match_type}:{text}"
+    messages_dict[key] = {"until": until, "text": text, "match_type": match_type}
+    bot.settings.update_settings(ctx.guild.id, settings)
+
+    when = (
+        f"until <t:{until}:f>"
+        if until
+        else "until you run `/autopurge msg_off`"
+    )
+
+    desc_str = ""
+    if match_type == "starts_with":
+        desc_str = f"starting with `{text}`"
+    elif match_type == "ends_with":
+        desc_str = f"ending with `{text}`"
+    else:
+        desc_str = f"containing `{text}`"
+
+    await ctx.send(
+        f"🧹 Auto-purge is now **on** for messages {desc_str} {when}. "
+        "Every new message matching this will be deleted.",
+        ephemeral=True,
+    )
+
+
+@autopurge_group.command(
+    name="msg_off", description="Stop auto-deleting messages matching text criteria"
+)
+@app_commands.describe(
+    text="Text to match",
+    match_type="How to match: 'contains', 'starts_with', or 'ends_with'"
+)
+async def autopurge_msg_off(
+    ctx: commands.Context,
+    text: str,
+    match_type: Literal["contains", "starts_with", "ends_with"] = "contains",
+):
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    settings = bot.settings.get_settings(ctx.guild.id)
+    ap = settings.get("autopurge", {"channels": {}, "exempt_roles": [], "users": {}, "messages": {}})
+    messages_dict = ap.get("messages", {})
+
+    key = f"{match_type}:{text}"
+    removed = messages_dict.pop(key, None)
+
+    if removed:
+        bot.settings.update_settings(ctx.guild.id, settings)
+
+    msg = (
+        f"✅ Auto-purge turned off for messages matching `{text}`."
+        if removed
+        else f"Auto-purge wasn't active for messages matching `{text}`."
+    )
+    await ctx.send(msg, ephemeral=True)
+
 @autopurge_group.command(
     name="user_on",
     description="Start auto-deleting every new message from a specific user",
@@ -4104,6 +4097,29 @@ async def autopurge_status(ctx: commands.Context):
         embed.add_field(
             name="Auto-purged Users",
             value="\n".join(user_lines)[:1024],
+            inline=False,
+        )
+
+    msg_lines = []
+    for k, v in ap.get("messages", {}).items():
+        until = v.get("until")
+        mtype = v.get("match_type")
+        txt = v.get("text")
+        mtype_str = "containing"
+        if mtype == "starts_with":
+            mtype_str = "starting with"
+        elif mtype == "ends_with":
+            mtype_str = "ending with"
+
+        msg_lines.append(
+            f"Messages {mtype_str} `{txt}` — "
+            + (f"until <t:{until}:f>" if until else "until turned off")
+        )
+
+    if msg_lines:
+        embed.add_field(
+            name="Auto-purged Messages",
+            value="\n".join(msg_lines)[:1024],
             inline=False,
         )
     await ctx.send(embed=embed, ephemeral=True)
