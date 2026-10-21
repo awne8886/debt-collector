@@ -1568,7 +1568,13 @@ def humanize_seconds(seconds: float) -> str:
     return f"{d:.0f}d {h:.0f}h"
 
 
-from utils.pagination import EMBED_DESCRIPTION_LIMIT, paginate_lines, Paginator, build_pages, send_pages
+from utils.pagination import (
+    EMBED_DESCRIPTION_LIMIT,
+    paginate_lines,
+    Paginator,
+    build_pages,
+    send_pages,
+)
 
 # --------------------------------------------------------------------------- #
 # Events
@@ -1770,14 +1776,34 @@ async def _cache_single_attachment(
         log.debug("Failed to cache attachment: %s", exc)
 
 
+def _extract_message_text(message: discord.Message) -> str:
+    parts = [message.content] if message.content else []
+    for embed in message.embeds:
+        if embed.title:
+            parts.append(embed.title)
+        if embed.description:
+            parts.append(embed.description)
+        for field in embed.fields:
+            if field.name:
+                parts.append(field.name)
+            if field.value:
+                parts.append(field.value)
+        if embed.author and embed.author.name:
+            parts.append(embed.author.name)
+        if embed.footer and embed.footer.text:
+            parts.append(embed.footer.text)
+    return " ".join(parts).casefold()
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if message.author.bot or message.guild is None:
+    if message.guild is None:
         return
 
     try:
-        await _handle_afk_return(message)
-        await _handle_afk_mentions(message)
+        if not message.author.bot:
+            await _handle_afk_return(message)
+            await _handle_afk_mentions(message)
 
         if message.attachments:
             config = (
@@ -1839,7 +1865,6 @@ async def on_message(message: discord.Message) -> None:
                     )
                 return
 
-
         msg_entries = autopurge.get("messages") or {}
         for key, m_entry in list(msg_entries.items()):
             if message.author.id == bot.user.id:
@@ -1856,7 +1881,7 @@ async def on_message(message: discord.Message) -> None:
 
             txt = m_entry.get("text", "")
             mtype = m_entry.get("match_type", "contains")
-            content_lower = message.content.casefold()
+            content_lower = _extract_message_text(message)
             needle = txt.casefold()
 
             is_match = False
@@ -1895,6 +1920,9 @@ async def on_message(message: discord.Message) -> None:
                         "autopurge_user", exc, guild=message.guild, user=message.author
                     )
                 return
+
+        if message.author.bot:
+            return
 
         if await _handle_automod(message):
             return
@@ -2155,7 +2183,7 @@ async def roleall_cmd(ctx: commands.Context, role: str, *, time: Optional[str] =
         # Run API calls and the rate-limit delay concurrently
         results, _ = await asyncio.gather(
             asyncio.gather(*(_add_role(m) for m in chunk)),
-            asyncio.sleep(0.1)  # Minimum time per chunk to avoid rate limits
+            asyncio.sleep(0.1),  # Minimum time per chunk to avoid rate limits
         )
 
         success += sum(1 for r in results if r)
@@ -2782,8 +2810,11 @@ async def purge_group(ctx: commands.Context, amount: int = 10):
     await _run_purge(ctx, amount, None, "messages")
 
 
-
-@purge_group.command(name="msg", aliases=["purgemsg"], description="Delete recent messages matching text criteria")
+@purge_group.command(
+    name="msg",
+    aliases=["purgemsg"],
+    description="Delete recent messages matching text criteria",
+)
 @app_commands.describe(
     text="Text to match",
     match_type="How to match: 'contains', 'starts_with', or 'ends_with'",
@@ -2797,15 +2828,16 @@ async def purge_msg(
 ):
     needle = text.casefold()
     if match_type == "starts_with":
-        check = lambda m: m.content.casefold().startswith(needle)
+        check = lambda m: _extract_message_text(m).startswith(needle)
         label = f"messages starting with `{text[:60]}`"
     elif match_type == "ends_with":
-        check = lambda m: m.content.casefold().endswith(needle)
+        check = lambda m: _extract_message_text(m).endswith(needle)
         label = f"messages ending with `{text[:60]}`"
     else:
-        check = lambda m: needle in m.content.casefold()
+        check = lambda m: needle in _extract_message_text(m)
         label = f"messages containing `{text[:60]}`"
     await _run_purge(ctx, amount, check, label)
+
 
 @purge_group.command(name="user", description="Delete a member's recent messages")
 @app_commands.describe(
@@ -2829,7 +2861,7 @@ async def purge_contains(ctx: commands.Context, text: str, amount: int = 10):
     await _run_purge(
         ctx,
         amount,
-        lambda m: needle in m.content.casefold(),
+        lambda m: needle in _extract_message_text(m),
         f"messages containing `{text[:60]}`",
     )
 
@@ -3844,7 +3876,6 @@ async def autopurge_exempt(
     await ctx.send(msg, ephemeral=True)
 
 
-
 @autopurge_group.command(
     name="msg_on",
     description="Start auto-deleting every new message matching text criteria",
@@ -3879,11 +3910,7 @@ async def autopurge_msg_on(
     messages_dict[key] = {"until": until, "text": text, "match_type": match_type}
     bot.settings.update_settings(ctx.guild.id, settings)
 
-    when = (
-        f"until <t:{until}:f>"
-        if until
-        else "until you run `/autopurge msg_off`"
-    )
+    when = f"until <t:{until}:f>" if until else "until you run `/autopurge msg_off`"
 
     desc_str = ""
     if match_type == "starts_with":
@@ -3905,7 +3932,7 @@ async def autopurge_msg_on(
 )
 @app_commands.describe(
     text="Text to match",
-    match_type="How to match: 'contains', 'starts_with', or 'ends_with'"
+    match_type="How to match: 'contains', 'starts_with', or 'ends_with'",
 )
 async def autopurge_msg_off(
     ctx: commands.Context,
@@ -3916,7 +3943,9 @@ async def autopurge_msg_off(
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
     settings = bot.settings.get_settings(ctx.guild.id)
-    ap = settings.get("autopurge", {"channels": {}, "exempt_roles": [], "users": {}, "messages": {}})
+    ap = settings.get(
+        "autopurge", {"channels": {}, "exempt_roles": [], "users": {}, "messages": {}}
+    )
     messages_dict = ap.get("messages", {})
 
     key = f"{match_type}:{text}"
@@ -3931,6 +3960,7 @@ async def autopurge_msg_off(
         else f"Auto-purge wasn't active for messages matching `{text}`."
     )
     await ctx.send(msg, ephemeral=True)
+
 
 @autopurge_group.command(
     name="user_on",
@@ -10580,7 +10610,7 @@ async def messagelog_edit(payload: discord.RawMessageUpdateEvent) -> None:
 
     data: Dict[str, Any] = payload.data or {}
     author: Dict[str, Any] = data.get("author") or {}
-    if author.get("bot"):
+    if author.get("bot") and "webhook_id" not in data:
         return
 
     after: str = str(data.get("content") or "")
@@ -10640,7 +10670,11 @@ async def messagelog_delete(payload: discord.RawMessageDeleteEvent) -> None:
         return
 
     cached: Optional[discord.Message] = payload.cached_message
-    if cached is not None and cached.author.bot:
+    if (
+        cached is not None
+        and cached.author.bot
+        and not getattr(cached, "webhook_id", None)
+    ):
         return
 
     embed: discord.Embed = discord.Embed(
