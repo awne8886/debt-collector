@@ -1177,6 +1177,10 @@ class DebtCollectorBot(commands.Bot):
             log.warning("Index setup failed: %s", exc)
         self.add_view(ModmailPanelView())
         self.add_view(TicketCloseView())
+        try:
+            await self.load_extension("cogs.music")
+        except Exception as exc:
+            log.error("Music module failed to load - continuing without it: %s", exc)
         await self._sync_commands_if_changed()
         for loop_task in (
             reminder_loop,
@@ -3041,6 +3045,7 @@ CATEGORY_LABELS: Dict[str, str] = {
     "config": "\u2699\ufe0f Configuration (admin)",
     "ai": "\U0001f9e0 AI",
     "fun": "\U0001f389 Fun & roleplay",
+    "music": "\U0001f3b5 Music",
 }
 
 # Root command -> category. Every root command in the tree must appear here;
@@ -3119,6 +3124,19 @@ COMMAND_CATEGORY: Dict[str, str] = {
     "ai": "ai",
     "ask": "ai",
     "aiopt": "ai",
+    # Music
+    "play": "music",
+    "playnext": "music",
+    "pause": "music",
+    "resume": "music",
+    "skip": "music",
+    "stop": "music",
+    "leave": "music",
+    "nowplaying": "music",
+    "volume": "music",
+    "loop": "music",
+    "seek": "music",
+    "queue": "music",
 }
 
 # Precise one-line summaries. Keys are fully qualified names, so subcommands are
@@ -3294,6 +3312,25 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "ai stats": "AI usage counters since the last restart.",
     "ask": "Ask the AI a one-off question with no conversation memory.",
     "aiopt": "Opt yourself out of, or back into, the AI reading and replying to you.",
+    # --- Music ---
+    "play": "Join your voice channel and play a YouTube / YouTube Music link, or the top result for a search.",
+    "playnext": "Like play, but the track goes to the front of the queue.",
+    "pause": "Pause the current track.",
+    "resume": "Resume a paused track.",
+    "skip": "Skip the current track. The requester and staff skip instantly; otherwise listeners vote.",
+    "stop": "Stop playback and clear the queue (staff or the only listener).",
+    "leave": "Disconnect from voice and clear the queue (staff or the only listener).",
+    "nowplaying": "Show the current track with a progress bar.",
+    "volume": "Show or set the playback volume (0-150%).",
+    "loop": "Loop the current track or the whole queue; with no argument it cycles off, track, queue.",
+    "seek": "Jump to a time in the current track, e.g. `1:30` or `90`.",
+    "queue": "Show the queue.",
+    "queue show": "Show the queue with durations and who requested each track.",
+    "queue shuffle": "Shuffle the waiting tracks.",
+    "queue remove": "Remove a waiting track by position (its requester or staff).",
+    "queue move": "Move a waiting track to a new position.",
+    "queue clear": "Remove every waiting track but keep the current one playing (staff or the only listener).",
+    "queue skipto": "Skip ahead to a queue position (staff or the only listener).",
 }
 
 
@@ -3555,7 +3592,17 @@ async def help_cmd(ctx: commands.Context, *, command: Optional[str] = None) -> N
 async def commands_cmd(
     ctx: commands.Context,
     category: Optional[
-        Literal["all", "moderation", "roles", "utility", "info", "config", "ai", "fun"]
+        Literal[
+            "all",
+            "moderation",
+            "roles",
+            "utility",
+            "info",
+            "config",
+            "ai",
+            "fun",
+            "music",
+        ]
     ] = None,
 ) -> None:
     prefix: str = ctx.clean_prefix or COMMAND_PREFIX
