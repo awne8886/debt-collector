@@ -36,6 +36,7 @@ from utils.pagination import build_pages, send_pages
 from utils.ytdl import (
     ExtractionError,
     StreamInfo,
+    LOG_GUILD,
     environment_report,
     ffmpeg_executable,
     memory_snapshot,
@@ -140,6 +141,8 @@ class MusicTrace(logging.Handler):
         try:
             message: str = record.getMessage()
             guild_id: Optional[int] = getattr(record, "guild_id", None)
+            if guild_id is None:
+                guild_id = LOG_GUILD.get()  # resolver/yt-dlp lines: the guild the lookup ran for
             self.lines.append((record.created, record.levelname, guild_id, message))
             if record.levelno == logging.WARNING and not getattr(record, "no_feed", False):
                 self.cog.record_threadsafe("music:warning", message, guild_id)
@@ -148,8 +151,15 @@ class MusicTrace(logging.Handler):
 
     def tail(self, limit: int, guild_id: Optional[int] = None, everything: bool = False) -> List[str]:
         """Newest-last lines. Without `everything`, other servers' lines are left out."""
+        # emit() runs on other threads (ffmpeg, yt-dlp); iterating a deque that is being appended
+        # to raises RuntimeError, so take a snapshot under the handler lock first.
+        self.acquire()
+        try:
+            snapshot = list(self.lines)
+        finally:
+            self.release()
         picked: List[str] = []
-        for created, level, line_guild, message in self.lines:
+        for created, level, line_guild, message in snapshot:
             if not everything and line_guild is not None and line_guild != guild_id:
                 continue
             stamp: str = time.strftime("%H:%M:%S", time.gmtime(created))
@@ -347,10 +357,7 @@ class GuildPlayer:
         try:
             # Resolved right now (never from the queue): YouTube stream URLs expire. One
             # extraction at a time, because yt-dlp's JS runtime is the memory spike on small hosts.
-            async with self.cog.extract_lock:
-                stream: StreamInfo = await asyncio.wait_for(
-                    asyncio.to_thread(resolve_stream, track), RESOLVE_TIMEOUT
-                )
+            stream: StreamInfo = await self.cog.extract(self.guild.id, resolve_stream, track)
             await self._check_voice_ready(vc)
             source = self._build_source(stream, position)
         except MusicError as exc:
@@ -716,6 +723,28 @@ class MusicCog(commands.Cog, name="Music"):
         with contextlib.suppress(Exception):
             recorder(where, error, guild=guild)
 
+    async def extract(self, guild_id: Optional[int], func: Any, *args: Any) -> Any:
+        """Run a blocking yt-dlp call in a worker thread, one at a time.
+
+        The lock is released when the *worker* finishes, not when the caller gives up: a timeout
+        abandons the wait (asyncio.TimeoutError) but the thread keeps running, and letting the
+        next extraction start meanwhile would break the one-at-a-time memory guarantee."""
+        LOG_GUILD.set(guild_id)  # tags the worker's log lines with this server
+        await self.extract_lock.acquire()
+        try:
+            worker: "asyncio.Future[Any]" = asyncio.ensure_future(asyncio.to_thread(func, *args))
+        except BaseException:
+            self.extract_lock.release()
+            raise
+
+        def _finished(done: "asyncio.Future[Any]") -> None:
+            self.extract_lock.release()
+            if not done.cancelled():
+                done.exception()  # mark retrieved: a caller that timed out never awaits it
+
+        worker.add_done_callback(_finished)
+        return await asyncio.wait_for(asyncio.shield(worker), RESOLVE_TIMEOUT)
+
     def record_threadsafe(self, where: str, message: str, guild_id: Optional[int]) -> None:
         """Feed /errors from any thread (ffmpeg's stderr reader, yt-dlp worker, logging)."""
 
@@ -879,11 +908,9 @@ class MusicCog(commands.Cog, name="Music"):
         player.log.info("command: play query=%.80r front=%s user=%s", query, front, ctx.author.id)
         async with ctx.typing():
             try:
-                async with self.extract_lock:  # one yt-dlp run at a time (memory)
-                    resolved = await asyncio.wait_for(
-                        asyncio.to_thread(resolve_tracks, parsed, ctx.author.id, ctx.author.display_name),
-                        RESOLVE_TIMEOUT,
-                    )
+                resolved = await self.extract(
+                    ctx.guild.id, resolve_tracks, parsed, ctx.author.id, ctx.author.display_name
+                )
             except ExtractionError as exc:
                 player.log.warning("command: lookup failed: %s", exc)
                 raise MusicError(str(exc))

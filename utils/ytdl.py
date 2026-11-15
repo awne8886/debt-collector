@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -23,6 +24,11 @@ from utils.music import (
 )
 
 log = logging.getLogger("debt-collector.music")
+
+# The guild a lookup is running for. asyncio.to_thread copies the context into its worker
+# thread, so log lines from yt-dlp/resolver code get tagged with it (and are only shown in
+# that server's `/errors music`). Unset means process-wide diagnostics.
+LOG_GUILD: ContextVar[Optional[int]] = ContextVar("music_log_guild", default=None)
 
 MAX_PLAYLIST_ITEMS: int = int(os.getenv("MUSIC_MAX_PLAYLIST", "50"))
 
@@ -156,6 +162,7 @@ def _js_runtimes() -> Dict[str, Dict[str, Any]]:
 
 
 _COOKIE_COPY: str = os.path.join(tempfile.gettempdir(), "debt-collector-ytdl-cookies.txt")
+_COOKIE_SOURCE_SIG: Optional[Tuple[str, int, int, int]] = None  # identity/version of the last-copied source
 
 
 def _cookie_file() -> Optional[str]:
@@ -167,9 +174,15 @@ def _cookie_file() -> Optional[str]:
     if not os.path.isfile(source):
         log.warning("YTDL_COOKIES_FILE=%s does not exist; continuing without cookies.", source)
         return None
+    global _COOKIE_SOURCE_SIG
     try:
-        if not os.path.exists(_COOKIE_COPY) or os.path.getmtime(source) > os.path.getmtime(_COOKIE_COPY):
+        # Compare the *source* against what was last copied (yt-dlp rewrites the copy, which
+        # would otherwise make it look newer than a freshly exported source file).
+        stat = os.stat(source)
+        signature = (os.path.realpath(source), stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        if signature != _COOKIE_SOURCE_SIG or not os.path.exists(_COOKIE_COPY):
             shutil.copyfile(source, _COOKIE_COPY)
+            _COOKIE_SOURCE_SIG = signature
         return _COOKIE_COPY
     except OSError as exc:
         log.warning("Couldn't make a writable copy of the cookies file (%s); using it as-is.", exc)

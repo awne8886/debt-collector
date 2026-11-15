@@ -38,7 +38,7 @@ Everything is a **hybrid command**: use `/ban` or `!ban`. The prefix is per-serv
 ### 1. Requirements
 
 * **Python 3.11**
-* A **Discord bot token** ([Developer Portal](https://discord.com/developers/applications))
+* A **Discord bot token** ([Developer Portal](https://discord.com/developers/applications)). Under **Bot → Privileged Gateway Intents**, enable **Server Members Intent** and **Message Content Intent** before starting the bot, otherwise it exits at startup with `PrivilegedIntentsRequired`
 * A **MongoDB** database (a free Atlas cluster is plenty) — all per-server settings live there
 * For music: **ffmpeg** (bundled via `imageio-ffmpeg`) and a **JavaScript runtime** (`deno`, `node` or `bun`) on `PATH`
 
