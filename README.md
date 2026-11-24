@@ -32,7 +32,10 @@ anything else is treated as a search or rejected.
 ### Hosting requirements
 
 * **Bot permissions:** Connect and Speak in the voice channels it should use.
-* **PyNaCl** and **yt-dlp** come from `requirements.txt`.
+* **PyNaCl**, **davey** and **yt-dlp** come from `requirements.txt`. `davey` (Discord's voice
+  encryption, DAVE) is pinned below 0.2: with 0.2 and discord.py 2.7.1 the bot shows as
+  speaking but nobody hears it. The bot logs a warning at startup if that combination
+  comes back, and logs `DAVE ... ready=` for each track it plays.
 * **ffmpeg:** used from `FFMPEG_PATH`, then `PATH`, then the static build bundled by
   `imageio-ffmpeg`, so a plain `pip install -r requirements.txt` is enough.
 * **A JavaScript runtime** (`deno`, `node` or `bun`) must be on `PATH`: current yt-dlp
@@ -58,6 +61,7 @@ anything else is treated as a search or rejected.
 | `YTDL_COOKIES_FILE` | unset | Cookies file passed to yt-dlp |
 | `YTDL_CACHE_DIR` | temp folder | Where yt-dlp caches YouTube's player code between plays |
 | `YTDL_WARP` | `auto` | Cloudflare WARP for YouTube: `auto` when YouTube blocks the host's IP, `on` always, `off` never (see below) |
+| `WARP_IPV6` | off | `1` also sends IPv6 through WARP. Off by default: YouTube treats WARP's IPv6 exits as region-locked and bot-checks them more |
 | `WARP_DIR` | temp folder | Where the WARP registration and the `wireproxy` binary are kept |
 | `WIREPROXY_PATH` | download | Use this `wireproxy` binary instead of downloading the pinned release |
 | `MUSIC_WARMUP` | `on` | `off` skips the YouTube check the bot runs once at startup |

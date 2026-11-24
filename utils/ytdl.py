@@ -93,8 +93,12 @@ def friendly_error(message: str) -> str:
         return "That video is private."
     if "members-only" in text or "members only" in text or "join this channel" in text:
         return "That video is for channel members only."
-    if "not available in your country" in text or "blocked it in your country" in text:
-        return "That video isn't available in this server's region."
+    if (
+        "not available in your country" in text
+        or "available in your country" in text
+        or "blocked it in your country" in text
+    ):
+        return "That video is region-locked and isn't available where the bot connects from."
     if "copyright" in text:
         return "That video was blocked for copyright reasons."
     if "video unavailable" in text or "this video is not available" in text:
@@ -343,6 +347,7 @@ _FINAL_ERRORS: Tuple[str, ...] = (
     "live event will begin",
     "premieres in",
     "not available in your country",
+    "made this video available in your country",
     "blocked it in your country",
     "is not a valid url",
     "unsupported url",
@@ -541,7 +546,8 @@ def _rotate(
             tried.append(strategy.label)
             log.warning(
                 "yt-dlp failed for %s via %s in %.1fs: %s",
-                target, strategy.label, time.monotonic() - attempt_started, message,
+                target, strategy.label, time.monotonic() - attempt_started,
+                message.splitlines()[0][:400] if message else message,
             )
             for warning in logger.warnings[-5:]:
                 log.info("  yt-dlp said: %s", warning)
