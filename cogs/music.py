@@ -728,9 +728,24 @@ class MusicCog(commands.Cog, name="Music"):
 
         The lock is released when the *worker* finishes, not when the caller gives up: a timeout
         abandons the wait (asyncio.TimeoutError) but the thread keeps running, and letting the
-        next extraction start meanwhile would break the one-at-a-time memory guarantee."""
+        next extraction start meanwhile would break the one-at-a-time memory guarantee.
+
+        One RESOLVE_TIMEOUT deadline covers waiting for the lock *and* the extraction itself, so a
+        stuck worker can't leave other servers (or this server's skip/stop) waiting forever."""
         LOG_GUILD.set(guild_id)  # tags the worker's log lines with this server
-        await self.extract_lock.acquire()
+        loop = asyncio.get_running_loop()
+        deadline: float = loop.time() + RESOLVE_TIMEOUT
+        if self.extract_lock.locked():
+            log.info("extract: waiting for another extraction to finish")
+        try:
+            await asyncio.wait_for(self.extract_lock.acquire(), RESOLVE_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("extract: gave up waiting %.0fs for another extraction to finish", RESOLVE_TIMEOUT)
+            raise
+        remaining: float = deadline - loop.time()
+        if remaining <= 0:  # the wait used the whole budget; don't start work nobody is waiting for
+            self.extract_lock.release()
+            raise asyncio.TimeoutError()
         try:
             worker: "asyncio.Future[Any]" = asyncio.ensure_future(asyncio.to_thread(func, *args))
         except BaseException:
@@ -743,7 +758,7 @@ class MusicCog(commands.Cog, name="Music"):
                 done.exception()  # mark retrieved: a caller that timed out never awaits it
 
         worker.add_done_callback(_finished)
-        return await asyncio.wait_for(asyncio.shield(worker), RESOLVE_TIMEOUT)
+        return await asyncio.wait_for(asyncio.shield(worker), remaining)
 
     def record_threadsafe(self, where: str, message: str, guild_id: Optional[int]) -> None:
         """Feed /errors from any thread (ffmpeg's stderr reader, yt-dlp worker, logging)."""
