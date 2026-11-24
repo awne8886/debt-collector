@@ -53,6 +53,7 @@ anything else is treated as a search or rejected.
 | --- | --- | --- |
 | `YTDL_PROXY` | unset | Proxy for all YouTube traffic, e.g. `socks5://127.0.0.1:40000` or `http://user:pass@host:port` |
 | `YTDL_PLAYER_CLIENTS` | yt-dlp's choice | Comma-separated YouTube clients to try, e.g. `tv_simply,web_embedded` |
+| `YTDL_FALLBACK_CLIENTS` | `default,tv,mweb,web_safari,tv_simply` | Clients to retry with when YouTube returns no playable audio; empty turns the retry off |
 | `YTDL_COOKIES_FILE` | unset | Cookies file passed to yt-dlp |
 | `FFMPEG_PATH` | auto | Path to an ffmpeg binary |
 | `MUSIC_DEFAULT_VOLUME` | `50` | Starting volume, 0-150 |

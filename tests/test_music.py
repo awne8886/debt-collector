@@ -359,6 +359,64 @@ class TestYtdlHelpers(unittest.TestCase):
             _writable_cookie_file.cache_clear()
             self.assertEqual(options["cookiefile"], source)
 
+    def test_resolve_stream_retries_with_fallback_clients(self):
+        import yt_dlp
+
+        from utils.ytdl import resolve_stream
+
+        calls = []
+
+        class FakeYDL:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=False):
+                calls.append(self.options)
+                if len(calls) == 1:
+                    raise yt_dlp.utils.DownloadError("ERROR: Requested format is not available")
+                return {"url": "https://audio.invalid/a", "duration": 10}
+
+        with patch.dict("os.environ", {}, clear=True), patch("yt_dlp.YoutubeDL", FakeYDL), \
+                self.assertLogs("debt-collector.music", "WARNING"):
+            stream = resolve_stream(make_track("song"))
+        self.assertEqual(stream.url, "https://audio.invalid/a")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("extractor_args", calls[0])
+        self.assertEqual(calls[1]["extractor_args"]["youtube"]["player_client"][0], "default")
+
+    def test_resolve_stream_does_not_retry_other_errors(self):
+        import yt_dlp
+
+        from utils.ytdl import resolve_stream
+
+        calls = []
+
+        class FakeYDL:
+            def __init__(self, options):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=False):
+                calls.append(url)
+                raise yt_dlp.utils.DownloadError("ERROR: Private video")
+
+        with patch.dict("os.environ", {}, clear=True), patch("yt_dlp.YoutubeDL", FakeYDL), \
+                self.assertLogs("debt-collector.music", "WARNING"), \
+                self.assertRaises(ExtractionError):
+            resolve_stream(make_track("song"))
+        self.assertEqual(len(calls), 1)
+
     def test_entry_to_track(self):
         entry = {"id": VID, "title": "Song", "duration": 212.0, "channel": "Artist"}
         track = _entry_to_track(entry, 5, "Me")
