@@ -197,6 +197,11 @@ def _js_runtimes() -> Dict[str, Dict[str, Any]]:
         if path:
             runtimes[name] = {"path": path}
             found.append(name)
+    try:
+        from yt_dlp.version import __version__ as ytdlp_version
+    except Exception:
+        ytdlp_version = "unknown"
+    log.info("yt-dlp version %s", ytdlp_version)
     if found:
         log.info("JavaScript runtimes available to yt-dlp: %s", ", ".join(found))
     else:

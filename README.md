@@ -144,6 +144,9 @@ Play YouTube and YouTube Music in a voice channel. The bot joins the channel you
 * **libopus** is optional. Without it the bot falls back to ffmpeg's Opus output and a volume change restarts the current track from where it was.
 * **YouTube bot checks:** many datacenter IPs get *"Sign in to confirm you're not a bot"*. YouTube decides this by the host's IP address, so a fix needs one of the options under [Getting past YouTube's bot check](#getting-past-youtubes-bot-check).
 * Keep `yt-dlp` current (`pip install -U yt-dlp`); YouTube changes break old versions.
+  Hosts that cache packages between builds (Render) keep an old copy until the minimum
+  version in `requirements.txt` is raised or the build cache is cleared. The bot logs
+  the yt-dlp version it is running the first time it uses YouTube.
 
 ### 🩺 Music troubleshooting
 
