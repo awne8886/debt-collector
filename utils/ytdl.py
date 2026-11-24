@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 from contextvars import ContextVar
@@ -141,6 +142,13 @@ def friendly_error(message: str) -> str:
         return "That video is unavailable."
     if "live event will begin" in text or "premieres in" in text:
         return "That live stream or premiere hasn't started yet."
+    if "requested format is not available" in text or "only images are available" in text:
+        return (
+            "YouTube gave me no playable audio for that. If this happens for every video, "
+            "the host is missing a JavaScript runtime (deno) or yt-dlp needs updating."
+        )
+    if "http error 403" in text:
+        return "YouTube refused the request (HTTP 403). Try again in a moment."
     if "unable to download" in text or "timed out" in text or "connection" in text:
         return "I couldn't reach YouTube just now. Try again in a moment."
     return "I couldn't load that from YouTube."
@@ -176,13 +184,27 @@ class _YtdlLogger:
 
 
 def _js_runtimes() -> Dict[str, Dict[str, Any]]:
-    """Every JavaScript runtime on PATH, by full path (yt-dlp only auto-enables a bare `deno`)."""
-    found: Dict[str, Dict[str, Any]] = {}
+    """YouTube needs a JavaScript runtime; yt-dlp only auto-enables a bare `deno`, so every
+    runtime found is passed by full path (Render's Deno isn't on the service PATH, though
+    `_extend_path` fixes that). deno is always listed: yt-dlp also finds the copy that pip
+    installs (yt-dlp[deno]) next to Python, which isn't always on PATH.
+    """
+    runtimes: Dict[str, Dict[str, Any]] = {"deno": {}}
+    found: List[str] = []
+    scripts: str = sysconfig.get_path("scripts") or ""
     for name in ("deno", "node", "bun"):
-        path: Optional[str] = shutil.which(name)
+        path: Optional[str] = shutil.which(name) or (shutil.which(name, path=scripts) if scripts else None)
         if path:
-            found[name] = {"path": path}
-    return found
+            runtimes[name] = {"path": path}
+            found.append(name)
+    if found:
+        log.info("JavaScript runtimes available to yt-dlp: %s", ", ".join(found))
+    else:
+        log.warning(
+            "No JavaScript runtime (deno, node or bun) found; YouTube playback will fail. "
+            "Install requirements.txt again (it includes deno)."
+        )
+    return runtimes
 
 
 def _player_clients() -> List[str]:
@@ -340,7 +362,7 @@ def environment_report() -> List[Tuple[int, str]]:
         if not has_https:
             report.append((logging.ERROR, "ffmpeg has no https support: it can't open YouTube streams"))
 
-    runtimes: Dict[str, Dict[str, Any]] = _js_runtimes()
+    runtimes: Dict[str, Dict[str, Any]] = {n: c for n, c in _js_runtimes().items() if c.get("path")}
     if not runtimes:
         report.append(
             (
