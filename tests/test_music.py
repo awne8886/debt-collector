@@ -273,12 +273,15 @@ class TestYtdlHelpers(unittest.TestCase):
         self.assertIn("private", friendly_error("ERROR: Private video. Sign in"))
         self.assertIn("age-restricted", friendly_error("Sign in to confirm your age"))
         self.assertEqual(friendly_error("???"), "I couldn't load that from YouTube.")
+        self.assertIn("JavaScript runtime", friendly_error("ERROR: Requested format is not available"))
+        self.assertIn("403", friendly_error("Unable to download API page: HTTP Error 403: Forbidden"))
 
     def test_base_options_defaults(self):
         with patch.dict("os.environ", {}, clear=True):
             options = _base_options()
         self.assertEqual(options["source_address"], "0.0.0.0")
         self.assertNotIn("proxy", options)
+        self.assertIn("deno", options["js_runtimes"])
         self.assertNotIn("extractor_args", options)
 
     def test_base_options_proxy_and_clients(self):

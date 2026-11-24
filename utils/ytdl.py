@@ -4,6 +4,7 @@ import functools
 import logging
 import os
 import shutil
+import sysconfig
 import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -97,6 +98,13 @@ def friendly_error(message: str) -> str:
         return "That video is unavailable."
     if "live event will begin" in text or "premieres in" in text:
         return "That live stream or premiere hasn't started yet."
+    if "requested format is not available" in text or "only images are available" in text:
+        return (
+            "YouTube gave me no playable audio for that. If this happens for every video, "
+            "the host is missing a JavaScript runtime (deno) or yt-dlp needs updating."
+        )
+    if "http error 403" in text:
+        return "YouTube refused the request (HTTP 403). Try again in a moment."
     if "unable to download" in text or "timed out" in text or "connection" in text:
         return "I couldn't reach YouTube just now. Try again in a moment."
     return "I couldn't load that from YouTube."
@@ -120,8 +128,29 @@ class _YtdlLogger:
 
 @functools.lru_cache(maxsize=1)
 def _js_runtimes() -> Dict[str, Dict[str, Any]]:
-    """YouTube needs a JavaScript runtime; yt-dlp only auto-enables deno, so enable any we find."""
-    return {name: {} for name in ("deno", "node", "bun") if shutil.which(name)}
+    """YouTube needs a JavaScript runtime; yt-dlp only auto-enables deno, so enable any we find.
+
+    deno is always listed: yt-dlp also finds the copy pip installs (yt-dlp[deno]) next to
+    Python, which isn't always on PATH.
+    """
+    runtimes: Dict[str, Dict[str, Any]] = {"deno": {}}
+    runtimes.update({name: {} for name in ("node", "bun") if shutil.which(name)})
+    found: List[str] = [name for name in ("deno", "node", "bun") if _runtime_installed(name)]
+    if found:
+        log.info("JavaScript runtimes available to yt-dlp: %s", ", ".join(found))
+    else:
+        log.warning(
+            "No JavaScript runtime (deno, node or bun) found; YouTube playback will fail. "
+            "Install requirements.txt again (it includes deno)."
+        )
+    return runtimes
+
+
+def _runtime_installed(name: str) -> bool:
+    if shutil.which(name):
+        return True
+    scripts: str = sysconfig.get_path("scripts") or ""
+    return bool(scripts) and shutil.which(name, path=scripts) is not None
 
 
 def _base_options() -> Dict[str, Any]:
@@ -136,9 +165,7 @@ def _base_options() -> Dict[str, Any]:
         "cachedir": False,
         "source_address": "0.0.0.0",  # prefer IPv4; YouTube blocks many IPv6 ranges
     }
-    runtimes: Dict[str, Dict[str, Any]] = _js_runtimes()
-    if runtimes:
-        options["js_runtimes"] = dict(runtimes)
+    options["js_runtimes"] = {name: dict(config) for name, config in _js_runtimes().items()}
     cookies: Optional[str] = _cookie_file()
     if cookies:
         options["cookiefile"] = _writable_cookie_file(cookies)
@@ -243,6 +270,7 @@ def resolve_tracks(
                 target, download=False, process=query.kind is not QueryKind.VIDEO
             )
     except yt_dlp.utils.DownloadError as exc:
+        log.warning("yt-dlp failed for %s: %s", target, exc)
         raise ExtractionError(friendly_error(str(exc))) from exc
 
     if not info:
@@ -281,6 +309,7 @@ def resolve_stream(track: Track) -> StreamInfo:
         with yt_dlp.YoutubeDL(options) as ydl:
             info: Optional[Dict[str, Any]] = ydl.extract_info(track.url, download=False)
     except yt_dlp.utils.DownloadError as exc:
+        log.warning("yt-dlp failed for %s: %s", track.url, exc)
         raise ExtractionError(friendly_error(str(exc))) from exc
 
     if not info:
