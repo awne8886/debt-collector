@@ -4,6 +4,7 @@ import functools
 import logging
 import os
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -128,7 +129,7 @@ def _base_options() -> Dict[str, Any]:
         options["js_runtimes"] = dict(runtimes)
     cookies: Optional[str] = os.getenv("YTDL_COOKIES_FILE")
     if cookies and os.path.isfile(cookies):
-        options["cookiefile"] = cookies
+        options["cookiefile"] = _writable_cookie_file(cookies)
     proxy: str = os.getenv("YTDL_PROXY", "").strip()
     if proxy:
         # The proxy has its own address, so don't pin the outgoing socket to IPv4.
@@ -138,6 +139,22 @@ def _base_options() -> Dict[str, Any]:
     if clients:
         options["extractor_args"] = {"youtube": {"player_client": clients}}
     return options
+
+
+@functools.lru_cache(maxsize=4)
+def _writable_cookie_file(path: str) -> str:
+    """yt-dlp rewrites the cookies file, so copy a read-only one (e.g. a Render Secret File)."""
+    if os.access(path, os.W_OK):
+        return path
+    target: str = os.path.join(tempfile.gettempdir(), "ytdl-cookies.txt")
+    try:
+        shutil.copyfile(path, target)
+        os.chmod(target, 0o600)
+    except OSError as exc:
+        log.warning("Couldn't copy read-only cookies file %s: %s", path, exc)
+        return path
+    log.info("Cookies file %s is read-only; using a writable copy at %s", path, target)
+    return target
 
 
 def _player_clients() -> List[str]:

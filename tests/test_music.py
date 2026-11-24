@@ -24,6 +24,7 @@ from utils.ytdl import (
     ExtractionError,
     StreamInfo,
     _base_options,
+    _writable_cookie_file,
     _entry_to_track,
     friendly_error,
 )
@@ -290,6 +291,37 @@ class TestYtdlHelpers(unittest.TestCase):
         self.assertEqual(
             options["extractor_args"], {"youtube": {"player_client": ["tv_simply", "web_embedded"]}}
         )
+
+    def test_read_only_cookies_are_copied(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(src_dir, "cookies.txt")
+            with open(source, "w") as handle:
+                handle.write("# Netscape HTTP Cookie File\n")
+            _writable_cookie_file.cache_clear()
+            with patch("utils.ytdl.os.access", return_value=False), patch(
+                "utils.ytdl.tempfile.gettempdir", return_value=tmp
+            ), patch.dict("os.environ", {"YTDL_COOKIES_FILE": source}, clear=True):
+                options = _base_options()
+            _writable_cookie_file.cache_clear()
+            self.assertEqual(options["cookiefile"], os.path.join(tmp, "ytdl-cookies.txt"))
+            with open(options["cookiefile"]) as handle:
+                self.assertIn("Netscape", handle.read())
+
+    def test_writable_cookies_are_used_in_place(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as src_dir:
+            source = os.path.join(src_dir, "cookies.txt")
+            open(source, "w").close()
+            _writable_cookie_file.cache_clear()
+            with patch.dict("os.environ", {"YTDL_COOKIES_FILE": source}, clear=True):
+                options = _base_options()
+            _writable_cookie_file.cache_clear()
+            self.assertEqual(options["cookiefile"], source)
 
     def test_entry_to_track(self):
         entry = {"id": VID, "title": "Song", "duration": 212.0, "channel": "Artist"}

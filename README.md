@@ -81,8 +81,14 @@ runs on. Most cloud and free hosts share flagged addresses. Try these in order:
    yt-dlp plugin and run its token server. yt-dlp picks the plugin up on its own. This helps
    with YouTube 403 errors and on lightly flagged IPs, but it won't clear a hard IP block.
 5. **Cookies** (`YTDL_COOKIES_FILE`, Netscape format). Use a throwaway Google account:
-   YouTube can ban accounts it sees used this way. Keep the file somewhere writable,
-   because yt-dlp updates it.
+   YouTube can ban accounts it sees used this way. yt-dlp updates the file as it goes;
+   if the file is read-only, the bot copies it to the temp folder and uses the copy.
+   * **Export:** sign in to YouTube in a private window, export the youtube.com cookies
+     in Netscape format (for example with the Cookie-Editor extension), then close the
+     window without signing out, so the browser doesn't rotate the exported cookies.
+   * **Render:** add the file under the service's Environment > Secret Files as
+     `cookies.txt`, and set `YTDL_COOKIES_FILE=/etc/secrets/cookies.txt`.
+   * Cookies expire. When the bot check comes back, export a fresh file.
 
 Running the bot on a home connection instead of a datacenter also avoids the check.
 
