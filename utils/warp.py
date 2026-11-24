@@ -304,10 +304,19 @@ def _api(method: str, path: str, body: Dict[str, Any], token: str = "") -> Dict[
         return json.load(response)
 
 
+def _use_ipv6() -> bool:
+    return os.getenv("WARP_IPV6", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _wireproxy_config(account: Dict[str, Any], port: int) -> str:
+    # IPv4 only by default: YouTube geolocates WARP's IPv6 exits badly ("not made this
+    # video available in your country") and bot-checks them more often. Without an
+    # IPv6 address in the tunnel, wireproxy connects over IPv4 only.
     addresses: str = f"{account['address_v4']}/32"
-    if account.get("address_v6"):
+    allowed: str = "0.0.0.0/0"
+    if _use_ipv6() and account.get("address_v6"):
         addresses += f", {account['address_v6']}/128"
+        allowed += ", ::/0"
     return (
         "[Interface]\n"
         f"PrivateKey = {account['private_key']}\n"
@@ -317,7 +326,7 @@ def _wireproxy_config(account: Dict[str, Any], port: int) -> str:
         "\n"
         "[Peer]\n"
         f"PublicKey = {account['peer_public_key']}\n"
-        "AllowedIPs = 0.0.0.0/0, ::/0\n"
+        f"AllowedIPs = {allowed}\n"
         f"Endpoint = {account['endpoint']}\n"
         "PersistentKeepalive = 25\n"
         "\n"

@@ -79,6 +79,41 @@ class MusicError(Exception):
     """A problem to show the user (never a bug)."""
 
 
+def _check_davey() -> None:
+    """Warn when davey is too new for this discord.py: voice then plays but nobody hears it."""
+    try:
+        from importlib.metadata import version
+
+        davey_version: str = version("davey")
+    except Exception:
+        return
+    parts = davey_version.split(".")
+    too_new: bool = len(parts) >= 2 and parts[0] == "0" and parts[1].isdigit() and int(parts[1]) >= 2
+    if too_new and discord.__version__ in ("2.7.0", "2.7.1"):
+        log.warning(
+            "davey %s with discord.py %s: listeners won't hear the bot (DAVE voice encryption "
+            "mismatch). Install davey<0.2 (requirements.txt pins it).",
+            davey_version, discord.__version__,
+        )
+    else:
+        log.info("Voice encryption: davey %s, discord.py %s", davey_version, discord.__version__)
+
+
+def _voice_encryption_state(vc: Any) -> str:
+    """DAVE (Discord's end-to-end voice encryption) status, for the logs.
+
+    When a channel uses DAVE and the bot's session isn't ready, Discord shows the bot
+    speaking but listeners hear silence, so this is the first thing to check.
+    """
+    connection = getattr(vc, "_connection", None)
+    version = getattr(connection, "dave_protocol_version", None)
+    if version is None:
+        return "DAVE status unknown"
+    if not version:
+        return "DAVE not in use"
+    return f"DAVE v{version}, ready={bool(getattr(connection, 'can_encrypt', False))}"
+
+
 def opus_available() -> bool:
     """True when libopus can be loaded (needed for live volume control)."""
     import discord.opus as opus
@@ -424,6 +459,11 @@ class GuildPlayer:
         vc.play(source, after=lambda error, g=generation, p=self._probe: self._after(g, error, p))
         self.log.info("play: vc.play() called, is_playing=%s | %s", vc.is_playing(), memory_snapshot())
         self.clock.start(position)
+        log.info(
+            "Playing %s (%s) in guild %s from %ss; %s",
+            track.url, format_duration(track.duration), self.guild.id, int(position),
+            _voice_encryption_state(vc),
+        )
         self.refresh_timer()
         self._watch_audio(generation)
         if announce:
@@ -534,6 +574,14 @@ class GuildPlayer:
     async def _on_end(self, generation: int, error: Optional[Exception]) -> None:
         if generation != self._gen:
             return  # we stopped or replaced this source ourselves
+        track: Optional[Track] = self.queue.current
+        if track is not None:
+            played: float = self.clock.position()
+            log.info(
+                "Stream ended for %s after %s of %s%s",
+                track.url, format_duration(played), format_duration(track.duration),
+                f" (error: {error})" if error else "",
+            )
         if error is not None:
             log.warning("Playback error in guild %s: %s", self.guild.id, error)
             self.cog.record_error("music:playback", error, self.guild)
@@ -742,6 +790,7 @@ class MusicCog(commands.Cog, name="Music"):
             )
         if ffmpeg_executable() is None:
             log.warning("ffmpeg not found - music commands will report that they can't play.")
+        _check_davey()
         self._warm_up_task: Optional["asyncio.Task[Any]"] = None
 
     async def cog_load(self) -> None:

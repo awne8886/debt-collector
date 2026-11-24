@@ -109,6 +109,7 @@ Slash commands sync automatically whenever the command set changes (set `SYNC_CO
 | `YTDL_COOKIES_FILE` | unset | Cookies file passed to yt-dlp |
 | `YTDL_CACHE_DIR` | temp folder | Where yt-dlp caches YouTube's player code between plays |
 | `YTDL_WARP` | `auto` | Cloudflare WARP for YouTube: `auto` when YouTube blocks the host's IP, `on` always, `off` never (see below) |
+| `WARP_IPV6` | off | `1` also sends IPv6 through WARP. Off by default: YouTube treats WARP's IPv6 exits as region-locked and bot-checks them more |
 | `WARP_DIR` | temp folder | Where the WARP registration and the `wireproxy` binary are kept |
 | `WIREPROXY_PATH` | download | Use this `wireproxy` binary instead of downloading the pinned release |
 | `MUSIC_WARMUP` | `on` | `off` skips the YouTube check the bot runs once at startup |
@@ -146,7 +147,7 @@ Play YouTube and YouTube Music in a voice channel. The bot joins the channel you
 ### Music hosting requirements
 
 * **Bot permissions:** *Connect* and *Speak* in the voice channels it should use (and it must not be server-muted).
-* **PyNaCl**, **davey** (voice end-to-end encryption) and **yt-dlp** come from `requirements.txt`.
+* **PyNaCl**, **davey** (voice end-to-end encryption) and **yt-dlp** come from `requirements.txt`. `davey` is pinned below 0.2: with 0.2 and discord.py 2.7.1 the bot shows as speaking but nobody hears it. The bot logs a warning at startup if that combination comes back, and logs `DAVE ... ready=` for each track it plays.
 * **ffmpeg** is used from `FFMPEG_PATH`, then `PATH`, then the static build bundled by `imageio-ffmpeg`, so a plain `pip install -r requirements.txt` is enough.
 * **A JavaScript runtime** (`deno`, `node` or `bun`): current yt-dlp needs one to read YouTube. The bot also looks in `/opt/render/project/.deno/bin`, `~/.deno/bin` and `~/.bun/bin` and adds them to `PATH` itself, so a Deno installed during a Render build is found even though Render doesn't put it on `PATH`.
 * **libopus** is optional. Without it the bot falls back to ffmpeg's Opus output and a volume change restarts the current track from where it was.
