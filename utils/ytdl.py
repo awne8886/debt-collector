@@ -6,8 +6,10 @@ import os
 import shutil
 import sysconfig
 import tempfile
+import threading
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from utils.music import (
     ParsedQuery,
@@ -100,8 +102,8 @@ def friendly_error(message: str) -> str:
         return "That live stream or premiere hasn't started yet."
     if "requested format is not available" in text or "only images are available" in text:
         return (
-            "YouTube gave me no playable audio for that. If this happens for every video, "
-            "the host is missing a JavaScript runtime (deno) or yt-dlp needs updating."
+            "YouTube gave me no playable audio for that from any of the clients I tried. "
+            "If this happens for every video, the bot owner should check the logs."
         )
     if "http error 403" in text:
         return "YouTube refused the request (HTTP 403). Try again in a moment."
@@ -111,7 +113,14 @@ def friendly_error(message: str) -> str:
 
 
 class _YtdlLogger:
-    """Keep yt-dlp out of stderr; real failures surface as ExtractionError instead."""
+    """Keep yt-dlp out of stderr; real failures surface as ExtractionError instead.
+
+    Warnings are kept so a failed attempt can log why (skipped clients, missing PO
+    tokens, failed JS challenges) without flooding the logs when things work.
+    """
+
+    def __init__(self) -> None:
+        self.warnings: List[str] = []
 
     def debug(self, message: str) -> None:
         pass
@@ -121,6 +130,8 @@ class _YtdlLogger:
 
     def warning(self, message: str) -> None:
         log.debug("yt-dlp: %s", message)
+        if len(self.warnings) < 20:
+            self.warnings.append(message)
 
     def error(self, message: str) -> None:
         log.debug("yt-dlp: %s", message)
@@ -167,7 +178,8 @@ def _base_options() -> Dict[str, Any]:
         "noplaylist": True,
         "socket_timeout": 15,
         "retries": 3,
-        "cachedir": False,
+        "extractor_retries": 1,  # other clients are tried instead of retrying one
+        "cachedir": _cache_dir(),
         "source_address": "0.0.0.0",  # prefer IPv4; YouTube blocks many IPv6 ranges
     }
     options["js_runtimes"] = {name: dict(config) for name, config in _js_runtimes().items()}
@@ -183,6 +195,43 @@ def _base_options() -> Dict[str, Any]:
     if clients:
         options["extractor_args"] = {"youtube": {"player_client": clients}}
     return options
+
+
+def _cache_dir() -> str:
+    """yt-dlp caches YouTube's player JS and solved challenges here.
+
+    Without it every play downloads and re-solves the player script, which takes tens
+    of seconds on a small host (Render's free instances get a tenth of a CPU).
+    """
+    return os.getenv("YTDL_CACHE_DIR", "").strip() or os.path.join(
+        tempfile.gettempdir(), "yt-dlp-cache"
+    )
+
+
+def ffmpeg_input_options() -> List[str]:
+    """ffmpeg options so the audio goes the same way as yt-dlp's requests.
+
+    YouTube ties each stream URL to the IP address that asked for it, so with
+    YTDL_PROXY set, ffmpeg must fetch through the same proxy or it gets HTTP 403.
+    ffmpeg only speaks HTTP proxies, not SOCKS.
+    """
+    proxy: str = os.getenv("YTDL_PROXY", "").strip()
+    if not proxy:
+        return []
+    if proxy.lower().startswith(("http://", "https://")):
+        return ["-http_proxy", proxy]
+    _warn_socks_once(proxy.split("://", 1)[0])
+    return []
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_socks_once(scheme: str) -> None:
+    log.warning(
+        "YTDL_PROXY uses %s, which ffmpeg can't use, so audio is fetched without the proxy and "
+        "YouTube may refuse it (HTTP 403). Use an http:// proxy instead (wireproxy can "
+        "serve one with an [http] section).",
+        scheme,
+    )
 
 
 def _cookie_file() -> Optional[str]:
@@ -252,40 +301,230 @@ def _entry_to_track(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Client rotation
+#
+# YouTube treats its "clients" (web, TV, iOS, Vision Pro, Android VR, ...) differently,
+# and which ones work changes with the host's IP, whether cookies are sent and
+# YouTube's experiments of the week. Music bots built on Lavalink's youtube-source
+# plugin handle this by trying clients in turn until one returns audio; this does the
+# same with yt-dlp, and remembers which group worked so the next play starts there.
+# --------------------------------------------------------------------------- #
+
+# Clients that accept cookies and still return some audio without a PO token (the TV
+# clients all of it; the web ones format 18 or HLS).
+_COOKIE_CLIENTS: Tuple[str, ...] = ("tv_samsung", "tv", "web_embedded", "mweb", "web_music")
+# Clients that need no JavaScript (fast on a slow CPU) but can't take cookies.
+_JSLESS_CLIENTS: Tuple[str, ...] = ("visionos", "ios_producer", "android_vr")
+# Cookie-less clients that do need the JavaScript player.
+_JS_CLIENTS: Tuple[str, ...] = ("tv_samsung", "web_embedded", "mweb", "tv_simply", "web_music")
+
+# Failures no other client can fix, so the rotation stops early.
+_FINAL_ERRORS: Tuple[str, ...] = (
+    "private video",
+    "members-only",
+    "members only",
+    "join this channel",
+    "copyright",
+    "has been removed",
+    "account associated with this video has been terminated",
+    "live event will begin",
+    "premieres in",
+    "not available in your country",
+    "blocked it in your country",
+    "is not a valid url",
+    "unsupported url",
+)
+
+try:
+    ATTEMPT_BUDGET_SECONDS: float = max(float(os.getenv("YTDL_ATTEMPT_BUDGET", "75")), 5.0)
+except ValueError:
+    ATTEMPT_BUDGET_SECONDS = 75.0
+_STREAM_TTL_SECONDS: float = 20 * 60
+_PROBE_VIDEO: str = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # "Me at the zoo"
+
+
+@dataclass(frozen=True)
+class Strategy:
+    clients: Tuple[str, ...]  # empty: let yt-dlp choose
+    cookies: bool
+
+    @property
+    def label(self) -> str:
+        names: str = ",".join(self.clients) or "yt-dlp default"
+        return f"{names} ({'with' if self.cookies else 'no'} cookies)"
+
+
+_state_lock = threading.Lock()
+_preferred: Optional[Strategy] = None
+_demoted: Optional[Strategy] = None  # its last stream died at once; tried last
+_stream_cache: Dict[str, Tuple[float, "StreamInfo"]] = {}
+
+
+def _rotation_enabled() -> bool:
+    return os.getenv("YTDL_CLIENT_ROTATION", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def strategies() -> List[Strategy]:
+    """Every client group to try, in order. The first is what the owner configured."""
+    configured: Tuple[str, ...] = tuple(_player_clients())
+    has_cookies: bool = _cookie_file() is not None
+    order: List[Strategy] = [Strategy(configured, has_cookies)]
+    if not _rotation_enabled():
+        return order
+    if has_cookies:
+        order.append(Strategy(_COOKIE_CLIENTS, True))
+    order += [
+        Strategy(_JSLESS_CLIENTS, False),
+        Strategy(_JS_CLIENTS, False),
+    ]
+    if configured and not has_cookies:
+        order.insert(1, Strategy((), False))
+    unique: List[Strategy] = []
+    for strategy in order:
+        if strategy not in unique:
+            unique.append(strategy)
+    return unique
+
+
+def _ordered_strategies() -> List[Strategy]:
+    """strategies(), with the group that last worked moved to the front."""
+    order: List[Strategy] = strategies()
+    with _state_lock:
+        preferred: Optional[Strategy] = _preferred
+        demoted: Optional[Strategy] = _demoted
+    if demoted is not None and demoted in order and len(order) > 1:
+        order.remove(demoted)
+        order.append(demoted)
+    if preferred is not None and preferred in order:
+        order.remove(preferred)
+        order.insert(0, preferred)
+    return order
+
+
+def stream_failed() -> None:
+    """The last stream died as soon as it started (YouTube refused it): try other clients first.
+
+    Stream URLs can resolve fine and still be refused when fetched, e.g. when a client
+    needs a PO token for the download itself. Lavalink's YouTube source reacts to that
+    by switching clients; so does this.
+    """
+    global _preferred, _demoted
+    with _state_lock:
+        if _preferred is None:
+            return
+        _demoted, _preferred = _preferred, None
+        label: str = _demoted.label
+    log.warning("A stream from %s died at once; trying other YouTube clients first", label)
+
+
+def _remember(strategy: Strategy) -> None:
+    global _preferred
+    with _state_lock:
+        changed: bool = _preferred != strategy
+        _preferred = strategy
+    if changed:
+        log.info("YouTube is answering through %s; trying that first from now on", strategy.label)
+
+
+def _options_for(strategy: Strategy) -> Dict[str, Any]:
+    options: Dict[str, Any] = _base_options()
+    if not strategy.cookies:
+        options.pop("cookiefile", None)
+    options.pop("extractor_args", None)
+    if strategy.clients:
+        options["extractor_args"] = {"youtube": {"player_client": list(strategy.clients)}}
+    return options
+
+
+def _is_final(message: str) -> bool:
+    text: str = (message or "").lower()
+    return any(marker in text for marker in _FINAL_ERRORS)
+
+
+def _run_with_rotation(
+    target: str,
+    configure: Callable[[Dict[str, Any]], None],
+    *,
+    process: bool = True,
+    check: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """Run yt-dlp on `target`, moving through the client groups until one succeeds.
+
+    `check` may raise yt_dlp's DownloadError to reject a result (e.g. no audio URL),
+    which moves on to the next group like any other failure.
+    """
+    import yt_dlp
+
+    started: float = time.monotonic()
+    first_error: Optional[str] = None
+    tried: List[str] = []
+    for strategy in _ordered_strategies():
+        if tried and time.monotonic() - started > ATTEMPT_BUDGET_SECONDS:
+            log.warning("Gave up on %s after %.0fs (tried %s)", target, time.monotonic() - started, "; ".join(tried))
+            break
+        options: Dict[str, Any] = _options_for(strategy)
+        configure(options)
+        logger: _YtdlLogger = options["logger"]
+        attempt_started: float = time.monotonic()
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info: Optional[Dict[str, Any]] = ydl.extract_info(target, download=False, process=process)
+            if not info:
+                raise yt_dlp.utils.DownloadError("ERROR: Video unavailable")
+            if check is not None:
+                check(info)
+        except yt_dlp.utils.DownloadError as exc:
+            message: str = str(exc)
+            tried.append(strategy.label)
+            log.warning(
+                "yt-dlp failed for %s via %s in %.1fs: %s",
+                target, strategy.label, time.monotonic() - attempt_started, message,
+            )
+            for warning in logger.warnings[-5:]:
+                log.info("  yt-dlp said: %s", warning)
+            # The first error is usually the most telling (the owner's own setup).
+            if first_error is None or (_is_final(message) and not _is_final(first_error)):
+                first_error = message
+            if _is_final(message):
+                break
+            continue
+        if tried:
+            log.info("Recovered %s via %s after: %s", target, strategy.label, "; ".join(tried))
+        _remember(strategy)
+        return info
+    raise ExtractionError(friendly_error(first_error or "")) from None
+
+
 def resolve_tracks(
     query: ParsedQuery, requester_id: int, requester_name: str
 ) -> ResolvedQuery:
-    """Look up metadata for a link or search. Stream URLs are fetched later."""
-    import yt_dlp
+    """Look up metadata for a link or search.
 
-    options: Dict[str, Any] = _base_options()
-    target: str = query.value
-
-    if query.kind is QueryKind.PLAYLIST:
-        options.update(
-            {"noplaylist": False, "extract_flat": "in_playlist", "playlistend": MAX_PLAYLIST_ITEMS}
-        )
-    elif query.kind is QueryKind.SEARCH:
-        options.update({"extract_flat": "in_playlist"})
-        target = f"ytsearch1:{query.value}"
-
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info: Optional[Dict[str, Any]] = ydl.extract_info(
-                target, download=False, process=query.kind is not QueryKind.VIDEO
-            )
-    except yt_dlp.utils.DownloadError as exc:
-        log.warning("yt-dlp failed for %s: %s", target, exc)
-        raise ExtractionError(friendly_error(str(exc))) from exc
-
-    if not info:
-        raise ExtractionError("I couldn't find anything for that.")
-
+    A single video is fully resolved here, stream URL included, so playing it right
+    away doesn't ask YouTube a second time.
+    """
     if query.kind is QueryKind.VIDEO:
+        info: Dict[str, Any] = _resolve_video(query.value)
         track = _entry_to_track(info, requester_id, requester_name)
         if track is None:
             raise ExtractionError("That video is unavailable.")
         return ResolvedQuery([track])
+
+    target: str = query.value
+
+    def configure(options: Dict[str, Any]) -> None:
+        if query.kind is QueryKind.PLAYLIST:
+            options.update(
+                {"noplaylist": False, "extract_flat": "in_playlist", "playlistend": MAX_PLAYLIST_ITEMS}
+            )
+        else:
+            options.update({"extract_flat": "in_playlist"})
+
+    if query.kind is QueryKind.SEARCH:
+        target = f"ytsearch1:{query.value}"
+
+    info = _run_with_rotation(target, configure)
 
     entries: List[Dict[str, Any]] = [e for e in (info.get("entries") or []) if e]
     tracks: List[Track] = []
@@ -304,28 +543,56 @@ def resolve_tracks(
     return ResolvedQuery(tracks, playlist_title=title)
 
 
-def resolve_stream(track: Track) -> StreamInfo:
-    """Fetch a fresh stream URL (they expire, so this is done right before playing)."""
-    import yt_dlp
-
-    options: Dict[str, Any] = _base_options()
-    options["format"] = "bestaudio/best"
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info: Optional[Dict[str, Any]] = ydl.extract_info(track.url, download=False)
-    except yt_dlp.utils.DownloadError as exc:
-        log.warning("yt-dlp failed for %s: %s", track.url, exc)
-        raise ExtractionError(friendly_error(str(exc))) from exc
-
-    if not info:
-        raise ExtractionError("That video is unavailable.")
+def _stream_url(info: Dict[str, Any]) -> Optional[str]:
     url: Optional[str] = info.get("url")
-    if not url:
-        formats = [f for f in (info.get("requested_formats") or []) if f.get("url")]
-        url = formats[0]["url"] if formats else None
+    if url:
+        return url
+    formats = [f for f in (info.get("requested_formats") or []) if f.get("url")]
+    return formats[0]["url"] if formats else None
+
+
+def _require_audio(info: Dict[str, Any]) -> None:
+    if not _stream_url(info):
+        import yt_dlp
+
+        raise yt_dlp.utils.DownloadError("ERROR: Requested format is not available")
+
+
+def _configure_stream(options: Dict[str, Any]) -> None:
+    # Audio-only first; failing that, the smallest file that has audio (format 18 and
+    # HLS streams are what PO-token-less clients often still return).
+    options["format"] = "bestaudio/best[acodec!=none]/best"
+
+
+def _resolve_video(url: str) -> Dict[str, Any]:
+    info: Dict[str, Any] = _run_with_rotation(url, _configure_stream, check=_require_audio)
+    _cache_stream(url, info)
+    return info
+
+
+def _cache_stream(url: str, info: Dict[str, Any]) -> None:
+    stream: StreamInfo = _to_stream(info)
+    now: float = time.monotonic()
+    with _state_lock:
+        for key in [k for k, (expires, _) in _stream_cache.items() if expires <= now]:
+            del _stream_cache[key]
+        if len(_stream_cache) >= 64:
+            _stream_cache.pop(next(iter(_stream_cache)))
+        _stream_cache[url] = (now + _STREAM_TTL_SECONDS, stream)
+
+
+def _cached_stream(url: str) -> Optional["StreamInfo"]:
+    with _state_lock:
+        entry = _stream_cache.pop(url, None)
+    if entry is None or entry[0] <= time.monotonic():
+        return None
+    return entry[1]
+
+
+def _to_stream(info: Dict[str, Any]) -> "StreamInfo":
+    url: Optional[str] = _stream_url(info)
     if not url:
         raise ExtractionError("YouTube gave me no playable audio for that video.")
-
     duration = info.get("duration")
     return StreamInfo(
         url=url,
@@ -335,3 +602,91 @@ def resolve_stream(track: Track) -> StreamInfo:
         thumbnail=info.get("thumbnail"),
         title=info.get("title"),
     )
+
+
+def resolve_stream(track: Track) -> StreamInfo:
+    """A stream URL for `track`: the one found while queueing it if still fresh, else a new one.
+
+    Cached URLs are used once: a seek or a volume restart asks again, so a URL that
+    YouTube has since revoked can't get stuck.
+    """
+    cached: Optional[StreamInfo] = _cached_stream(track.url)
+    if cached is not None:
+        return cached
+    return _to_stream(_run_with_rotation(track.url, _configure_stream, check=_require_audio))
+
+
+def warm_up() -> Optional[Strategy]:
+    """Resolve a known video once so the working client group and player JS are ready."""
+    try:
+        _run_with_rotation(_PROBE_VIDEO, _configure_stream, check=_require_audio)
+    except ExtractionError as exc:
+        log.warning("YouTube warm-up failed with every client group: %s", exc)
+        return None
+    with _state_lock:
+        return _preferred
+
+
+def _check_playable(info: Dict[str, Any], seconds: int = 3) -> Optional[str]:
+    """Decode the first seconds of a resolved stream the way playback does. None means it played."""
+    import subprocess
+
+    executable: Optional[str] = ffmpeg_executable()
+    if executable is None:
+        return "ffmpeg not found"
+    command: List[str] = [
+        executable, "-v", "error", "-nostdin",
+        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+    ]
+    agent: Optional[str] = (info.get("http_headers") or {}).get("User-Agent")
+    if agent:
+        command += ["-user_agent", agent]
+    command += ffmpeg_input_options()
+    command += ["-i", _stream_url(info) or "", "-t", str(seconds), "-vn",
+                "-f", "s16le", "-ar", "48000", "-ac", "2", "-"]
+    try:
+        done = subprocess.run(command, capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return "timed out"
+    needed: int = 48000 * 2 * 2 * seconds // 2  # at least half of the requested audio
+    if len(done.stdout) >= needed:
+        return None
+    error: str = done.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or ["no audio"]
+    return error[0][-160:]
+
+
+def probe(url: str = _PROBE_VIDEO) -> List[Tuple[str, bool, float, str]]:
+    """Try every client group (not stopping at the first success) and log each result.
+
+    Diagnostics for the bot owner: shows which groups work from this host right now.
+    """
+    import yt_dlp
+
+    results: List[Tuple[str, bool, float, str]] = []
+    groups: List[Strategy] = strategies()
+    singles: List[Strategy] = []
+    for group in groups:
+        for client in group.clients:
+            single = Strategy((client,), group.cookies)
+            if single not in groups and single not in singles:
+                singles.append(single)
+    for strategy in groups + singles:
+        options: Dict[str, Any] = _options_for(strategy)
+        _configure_stream(options)
+        started: float = time.monotonic()
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=False)
+            _require_audio(info or {})
+            fetched: Optional[str] = _check_playable(info)
+            detail: str = f"format {info.get('format_id')} ({info.get('acodec')})"
+            ok: bool = fetched is None
+            if fetched is not None:
+                detail += f" resolved, but ffmpeg couldn't fetch it: {fetched}"
+        except yt_dlp.utils.DownloadError as exc:
+            detail = str(exc).replace("ERROR: ", "")[:160]
+            ok = False
+        elapsed: float = time.monotonic() - started
+        results.append((strategy.label, ok, elapsed, detail))
+        log.info("probe %-4s %5.1fs %s: %s", "OK" if ok else "FAIL", elapsed, strategy.label, detail)
+    return results

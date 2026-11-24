@@ -32,18 +32,23 @@ from utils.music import (
 )
 from utils.pagination import build_pages, send_pages
 from utils.ytdl import (
+    ATTEMPT_BUDGET_SECONDS,
     ExtractionError,
     StreamInfo,
     ffmpeg_executable,
+    ffmpeg_input_options,
     resolve_stream,
+    stream_failed,
     resolve_tracks,
+    warm_up,
 )
 
 log = logging.getLogger("debt-collector.music")
 
 IDLE_TIMEOUT: float = 180.0  # leave this long after the queue runs dry
 ALONE_TIMEOUT: float = 120.0  # leave this long after everyone else has left
-RESOLVE_TIMEOUT: float = 60.0
+# The client rotation stops starting new attempts after its budget; leave room for the last one.
+RESOLVE_TIMEOUT: float = ATTEMPT_BUDGET_SECONDS + 45.0
 INSTANT_FAILURE_SECONDS: float = 3.0  # a track that ends sooner than this "died"
 MIN_TRACK_FOR_FAILURE_CHECK: int = 10  # ...but only judge tracks at least this long
 MAX_QUICK_FAILURES: int = 3
@@ -170,6 +175,7 @@ class GuildPlayer:
             before.append(f"-user_agent {shlex.quote(agent)}")
         if position >= 1:
             before.append(f"-ss {int(position)}")
+        before.extend(shlex.quote(part) for part in ffmpeg_input_options())
         before_options: str = " ".join(before)
 
         if self.cog.pcm:
@@ -258,7 +264,10 @@ class GuildPlayer:
         """Detect a broken ffmpeg/stream: a long track that ends within seconds.
 
         Without this, a host problem would silently chew through the whole queue.
-        Returns True when the queue was halted. Caller holds the lock.
+        The first time a track dies like this, it's restarted once through other YouTube
+        clients, since YouTube sometimes refuses a stream it has just handed out.
+        Returns True when it dealt with the end itself (restarted the track or halted
+        the queue). Caller holds the lock.
         """
         track: Optional[Track] = self.queue.current
         if (
@@ -270,11 +279,19 @@ class GuildPlayer:
         ):
             self._quick_failures = 0
             return False
-        self._quick_failures += 1
-        await self.notify(
-            f"⚠️ **{_clean_title(track.title)}** stopped right after it started "
-            "(a stream or ffmpeg problem on my end)."
-        )
+        if track.stream_retries < 1:
+            track.stream_retries += 1
+            stream_failed()
+            log.warning("Retrying %s after its stream died at once", track.url)
+            if await self._start(track, announce=False):
+                return True
+            self._quick_failures += 1  # _start has already said why it couldn't play
+        else:
+            self._quick_failures += 1
+            await self.notify(
+                f"⚠️ **{_clean_title(track.title)}** stopped right after it started "
+                "(a stream or ffmpeg problem on my end)."
+            )
         if self._quick_failures < MAX_QUICK_FAILURES:
             return False
         self._quick_failures = 0
@@ -430,8 +447,17 @@ class MusicCog(commands.Cog, name="Music"):
             )
         if ffmpeg_executable() is None:
             log.warning("ffmpeg not found - music commands will report that they can't play.")
+        self._warm_up_task: Optional["asyncio.Task[Any]"] = None
+
+    async def cog_load(self) -> None:
+        # Find a YouTube client group that works from this host before anyone asks,
+        # so the first /play doesn't wait through the failing ones.
+        if os.getenv("MUSIC_WARMUP", "1").strip().lower() not in ("0", "false", "off", "no"):
+            self._warm_up_task = asyncio.create_task(asyncio.to_thread(warm_up))
 
     async def cog_unload(self) -> None:
+        if self._warm_up_task is not None:
+            self._warm_up_task.cancel()
         for guild_id in list(self.players):
             guild = self.bot.get_guild(guild_id)
             if guild is not None:

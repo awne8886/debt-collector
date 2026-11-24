@@ -359,3 +359,22 @@ class TestParseIdSet(unittest.TestCase):
         for raw, expected in cases:
             with self.subTest(raw=raw):
                 self.assertEqual(_parse_id_set(raw), expected)
+
+
+class TestPreviewDetection(unittest.TestCase):
+    def test_render_previews_do_not_run_the_bot(self):
+        from unittest.mock import patch
+
+        from main import _is_preview_deploy
+
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(_is_preview_deploy())
+        with patch.dict("os.environ", {"IS_PULL_REQUEST": "true"}, clear=True):
+            self.assertTrue(_is_preview_deploy())
+        with patch.dict("os.environ", {"RENDER_SERVICE_NAME": "debt collector PR #60"}, clear=True):
+            self.assertTrue(_is_preview_deploy())
+        with patch.dict("os.environ", {"RENDER_SERVICE_NAME": "debt collector"}, clear=True):
+            self.assertFalse(_is_preview_deploy())
+        env = {"IS_PULL_REQUEST": "true", "PREVIEW_RUN_BOT": "1"}
+        with patch.dict("os.environ", env, clear=True):
+            self.assertFalse(_is_preview_deploy())

@@ -20,9 +20,11 @@ from utils.music import (
     progress_bar,
     required_votes,
 )
+import utils.ytdl as ytdl
 from utils.ytdl import (
     ExtractionError,
     StreamInfo,
+    Strategy,
     _base_options,
     _find_cookie_file,
     _writable_cookie_file,
@@ -273,7 +275,7 @@ class TestYtdlHelpers(unittest.TestCase):
         self.assertIn("private", friendly_error("ERROR: Private video. Sign in"))
         self.assertIn("age-restricted", friendly_error("Sign in to confirm your age"))
         self.assertEqual(friendly_error("???"), "I couldn't load that from YouTube.")
-        self.assertIn("JavaScript runtime", friendly_error("ERROR: Requested format is not available"))
+        self.assertIn("no playable audio", friendly_error("ERROR: Requested format is not available"))
         self.assertIn("403", friendly_error("Unable to download API page: HTTP Error 403: Forbidden"))
 
     def test_base_options_defaults(self):
@@ -359,6 +361,19 @@ class TestYtdlHelpers(unittest.TestCase):
             _writable_cookie_file.cache_clear()
             self.assertEqual(options["cookiefile"], source)
 
+    def test_ffmpeg_uses_the_same_http_proxy(self):
+        from utils.ytdl import _warn_socks_once, ffmpeg_input_options
+
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(ffmpeg_input_options(), [])
+        with patch.dict("os.environ", {"YTDL_PROXY": "http://u:p@host:8080"}, clear=True):
+            self.assertEqual(ffmpeg_input_options(), ["-http_proxy", "http://u:p@host:8080"])
+        _warn_socks_once.cache_clear()
+        with patch.dict("os.environ", {"YTDL_PROXY": "socks5://127.0.0.1:40000"}, clear=True), \
+                self.assertLogs("debt-collector.music", "WARNING"):
+            self.assertEqual(ffmpeg_input_options(), [])
+        _warn_socks_once.cache_clear()
+
     def test_entry_to_track(self):
         entry = {"id": VID, "title": "Song", "duration": 212.0, "channel": "Artist"}
         track = _entry_to_track(entry, 5, "Me")
@@ -370,6 +385,117 @@ class TestYtdlHelpers(unittest.TestCase):
         live = _entry_to_track({"id": VID, "title": "Radio", "is_live": True, "duration": 5}, 1, "x")
         self.assertTrue(live.is_live)
         self.assertIsNone(live.duration)
+
+
+class FakeYoutubeDL:
+    """Stands in for yt_dlp.YoutubeDL; `behaviour` maps a client tuple to a result or error."""
+
+    behaviour: dict = {}
+    calls: list = []
+
+    def __init__(self, options):
+        self.options = options
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def extract_info(self, target, download=False, process=True):
+        import yt_dlp
+
+        clients = tuple(self.options.get("extractor_args", {}).get("youtube", {}).get("player_client", ()))
+        cookies = "cookiefile" in self.options
+        FakeYoutubeDL.calls.append((clients, cookies))
+        result = FakeYoutubeDL.behaviour.get((clients, cookies), "ERROR: Requested format is not available")
+        if isinstance(result, str):
+            raise yt_dlp.utils.DownloadError(result)
+        return result
+
+
+class TestClientRotation(unittest.TestCase):
+    INFO = {"id": VID, "title": "Song", "duration": 200, "url": "https://audio.example/a"}
+
+    def setUp(self):
+        ytdl._preferred = None
+        ytdl._stream_cache.clear()
+        FakeYoutubeDL.calls = []
+        FakeYoutubeDL.behaviour = {}
+        self.ydl_patch = patch("yt_dlp.YoutubeDL", FakeYoutubeDL)
+        self.ydl_patch.start()
+        self.cookie_patch = patch("utils.ytdl._cookie_file", return_value="/tmp/cookies.txt")
+        self.cookie_patch.start()
+        self.writable_patch = patch("utils.ytdl._writable_cookie_file", side_effect=lambda p: p)
+        self.writable_patch.start()
+
+    def tearDown(self):
+        self.ydl_patch.stop()
+        self.cookie_patch.stop()
+        self.writable_patch.stop()
+        ytdl._preferred = None
+        ytdl._stream_cache.clear()
+
+    def test_strategy_order_with_cookies(self):
+        with patch.dict("os.environ", {}, clear=True):
+            order = ytdl.strategies()
+        self.assertEqual(order[0], Strategy((), True))
+        self.assertEqual(order[1], Strategy(ytdl._COOKIE_CLIENTS, True))
+        self.assertIn(Strategy(ytdl._JSLESS_CLIENTS, False), order)
+        with patch.dict("os.environ", {"YTDL_CLIENT_ROTATION": "off"}, clear=True):
+            self.assertEqual(ytdl.strategies(), [Strategy((), True)])
+
+    def test_falls_back_to_cookieless_clients_and_remembers(self):
+        FakeYoutubeDL.behaviour = {(ytdl._JSLESS_CLIENTS, False): dict(self.INFO)}
+        track = make_track("song")
+        with patch.dict("os.environ", {}, clear=True), self.assertLogs("debt-collector.music", "INFO"):
+            stream = ytdl.resolve_stream(track)
+        self.assertEqual(stream.url, "https://audio.example/a")
+        self.assertEqual(
+            FakeYoutubeDL.calls,
+            [((), True), (ytdl._COOKIE_CLIENTS, True), (ytdl._JSLESS_CLIENTS, False)],
+        )
+        FakeYoutubeDL.calls = []
+        with patch.dict("os.environ", {}, clear=True):
+            ytdl.resolve_stream(track)
+        self.assertEqual(FakeYoutubeDL.calls, [(ytdl._JSLESS_CLIENTS, False)])
+
+    def test_final_errors_stop_the_rotation(self):
+        FakeYoutubeDL.behaviour = {((), True): "ERROR: [youtube] x: Private video. Sign in"}
+        with patch.dict("os.environ", {}, clear=True), self.assertLogs("debt-collector.music", "WARNING"):
+            with self.assertRaises(ExtractionError) as caught:
+                ytdl.resolve_stream(make_track("song"))
+        self.assertIn("private", str(caught.exception))
+        self.assertEqual(len(FakeYoutubeDL.calls), 1)
+
+    def test_result_without_audio_moves_on(self):
+        FakeYoutubeDL.behaviour = {
+            ((), True): {"id": VID, "title": "Song"},  # no url: only images
+            (ytdl._COOKIE_CLIENTS, True): dict(self.INFO),
+        }
+        with patch.dict("os.environ", {}, clear=True), self.assertLogs("debt-collector.music", "INFO"):
+            stream = ytdl.resolve_stream(make_track("song"))
+        self.assertEqual(stream.url, "https://audio.example/a")
+
+    def test_video_lookup_caches_the_stream_once(self):
+        from utils.music import ParsedQuery
+
+        FakeYoutubeDL.behaviour = {((), True): dict(self.INFO)}
+        with patch.dict("os.environ", {}, clear=True):
+            resolved = ytdl.resolve_tracks(ParsedQuery(QueryKind.VIDEO, CANON), 1, "me")
+            track = resolved.tracks[0]
+            self.assertEqual(track.duration, 200)
+            ytdl.resolve_stream(track)
+            self.assertEqual(len(FakeYoutubeDL.calls), 1)  # served from the cache
+            ytdl.resolve_stream(track)
+            self.assertEqual(len(FakeYoutubeDL.calls), 2)  # cache entries are single-use
+
+    def test_all_failing_reports_first_error(self):
+        with patch.dict("os.environ", {}, clear=True), self.assertLogs("debt-collector.music", "WARNING"):
+            with self.assertRaises(ExtractionError) as caught:
+                ytdl.resolve_stream(make_track("song"))
+        self.assertIn("no playable audio", str(caught.exception))
+        self.assertEqual(len(FakeYoutubeDL.calls), len(ytdl.strategies()))
 
 
 # --------------------------------------------------------------------------- #
@@ -475,9 +601,11 @@ class TestGuildPlayer(unittest.IsolatedAsyncioTestCase):
         self.player.queue.add_many([a, b])
         self.assertTrue(await self.player.ensure_playing())
         self.assertIs(self.player.queue.current, a)
+        self.player.clock.start(99)  # it played to the end
         self.vc.finish_naturally()
         await self.until(lambda: self.vc.play_calls == 2)
         self.assertIs(self.player.queue.current, b)
+        self.player.clock.start(99)
         self.vc.finish_naturally()
         await self.until(lambda: self.player.queue.current is None)
         self.assertFalse(self.player.active)
@@ -534,12 +662,16 @@ class TestGuildPlayer(unittest.IsolatedAsyncioTestCase):
     async def test_three_instant_deaths_halt_the_queue(self):
         self.player.queue.add_many([make_track(f"t{i}") for i in range(6)])
         await self.player.ensure_playing()
-        for expected_plays in (2, 3):
-            self.vc.finish_naturally()  # ends immediately: position ~0s on a 100s track
-            await self.until(lambda: self.vc.play_calls == expected_plays)
-        self.vc.finish_naturally()
-        await self.until(lambda: self.player.queue.current is None)
-        self.assertEqual(self.vc.play_calls, 3)
+        # Each track ends immediately (position ~0s on a 100s track), is restarted once
+        # through other clients, dies again, and only then counts as a failure.
+        with patch("cogs.music.stream_failed") as demote:
+            for expected_plays in (2, 3, 4, 5, 6):
+                self.vc.finish_naturally()
+                await self.until(lambda: self.vc.play_calls == expected_plays)
+            self.vc.finish_naturally()
+            await self.until(lambda: self.player.queue.current is None)
+        self.assertEqual(demote.call_count, 3)
+        self.assertEqual(self.vc.play_calls, 6)
         self.assertEqual(len(self.player.queue), 0)
         sent = " ".join(str(c) for c in self.channel.send.await_args_list)
         self.assertIn("Three tracks in a row", sent)
@@ -547,13 +679,29 @@ class TestGuildPlayer(unittest.IsolatedAsyncioTestCase):
     async def test_normal_length_playback_resets_the_failure_count(self):
         self.player.queue.add_many([make_track(f"t{i}") for i in range(4)])
         await self.player.ensure_playing()
-        self.vc.finish_naturally()
-        await self.until(lambda: self.vc.play_calls == 2)
+        with patch("cogs.music.stream_failed"):
+            self.vc.finish_naturally()  # dies at once: restarted
+            await self.until(lambda: self.vc.play_calls == 2)
+            self.vc.finish_naturally()  # dies again: counted, next track
+            await self.until(lambda: self.vc.play_calls == 3)
         self.assertEqual(self.player._quick_failures, 1)
         self.player.clock.start(50)  # pretend the second track really played for a while
         self.vc.finish_naturally()
-        await self.until(lambda: self.vc.play_calls == 3)
+        await self.until(lambda: self.vc.play_calls == 4)
         self.assertEqual(self.player._quick_failures, 0)
+
+    async def test_instant_death_restarts_the_same_track_once(self):
+        a, b = make_track("a"), make_track("b")
+        self.player.queue.add_many([a, b])
+        await self.player.ensure_playing()
+        with patch("cogs.music.stream_failed") as demote:
+            self.vc.finish_naturally()
+            await self.until(lambda: self.vc.play_calls == 2)
+        demote.assert_called_once()
+        self.assertIs(self.player.queue.current, a)
+        self.assertEqual(a.stream_retries, 1)
+        self.assertEqual(self.player._quick_failures, 0)
+        self.channel.send.assert_not_awaited()  # a silent recovery
 
     async def test_stop_clears_everything(self):
         self.player.queue.add_many([make_track("a"), make_track("b")])

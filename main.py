@@ -4550,6 +4550,51 @@ async def _start_keepalive_server() -> None:
     log.info("Keepalive HTTP server listening on port %s.", port)
 
 
+def _is_preview_deploy() -> bool:
+    """True on a Render pull-request preview, unless PREVIEW_RUN_BOT=1 asks otherwise.
+
+    Previews copy the production environment, bot token included, so without this each
+    one logs in as a second copy of the bot: both answer commands, and in voice they
+    keep kicking each other out of the channel.
+    """
+    if os.getenv("PREVIEW_RUN_BOT", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    if os.getenv("IS_PULL_REQUEST", "").strip().lower() == "true":
+        return True
+    return bool(re.search(r"\bPR #\d+\b", os.getenv("RENDER_SERVICE_NAME", "")))
+
+
+async def _run_preview_diagnostics() -> None:
+    """On a preview: test YouTube from this host instead of logging in, then idle."""
+    from utils.ytdl import probe
+
+    log.warning(
+        "Pull-request preview: not logging in to Discord (set PREVIEW_RUN_BOT=1 to override). "
+        "Probing YouTube clients from this host instead."
+    )
+    urls: List[str] = [
+        u.strip()
+        for u in os.getenv("YTDL_PROBE_URLS", "").split(",")
+        if u.strip()
+    ] or [
+        "https://www.youtube.com/watch?v=jNQXAC9IVRw",  # a plain upload
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",  # a label music video
+    ]
+    for url in urls:
+        log.warning("Probing YouTube clients with %s", url)
+        try:
+            results = await asyncio.to_thread(probe, url)
+            working: List[str] = [label for label, ok, _, _ in results if ok]
+            log.warning(
+                "YouTube probe finished for %s: %d of %d client setups work%s",
+                url, len(working), len(results), f" ({'; '.join(working)})" if working else "",
+            )
+        except Exception:
+            log.exception("YouTube probe crashed")
+    while True:
+        await asyncio.sleep(3600)
+
+
 async def _apply_guild_automations(message: discord.Message) -> None:
     """Cache-first settings lookup drives autoreact / autorespond."""
     assert message.guild is not None
@@ -12997,6 +13042,10 @@ if __name__ == "__main__":
 
     async def runner() -> None:
         await _start_keepalive_server()
+
+        if _is_preview_deploy():
+            await _run_preview_diagnostics()
+            return
 
         base_backoff: float = 15.0
         max_backoff: float = 300.0

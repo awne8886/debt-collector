@@ -196,6 +196,7 @@ class Track:
     thumbnail: Optional[str] = None
     uploader: Optional[str] = None
     is_live: bool = False
+    stream_retries: int = 0  # restarts after the stream died at once (see GuildPlayer)
 
 
 class LoopMode(Enum):
