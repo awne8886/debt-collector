@@ -134,6 +134,17 @@ def friendly_error(message: str) -> str:
     return "I couldn't load that from YouTube."
 
 
+def _redact(text: Any) -> str:
+    """Log-safe yt-dlp text. A malformed cookies file makes CPython/yt-dlp echo the offending
+    row (a live session cookie) in its error, and /errors music is readable by server admins,
+    so anything cookie-related or tab-separated is replaced by a generic note."""
+    message: str = str(text)
+    lowered: str = message.lower()
+    if "cookie" in lowered or "\t" in message or "set-cookie" in lowered:
+        return "cookie-related problem (details hidden; check YTDL_COOKIES_FILE is a valid Netscape cookies.txt)"
+    return message[:500]
+
+
 class _YtdlLogger:
     """Keep yt-dlp out of stderr. Its warnings are the best clue when playback is silent
     (missing JS runtime, unsolved challenge, skipped formats), so they go to the music log
@@ -146,10 +157,10 @@ class _YtdlLogger:
         pass
 
     def warning(self, message: str) -> None:
-        log.warning("yt-dlp: %s", str(message)[:500])
+        log.warning("yt-dlp: %s", _redact(message))
 
     def error(self, message: str) -> None:
-        log.warning("yt-dlp: %s", str(message)[:500])
+        log.warning("yt-dlp: %s", _redact(message))
 
 
 def _js_runtimes() -> Dict[str, Dict[str, Any]]:
@@ -386,7 +397,7 @@ def resolve_tracks(
                 target, download=False, process=query.kind is not QueryKind.VIDEO
             )
     except yt_dlp.utils.DownloadError as exc:
-        log.error("resolve_tracks: yt-dlp failed for %.80s: %s", target, str(exc)[:500])
+        log.error("resolve_tracks: yt-dlp failed for %.80s: %s", target, _redact(exc))
         raise ExtractionError(friendly_error(str(exc))) from exc
     log.info("resolve_tracks: done in %.1fs", time.monotonic() - started)
 
@@ -434,7 +445,7 @@ def resolve_stream(track: Track) -> StreamInfo:
         with yt_dlp.YoutubeDL(options) as ydl:
             info: Optional[Dict[str, Any]] = ydl.extract_info(track.url, download=False)
     except yt_dlp.utils.DownloadError as exc:
-        log.error("resolve_stream: yt-dlp failed for %s: %s", track.url, str(exc)[:500])
+        log.error("resolve_stream: yt-dlp failed for %s: %s", track.url, _redact(exc))
         raise ExtractionError(friendly_error(str(exc))) from exc
 
     if not info:

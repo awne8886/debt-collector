@@ -59,7 +59,11 @@ export DISCORD_TOKEN="your-bot-token"
 export MONGO_URI="mongodb+srv://user:pass@cluster/db"
 ```
 
-### 4. Run
+### 4. Add the bot to a server
+
+In the [Developer Portal](https://discord.com/developers/applications), open your application and use its **Installation** (or **OAuth2**) page to generate an invite link. Include the `bot` and `applications.commands` scopes, grant the permissions the bot needs in your server (for music: **Connect** and **Speak** in the voice channel), and open the link to add it to your server.
+
+### 5. Run
 
 ```bash
 python main.py
@@ -82,7 +86,7 @@ Slash commands sync automatically whenever the command set changes (set `SYNC_CO
 
 | Variable | Meaning |
 | --- | --- |
-| `DEFAULT_PREFIX` | Prefix for servers that haven't set their own (`!` normally) |
+| `DEFAULT_PREFIX` | Fallback prefix used in DMs and when a server's stored prefix is missing. New servers are saved with `!` (change it per server with the prefix command) |
 | `SUPERUSER_IDS` | Comma-separated Discord user IDs with bot-owner powers (see all servers' errors, clear the error buffer) |
 | `SYNC_COMMANDS` | Set to `1` to force a slash-command sync on start (otherwise it only syncs when commands change) |
 | `MONGO_DB_NAME`, `MONGO_SETTINGS_COLLECTION`, `MONGO_AI_COLLECTION` | Override database / collection names |
@@ -211,7 +215,7 @@ commands need to be grouped.
 2. **Build command** — installs dependencies and Deno:
 
    ```bash
-   pip install -r requirements.txt && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/opt/render/project/.deno sh
+   pip install -r requirements.txt && curl -fsSL -o /tmp/deno-install.sh https://deno.land/install.sh && DENO_INSTALL=/opt/render/project/.deno sh /tmp/deno-install.sh
    ```
 
 3. **Start command:** `python main.py`

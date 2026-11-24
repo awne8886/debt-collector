@@ -205,6 +205,10 @@ class _FfmpegStderr:
         pass
 
 
+class ExtractionBusy(asyncio.TimeoutError):
+    """The extraction slot never freed up, so nothing was attempted (the track isn't broken)."""
+
+
 class _ProbedSource(discord.AudioSource):
     """Wraps an audio source and counts what ffmpeg really delivers: frames, time to the first
     frame and (PCM only) peak amplitude. That tells "ffmpeg is silent" from "stalled stream"
@@ -222,6 +226,11 @@ class _ProbedSource(discord.AudioSource):
 
     def read(self) -> bytes:
         data: bytes = self.inner.read()
+        if not data:
+            # discord.py's player looks for the ffmpeg failure on the source it was given
+            error = getattr(self.inner, "_current_error", None)
+            if error is not None:
+                self._current_error = error
         if data:
             self.frames += 1
             if self.first_frame_at is None:
@@ -252,6 +261,7 @@ class GuildPlayer:
         self.guild: discord.Guild = guild
         self.log: _GuildLog = _GuildLog(log, {"guild_id": getattr(guild, "id", None)})
         self._probe: Optional[_ProbedSource] = None
+        self._busy: bool = False  # set when _start gave up only because the extractor was busy
         self._watchers: Set["asyncio.Task[None]"] = set()
         self.queue: MusicQueue = MusicQueue()
         self.clock: PlaybackClock = PlaybackClock()
@@ -368,6 +378,12 @@ class GuildPlayer:
             self.log.warning("play: skipping %s: %s", track.url, exc)
             await self.notify(f"⚠️ Skipping **{_clean_title(track.title)}** — {exc}")
             return False
+        except ExtractionBusy:
+            # never ran: another server's extraction held the slot. Keep the track queued.
+            self.log.warning("play: extractor busy, keeping %s queued", track.url)
+            self._busy = True
+            await self.notify("⏳ Another song is still loading — try again in a moment.")
+            return False
         except asyncio.TimeoutError:
             self.log.error("play: resolving %s timed out after %.0fs", track.url, RESOLVE_TIMEOUT)
             await self.notify(f"⚠️ Skipping **{_clean_title(track.title)}** — YouTube took too long to respond.")
@@ -394,7 +410,7 @@ class GuildPlayer:
         if vc.is_playing() or vc.is_paused():
             self.log.info("play: stopping the previous source first")
             vc.stop()
-        vc.play(source, after=lambda error, g=generation: self._after(g, error))
+        vc.play(source, after=lambda error, g=generation, p=self._probe: self._after(g, error, p))
         self.log.info("play: vc.play() called, is_playing=%s | %s", vc.is_playing(), memory_snapshot())
         self.clock.start(position)
         self.refresh_timer()
@@ -485,9 +501,9 @@ class GuildPlayer:
         else:
             self.log.info("audio: flowing; %s | %s", probe.summary(), memory_snapshot())
 
-    def _after(self, generation: int, error: Optional[Exception]) -> None:
-        """Runs on discord.py's player thread when a source finishes or is stopped."""
-        probe: Optional[_ProbedSource] = self._probe
+    def _after(self, generation: int, error: Optional[Exception], probe: Optional[_ProbedSource] = None) -> None:
+        """Runs on discord.py's player thread when a source finishes or is stopped.
+        `probe` is the finishing source's own stats (self._probe may already be the next one)."""
         stats: str = probe.summary() if probe is not None else "no stats"
         if error is not None:
             # Printed straight to stderr as well, so it shows up in the Render logs whatever
@@ -559,6 +575,10 @@ class GuildPlayer:
             self.skip_votes.clear()
             if await self._start(track, announce=announce):
                 return True
+            if self._busy:  # don't burn through the queue while the extractor is occupied
+                self._busy = False
+                self._halt()
+                return False
 
     def _halt(self) -> None:
         self._gen += 1
@@ -741,11 +761,11 @@ class MusicCog(commands.Cog, name="Music"):
             await asyncio.wait_for(self.extract_lock.acquire(), RESOLVE_TIMEOUT)
         except asyncio.TimeoutError:
             log.warning("extract: gave up waiting %.0fs for another extraction to finish", RESOLVE_TIMEOUT)
-            raise
+            raise ExtractionBusy() from None
         remaining: float = deadline - loop.time()
         if remaining <= 0:  # the wait used the whole budget; don't start work nobody is waiting for
             self.extract_lock.release()
-            raise asyncio.TimeoutError()
+            raise ExtractionBusy()
         try:
             worker: "asyncio.Future[Any]" = asyncio.ensure_future(asyncio.to_thread(func, *args))
         except BaseException:
