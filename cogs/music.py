@@ -359,6 +359,7 @@ class GuildPlayer:
 
     async def _start(self, track: Track, position: float = 0.0, *, announce: bool = True) -> bool:
         """Begin playing `track`. Caller holds the lock. False means it couldn't play."""
+        self._busy = False  # reflects only this call (seek never clears it otherwise)
         vc = self.voice
         if vc is None:
             self.log.warning("play: voice client isn't connected (still reconnecting?); can't start %s", track.url)
