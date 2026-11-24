@@ -114,7 +114,8 @@ def friendly_error(message: str) -> str:
     if "not a bot" in text or "sign in to confirm" in text:
         return (
             "YouTube is blocking this server's IP with a bot check. "
-            "The bot owner needs to supply cookies (`YTDL_COOKIES_FILE`)."
+            "The bot owner can route YouTube through a proxy (`YTDL_PROXY`) "
+            "or supply cookies (`YTDL_COOKIES_FILE`)."
         )
     if "private video" in text:
         return "That video is private."
@@ -161,32 +162,40 @@ def _js_runtimes() -> Dict[str, Dict[str, Any]]:
     return found
 
 
-_COOKIE_COPY: str = os.path.join(tempfile.gettempdir(), "debt-collector-ytdl-cookies.txt")
-_COOKIE_SOURCE_SIG: Optional[Tuple[str, int, int, int]] = None  # identity/version of the last-copied source
+def _player_clients() -> List[str]:
+    """YTDL_PLAYER_CLIENTS, e.g. "tv_simply,web_embedded": which YouTube clients yt-dlp asks."""
+    raw: str = os.getenv("YTDL_PLAYER_CLIENTS", "")
+    return [c.strip() for c in raw.split(",") if c.strip()]
 
 
-def _cookie_file() -> Optional[str]:
-    """YTDL_COOKIES_FILE, as a writable copy: yt-dlp rewrites its cookie file, and hosts such
-    as Render mount secret files read-only, which would make every extraction fail."""
-    source: Optional[str] = os.getenv("YTDL_COOKIES_FILE")
-    if not source:
-        return None
-    if not os.path.isfile(source):
-        log.warning("YTDL_COOKIES_FILE=%s does not exist; continuing without cookies.", source)
-        return None
-    global _COOKIE_SOURCE_SIG
+@functools.lru_cache(maxsize=4)
+def _copy_cookies(path: str, signature: Tuple[int, int, int]) -> str:
+    """Copy a read-only cookies file. `signature` is the *source's* mtime/size/inode, so a
+    replaced source is copied again (the cache is keyed on it, never on the copy that yt-dlp
+    keeps rewriting)."""
+    target: str = os.path.join(tempfile.gettempdir(), "ytdl-cookies.txt")
     try:
-        # Compare the *source* against what was last copied (yt-dlp rewrites the copy, which
-        # would otherwise make it look newer than a freshly exported source file).
-        stat = os.stat(source)
-        signature = (os.path.realpath(source), stat.st_mtime_ns, stat.st_size, stat.st_ino)
-        if signature != _COOKIE_SOURCE_SIG or not os.path.exists(_COOKIE_COPY):
-            shutil.copyfile(source, _COOKIE_COPY)
-            _COOKIE_SOURCE_SIG = signature
-        return _COOKIE_COPY
+        shutil.copyfile(path, target)
+        os.chmod(target, 0o600)
     except OSError as exc:
-        log.warning("Couldn't make a writable copy of the cookies file (%s); using it as-is.", exc)
-        return source
+        log.warning("Couldn't copy read-only cookies file %s: %s", path, exc)
+        return path
+    log.info("Cookies file %s is read-only; using a writable copy at %s", path, target)
+    return target
+
+
+def _writable_cookie_file(path: str) -> str:
+    """yt-dlp rewrites the cookies file, so copy a read-only one (e.g. a Render Secret File)."""
+    if os.access(path, os.W_OK):
+        return path
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return path
+    return _copy_cookies(path, (stat.st_mtime_ns, stat.st_size, stat.st_ino))
+
+
+_writable_cookie_file.cache_clear = _copy_cookies.cache_clear  # type: ignore[attr-defined]
 
 
 def _base_options() -> Dict[str, Any]:
@@ -204,9 +213,20 @@ def _base_options() -> Dict[str, Any]:
     runtimes: Dict[str, Dict[str, Any]] = _js_runtimes()
     if runtimes:
         options["js_runtimes"] = runtimes
-    cookies: Optional[str] = _cookie_file()
+    cookies: str = os.getenv("YTDL_COOKIES_FILE", "")
     if cookies:
-        options["cookiefile"] = cookies
+        if os.path.isfile(cookies):
+            options["cookiefile"] = _writable_cookie_file(cookies)
+        else:
+            log.warning("YTDL_COOKIES_FILE=%s does not exist; continuing without cookies.", cookies)
+    proxy: str = os.getenv("YTDL_PROXY", "").strip()
+    if proxy:
+        # The proxy has its own address, so don't pin the outgoing socket to IPv4.
+        options["proxy"] = proxy
+        options.pop("source_address", None)
+    clients: List[str] = _player_clients()
+    if clients:
+        options["extractor_args"] = {"youtube": {"player_client": clients}}
     return options
 
 
@@ -304,6 +324,11 @@ def environment_report() -> List[Tuple[int, str]]:
         report.append((logging.WARNING, f"Cookies: {cookies_env} does not exist"))
     else:
         report.append((logging.INFO, f"Cookies: {cookies_env} ({os.path.getsize(cookies_env)} bytes)"))
+
+    # Never log the proxy URL itself: it can carry credentials.
+    report.append((logging.INFO, f"Proxy: {'configured (YTDL_PROXY)' if os.getenv('YTDL_PROXY', '').strip() else 'none'}"))
+    clients_cfg: List[str] = _player_clients()
+    report.append((logging.INFO, f"YouTube player clients: {', '.join(clients_cfg) or 'yt-dlp default'}"))
 
     report.append((logging.INFO, f"Memory: {memory_snapshot()}"))
     report.append((logging.INFO, f"Python {sys.version.split()[0]}"))

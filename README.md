@@ -98,7 +98,9 @@ Slash commands sync automatically whenever the command set changes (set `SYNC_CO
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `YTDL_COOKIES_FILE` | unset | Path to a Netscape-format YouTube cookies file for yt-dlp |
+| `YTDL_PROXY` | unset | Proxy for all YouTube traffic, e.g. `socks5://127.0.0.1:40000` or `http://user:pass@host:port` |
+| `YTDL_PLAYER_CLIENTS` | yt-dlp's choice | Comma-separated YouTube clients to try, e.g. `tv_simply,web_embedded` |
+| `YTDL_COOKIES_FILE` | unset | Path to a Netscape-format YouTube cookies file for yt-dlp (a read-only file is copied to a writable one) |
 | `FFMPEG_PATH` | auto | Use a specific ffmpeg binary |
 | `MUSIC_DEFAULT_VOLUME` | `50` | Starting volume, 0–150 |
 | `MUSIC_MAX_DURATION` | `10800` | Longest single track in seconds |
@@ -136,7 +138,7 @@ Play YouTube and YouTube Music in a voice channel. The bot joins the channel you
 * **ffmpeg** is used from `FFMPEG_PATH`, then `PATH`, then the static build bundled by `imageio-ffmpeg`, so a plain `pip install -r requirements.txt` is enough.
 * **A JavaScript runtime** (`deno`, `node` or `bun`): current yt-dlp needs one to read YouTube. The bot also looks in `/opt/render/project/.deno/bin`, `~/.deno/bin` and `~/.bun/bin` and adds them to `PATH` itself, so a Deno installed during a Render build is found even though Render doesn't put it on `PATH`.
 * **libopus** is optional. Without it the bot falls back to ffmpeg's Opus output and a volume change restarts the current track from where it was.
-* **YouTube bot checks:** many datacenter IPs get *"Sign in to confirm you're not a bot"*. Export your YouTube cookies (Netscape format) to a file on the host and set `YTDL_COOKIES_FILE` to its path. The bot works on a writable copy, so a read-only secret file is fine.
+* **YouTube bot checks:** many datacenter IPs get *"Sign in to confirm you're not a bot"*. YouTube decides this by the host's IP address, so a fix needs one of the options under [Getting past YouTube's bot check](#getting-past-youtubes-bot-check).
 * Keep `yt-dlp` current (`pip install -U yt-dlp`); YouTube changes break old versions.
 
 ### 🩺 Music troubleshooting
@@ -159,8 +161,47 @@ The same lines are printed to the host's logs (Render → **Logs**), tagged `[g:
 | `ffmpeg: ... 403 Forbidden` | Expired or refused stream URL | Same as above; URLs are resolved right before playback, so it's the runtime or cookies |
 | `I might not be heard: missing the Speak permission` | Channel permission | Grant *Speak*, un-mute the bot; in Stage channels invite it to speak |
 | `DAVE session still not ready` | Voice encryption handshake slow | Usually clears on the next track; make sure `davey` is installed |
-| Sign in to confirm you're not a bot | YouTube flags the host's IP | Add cookies via `YTDL_COOKIES_FILE` |
+| Sign in to confirm you're not a bot | YouTube flags the host's IP | See [Getting past YouTube's bot check](#getting-past-youtubes-bot-check): player clients, a proxy, or cookies |
 | Memory near 512 MB on Render | yt-dlp + ffmpeg at once | Only one yt-dlp run happens at a time; check the `Memory:` log lines |
+
+---
+
+### Getting past YouTube's bot check
+
+"Sign in to confirm you're not a bot" means YouTube has flagged the IP address the bot
+runs on. Most cloud and free hosts share flagged addresses. Try these in order:
+
+1. **Update yt-dlp** (`pip install -U yt-dlp`) and restart. Old versions fail more often.
+2. **Try other YouTube clients.** Set `YTDL_PLAYER_CLIENTS`, for example
+   `tv_simply,web_embedded` or `mweb`. This costs nothing but helps only on some IPs,
+   and which clients work changes as YouTube changes.
+3. **Use a proxy (no cookies needed).** Set `YTDL_PROXY` and the bot sends all YouTube
+   traffic, audio included, through it. The bot check then sees the proxy's IP:
+   * A **residential proxy** is the most reliable. Use its `http://user:pass@host:port` URL.
+   * **Cloudflare WARP** is free. Run [`wgcf`](https://github.com/ViRb3/wgcf) to make a
+     WireGuard profile, then [`wireproxy`](https://github.com/whyvl/wireproxy) to expose
+     it as a local SOCKS5 proxy, and set `YTDL_PROXY=socks5://127.0.0.1:<port>`. YouTube
+     flags some WARP addresses too, so results vary.
+   * A home PC or Raspberry Pi running a small proxy (for example `microsocks`) also works,
+     because home IPs are rarely flagged.
+4. **Proof-of-origin tokens.** Install the
+   [`bgutil-ytdlp-pot-provider`](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+   yt-dlp plugin and run its token server. yt-dlp picks the plugin up on its own. This helps
+   with YouTube 403 errors and on lightly flagged IPs, but it won't clear a hard IP block.
+5. **Cookies** (`YTDL_COOKIES_FILE`, Netscape format). Use a throwaway Google account:
+   YouTube can ban accounts it sees used this way. yt-dlp updates the file as it goes;
+   if the file is read-only, the bot copies it to the temp folder and uses the copy.
+   * **Export:** sign in to YouTube in a private window, export the youtube.com cookies
+     in Netscape format (for example with the Cookie-Editor extension), then close the
+     window without signing out, so the browser doesn't rotate the exported cookies.
+   * **Render:** add the file under the service's Environment > Secret Files as
+     `cookies.txt`, and set `YTDL_COOKIES_FILE=/etc/secrets/cookies.txt`.
+   * Cookies expire. When the bot check comes back, export a fresh file.
+
+Running the bot on a home connection instead of a datacenter also avoids the check.
+
+The bot is at 94 of Discord's 100 global slash commands, so there are 6 left before new
+commands need to be grouped.
 
 ---
 

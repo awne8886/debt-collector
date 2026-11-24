@@ -20,7 +20,14 @@ from utils.music import (
     progress_bar,
     required_votes,
 )
-from utils.ytdl import ExtractionError, StreamInfo, _entry_to_track, friendly_error
+from utils.ytdl import (
+    ExtractionError,
+    StreamInfo,
+    _base_options,
+    _writable_cookie_file,
+    _entry_to_track,
+    friendly_error,
+)
 
 VID = "dQw4w9WgXcQ"
 CANON = f"https://www.youtube.com/watch?v={VID}"
@@ -258,10 +265,63 @@ class TestClock(unittest.TestCase):
 
 class TestYtdlHelpers(unittest.TestCase):
     def test_friendly_errors(self):
-        self.assertIn("cookies", friendly_error("ERROR: Sign in to confirm you're not a bot"))
+        bot_check = friendly_error("ERROR: Sign in to confirm you're not a bot")
+        self.assertIn("YTDL_PROXY", bot_check)
+        self.assertIn("YTDL_COOKIES_FILE", bot_check)
         self.assertIn("private", friendly_error("ERROR: Private video. Sign in"))
         self.assertIn("age-restricted", friendly_error("Sign in to confirm your age"))
         self.assertEqual(friendly_error("???"), "I couldn't load that from YouTube.")
+
+    def test_base_options_defaults(self):
+        with patch.dict("os.environ", {}, clear=True):
+            options = _base_options()
+        self.assertEqual(options["source_address"], "0.0.0.0")
+        self.assertNotIn("proxy", options)
+        self.assertNotIn("extractor_args", options)
+
+    def test_base_options_proxy_and_clients(self):
+        env = {
+            "YTDL_PROXY": " socks5://127.0.0.1:40000 ",
+            "YTDL_PLAYER_CLIENTS": "tv_simply, web_embedded,,",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            options = _base_options()
+        self.assertEqual(options["proxy"], "socks5://127.0.0.1:40000")
+        self.assertNotIn("source_address", options)
+        self.assertEqual(
+            options["extractor_args"], {"youtube": {"player_client": ["tv_simply", "web_embedded"]}}
+        )
+
+    def test_read_only_cookies_are_copied(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(src_dir, "cookies.txt")
+            with open(source, "w") as handle:
+                handle.write("# Netscape HTTP Cookie File\n")
+            _writable_cookie_file.cache_clear()
+            with patch("utils.ytdl.os.access", return_value=False), patch(
+                "utils.ytdl.tempfile.gettempdir", return_value=tmp
+            ), patch.dict("os.environ", {"YTDL_COOKIES_FILE": source}, clear=True):
+                options = _base_options()
+            _writable_cookie_file.cache_clear()
+            self.assertEqual(options["cookiefile"], os.path.join(tmp, "ytdl-cookies.txt"))
+            with open(options["cookiefile"]) as handle:
+                self.assertIn("Netscape", handle.read())
+
+    def test_writable_cookies_are_used_in_place(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as src_dir:
+            source = os.path.join(src_dir, "cookies.txt")
+            open(source, "w").close()
+            _writable_cookie_file.cache_clear()
+            with patch.dict("os.environ", {"YTDL_COOKIES_FILE": source}, clear=True):
+                options = _base_options()
+            _writable_cookie_file.cache_clear()
+            self.assertEqual(options["cookiefile"], source)
 
     def test_entry_to_track(self):
         entry = {"id": VID, "title": "Song", "duration": 212.0, "channel": "Artist"}
