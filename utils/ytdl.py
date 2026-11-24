@@ -689,4 +689,7 @@ def probe(url: str = _PROBE_VIDEO) -> List[Tuple[str, bool, float, str]]:
         elapsed: float = time.monotonic() - started
         results.append((strategy.label, ok, elapsed, detail))
         log.info("probe %-4s %5.1fs %s: %s", "OK" if ok else "FAIL", elapsed, strategy.label, detail)
+        if not ok:
+            for warning in options["logger"].warnings[-6:]:
+                log.info("  yt-dlp said: %s", warning[:300])
     return results
