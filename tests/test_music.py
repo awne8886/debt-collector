@@ -490,6 +490,31 @@ class TestClientRotation(unittest.TestCase):
             ytdl.resolve_stream(track)
             self.assertEqual(len(FakeYoutubeDL.calls), 2)  # cache entries are single-use
 
+    def test_warm_up_prefers_the_fastest_working_group(self):
+        FakeYoutubeDL.behaviour = {
+            ((), True): dict(self.INFO),
+            (ytdl._JSLESS_CLIENTS, False): dict(self.INFO),
+        }
+        clock = {"now": 0.0}
+
+        def slow_for_cookies(*_):
+            return clock["now"]
+
+        original = FakeYoutubeDL.extract_info
+
+        def timed(self_, target, download=False, process=True):
+            cookies = "cookiefile" in self_.options
+            clock["now"] += 15.0 if cookies else 3.0
+            return original(self_, target, download, process)
+
+        with patch.dict("os.environ", {"YTDL_WARP": "off"}, clear=True), \
+                patch.object(FakeYoutubeDL, "extract_info", timed), \
+                patch("utils.ytdl.time.monotonic", side_effect=slow_for_cookies), \
+                patch("utils.ytdl._check_playable", return_value=None), \
+                self.assertLogs("debt-collector.music", "INFO"):
+            chosen = ytdl.warm_up()
+        self.assertEqual(chosen, Strategy(ytdl._JSLESS_CLIENTS, False))
+
     def test_all_failing_reports_first_error(self):
         with patch.dict("os.environ", {}, clear=True), self.assertLogs("debt-collector.music", "WARNING"):
             with self.assertRaises(ExtractionError) as caught:

@@ -681,14 +681,50 @@ def resolve_stream(track: Track) -> StreamInfo:
 
 
 def warm_up() -> Optional[Strategy]:
-    """Resolve a known video once so the working client group and player JS are ready."""
+    """Find the route and the fastest working client group before anyone asks.
+
+    The rotation keeps the first group that works, which can be a slow one (on
+    Render through WARP, the cookie groups take ~15 s and the JavaScript-free group
+    ~3 s), so each group is timed once and the fastest becomes the first choice.
+    """
     try:
         _run_with_rotation(_PROBE_VIDEO, _configure_stream, check=_require_audio)
     except ExtractionError as exc:
         log.warning("YouTube warm-up failed with every client group: %s", exc)
         return None
+    fastest: Optional[Tuple[float, Strategy]] = None
+    for strategy in strategies():
+        elapsed: Optional[float] = _time_strategy(strategy)
+        if elapsed is not None and (fastest is None or elapsed < fastest[0]):
+            fastest = (elapsed, strategy)
+    if fastest is not None:
+        log.info("Fastest YouTube client group: %s (%.1fs)", fastest[1].label, fastest[0])
+        _remember(fastest[1])
     with _state_lock:
         return _preferred
+
+
+def _time_strategy(strategy: Strategy) -> Optional[float]:
+    """Seconds one group takes to resolve audio that really plays, or None if it doesn't.
+
+    Playback is checked too: some clients (android_vr through WARP, for one) resolve
+    fine but YouTube refuses the stream itself.
+    """
+    import yt_dlp
+
+    options: Dict[str, Any] = _options_for(strategy)
+    _configure_stream(options)
+    started: float = time.monotonic()
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(_PROBE_VIDEO, download=False)
+        _require_audio(info or {})
+    except yt_dlp.utils.DownloadError:
+        return None
+    elapsed: float = time.monotonic() - started
+    if _check_playable(info, seconds=2) is not None:
+        return None
+    return elapsed
 
 
 def _check_playable(info: Dict[str, Any], seconds: int = 3) -> Optional[str]:
