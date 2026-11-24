@@ -498,6 +498,138 @@ class TestClientRotation(unittest.TestCase):
         self.assertEqual(len(FakeYoutubeDL.calls), len(ytdl.strategies()))
 
 
+class TestWarp(unittest.TestCase):
+    def setUp(self):
+        from utils import warp
+
+        self.warp = warp
+        warp._process = None
+        warp._proxy = None
+        warp._failed_at = 0.0
+
+    def test_modes_and_availability(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(self.warp.mode(), "auto")
+        with patch.dict("os.environ", {"YTDL_WARP": "off"}, clear=True):
+            self.assertFalse(self.warp.available())
+        with patch.dict("os.environ", {"YTDL_WARP": "1"}, clear=True):
+            self.assertEqual(self.warp.mode(), "on")
+        with patch.dict("os.environ", {"YTDL_PROXY": "http://p:1"}, clear=True):
+            self.assertFalse(self.warp.available())  # an explicit proxy always wins
+        with patch.dict("os.environ", {}, clear=True), patch("utils.warp._machine", return_value="mips"):
+            self.assertFalse(self.warp.available())
+
+    def test_registration_and_config(self):
+        import json
+        import tempfile
+
+        registration = {
+            "id": "dev", "token": "tok",
+            "config": {
+                "peers": [{"public_key": "PEERKEY=", "endpoint": {
+                    "v4": "162.159.192.8:0", "host": "engage.cloudflareclient.com:2408"}}],
+                "interface": {"addresses": {"v4": "172.16.0.2", "v6": "2606:4700::1"}},
+            },
+        }
+        calls = []
+
+        def fake_api(method, path, body, token=""):
+            calls.append((method, path))
+            return registration if method == "POST" else {}
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", {"WARP_DIR": tmp}), \
+                patch("utils.warp._api", side_effect=fake_api):
+            account = self.warp._account()
+            again = self.warp._account()  # kept, not registered twice
+            with open(f"{tmp}/account.json") as handle:
+                self.assertEqual(json.load(handle), account)
+        self.assertEqual(calls, [("POST", "/reg"), ("PATCH", "/reg/dev")])
+        self.assertEqual(again, account)
+        self.assertEqual(account["endpoint"], "162.159.192.8:2408")
+        config = self.warp._wireproxy_config(account, 4000)
+        self.assertIn("Address = 172.16.0.2/32, 2606:4700::1/128", config)
+        self.assertIn("PublicKey = PEERKEY=", config)
+        self.assertIn("[http]\nBindAddress = 127.0.0.1:4000", config)
+        self.assertEqual(len(__import__("base64").b64decode(account["private_key"])), 32)
+
+    def test_download_must_match_the_pinned_checksum(self):
+        import io
+        import tempfile
+
+        fake = MagicMock()
+        fake.__enter__.return_value = io.BytesIO(b"not the real archive")
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", {"WARP_DIR": tmp}), \
+                patch("utils.warp._machine", return_value="x86_64"), \
+                patch("utils.warp.urllib.request.urlopen", return_value=fake):
+            with self.assertRaises(self.warp.WarpError) as caught:
+                self.warp._wireproxy_binary()
+        self.assertIn("SHA-256", str(caught.exception))
+
+    def test_failed_start_is_not_retried_at_once(self):
+        with patch.dict("os.environ", {}, clear=True), \
+                patch("utils.warp.available", return_value=True), \
+                patch("utils.warp._start", side_effect=self.warp.WarpError("no udp")) as start, \
+                self.assertLogs("debt-collector.music", "WARNING"):
+            self.assertIsNone(self.warp.ensure_started())
+            self.assertIsNone(self.warp.ensure_started())
+        start.assert_called_once()
+
+
+class TestWarpFallback(unittest.TestCase):
+    """When YouTube refuses the host's IP, the rotation hands over to WARP."""
+
+    INFO = TestClientRotation.INFO
+    setUp = TestClientRotation.setUp
+    tearDown = TestClientRotation.tearDown
+
+    def test_ip_block_switches_to_warp_and_retries(self):
+        bot_check = "ERROR: [youtube] x: Sign in to confirm you're not a bot"
+        state = {"warp": None}
+
+        class RoutedYoutubeDL(FakeYoutubeDL):
+            def extract_info(self, target, download=False, process=True):
+                if state["warp"] is None:
+                    import yt_dlp
+
+                    FakeYoutubeDL.calls.append(("direct",))
+                    raise yt_dlp.utils.DownloadError(bot_check)
+                return super().extract_info(target, download, process)
+
+        def start():
+            state["warp"] = "http://127.0.0.1:9"
+            return state["warp"]
+
+        FakeYoutubeDL.behaviour = {((), True): dict(self.INFO)}
+        with patch("yt_dlp.YoutubeDL", RoutedYoutubeDL), \
+                patch.dict("os.environ", {}, clear=True), \
+                patch("utils.warp.available", return_value=True), \
+                patch("utils.warp.proxy_url", side_effect=lambda: state["warp"]), \
+                patch("utils.warp.ensure_started", side_effect=start), \
+                self.assertLogs("debt-collector.music", "INFO"):
+            stream = ytdl.resolve_stream(make_track("song"))
+            options = ytdl._base_options()
+            self.assertEqual(ytdl.ffmpeg_input_options(), ["-http_proxy", "http://127.0.0.1:9"])
+        self.assertEqual(stream.url, "https://audio.example/a")
+        self.assertEqual(FakeYoutubeDL.calls[0], ("direct",))  # one direct try, then WARP
+        self.assertEqual(options["proxy"], "http://127.0.0.1:9")
+
+    def test_rotation_continues_when_warp_cannot_start(self):
+        import yt_dlp
+
+        FakeYoutubeDL.behaviour = {
+            ((), True): "ERROR: [youtube] x: Sign in to confirm you're not a bot",
+            (ytdl._COOKIE_CLIENTS, True): dict(self.INFO),
+        }
+        with patch.dict("os.environ", {}, clear=True), \
+                patch("utils.warp.available", return_value=True), \
+                patch("utils.warp.proxy_url", return_value=None), \
+                patch("utils.warp.ensure_started", return_value=None) as start, \
+                self.assertLogs("debt-collector.music", "INFO"):
+            stream = ytdl.resolve_stream(make_track("song"))
+        start.assert_called_once()
+        self.assertEqual(stream.url, "https://audio.example/a")
+
+
 # --------------------------------------------------------------------------- #
 # Player state machine, driven with a fake voice connection
 # --------------------------------------------------------------------------- #

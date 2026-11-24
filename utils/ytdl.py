@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from utils import warp
 from utils.music import (
     ParsedQuery,
     QueryKind,
@@ -186,7 +187,7 @@ def _base_options() -> Dict[str, Any]:
     cookies: Optional[str] = _cookie_file()
     if cookies:
         options["cookiefile"] = _writable_cookie_file(cookies)
-    proxy: str = os.getenv("YTDL_PROXY", "").strip()
+    proxy: Optional[str] = _route_proxy()
     if proxy:
         # The proxy has its own address, so don't pin the outgoing socket to IPv4.
         options["proxy"] = proxy
@@ -208,14 +209,19 @@ def _cache_dir() -> str:
     )
 
 
+def _route_proxy() -> Optional[str]:
+    """Where YouTube traffic goes: YTDL_PROXY, else WARP when it's running, else direct."""
+    return os.getenv("YTDL_PROXY", "").strip() or warp.proxy_url()
+
+
 def ffmpeg_input_options() -> List[str]:
     """ffmpeg options so the audio goes the same way as yt-dlp's requests.
 
-    YouTube ties each stream URL to the IP address that asked for it, so with
-    YTDL_PROXY set, ffmpeg must fetch through the same proxy or it gets HTTP 403.
-    ffmpeg only speaks HTTP proxies, not SOCKS.
+    YouTube ties each stream URL to the IP address that asked for it, so behind a
+    proxy (YTDL_PROXY or WARP), ffmpeg must fetch through the same proxy or it gets
+    HTTP 403. ffmpeg only speaks HTTP proxies, not SOCKS.
     """
-    proxy: str = os.getenv("YTDL_PROXY", "").strip()
+    proxy: Optional[str] = _route_proxy()
     if not proxy:
         return []
     if proxy.lower().startswith(("http://", "https://")):
@@ -454,6 +460,53 @@ def _run_with_rotation(
     `check` may raise yt_dlp's DownloadError to reject a result (e.g. no audio URL),
     which moves on to the next group like any other failure.
     """
+    if warp.mode() == "on" and warp.available() and warp.proxy_url() is None:
+        _switch_to_warp()
+    try:
+        return _rotate(target, configure, process=process, check=check)
+    except _RouteChanged:
+        return _rotate(target, configure, process=process, check=check)
+
+
+# What YouTube says when it refuses the host's IP address outright.
+_IP_BLOCK_SIGNS: Tuple[str, ...] = (
+    "sign in to confirm you",
+    "unable to download api page: http error 403",
+)
+
+
+class _RouteChanged(Exception):
+    """YouTube traffic now goes another way (WARP); start the rotation again."""
+
+
+def _looks_ip_blocked(message: str, warnings: List[str]) -> bool:
+    text: str = " ".join([message, *warnings]).lower()
+    return any(sign in text for sign in _IP_BLOCK_SIGNS)
+
+
+def _switch_to_warp() -> bool:
+    """Start WARP and route YouTube through it. False if it can't be used or started."""
+    global _preferred, _demoted
+    if not warp.available():
+        return False
+    if warp.proxy_url() is not None:
+        return False  # already on WARP; a retry through it wouldn't change anything
+    if warp.ensure_started() is None:
+        return False
+    with _state_lock:
+        _preferred = None  # which clients work depends on the IP, so start over
+        _demoted = None
+        _stream_cache.clear()
+    return True
+
+
+def _rotate(
+    target: str,
+    configure: Callable[[Dict[str, Any]], None],
+    *,
+    process: bool,
+    check: Optional[Callable[[Dict[str, Any]], None]],
+) -> Dict[str, Any]:
     import yt_dlp
 
     started: float = time.monotonic()
@@ -488,6 +541,17 @@ def _run_with_rotation(
                 first_error = message
             if _is_final(message):
                 break
+            # YouTube refusing this IP: no other client will do better from here, so
+            # hand over to WARP (auto mode) instead of waiting through the rest.
+            if (
+                warp.mode() == "auto"
+                and warp.available()
+                and warp.proxy_url() is None
+                and _looks_ip_blocked(message, logger.warnings)
+            ):
+                log.warning("YouTube is refusing this server's IP; trying Cloudflare WARP")
+                if _switch_to_warp():
+                    raise _RouteChanged()
             continue
         if tried:
             log.info("Recovered %s via %s after: %s", target, strategy.label, "; ".join(tried))
@@ -671,6 +735,10 @@ def probe(url: str = _PROBE_VIDEO) -> List[Tuple[str, bool, float, str]]:
             if single not in groups and single not in singles:
                 singles.append(single)
     for strategy in groups + singles:
+        if strategy in singles and not any(ok for _, ok, _, _ in results):
+            # A group works when any of its clients does, so none of these will.
+            log.info("probe: every client group failed, skipping single clients")
+            break
         options: Dict[str, Any] = _options_for(strategy)
         _configure_stream(options)
         started: float = time.monotonic()

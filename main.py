@@ -4580,17 +4580,28 @@ async def _run_preview_diagnostics() -> None:
         "https://www.youtube.com/watch?v=jNQXAC9IVRw",  # a plain upload
         "https://www.youtube.com/watch?v=dQw4w9WgXcQ",  # a label music video
     ]
-    for url in urls:
-        log.warning("Probing YouTube clients with %s", url)
-        try:
-            results = await asyncio.to_thread(probe, url)
-            working: List[str] = [label for label, ok, _, _ in results if ok]
-            log.warning(
-                "YouTube probe finished for %s: %d of %d client setups work%s",
-                url, len(working), len(results), f" ({'; '.join(working)})" if working else "",
-            )
-        except Exception:
-            log.exception("YouTube probe crashed")
+    async def run(route: str) -> None:
+        for url in urls:
+            log.warning("Probing YouTube clients %s with %s", route, url)
+            try:
+                results = await asyncio.to_thread(probe, url)
+                working: List[str] = [label for label, ok, _, _ in results if ok]
+                log.warning(
+                    "YouTube probe finished %s for %s: %d of %d client setups work%s",
+                    route, url, len(working), len(results),
+                    f" ({'; '.join(working)})" if working else "",
+                )
+            except Exception:
+                log.exception("YouTube probe crashed")
+
+    from utils import warp
+
+    await run("directly" if not os.getenv("YTDL_PROXY") else "through YTDL_PROXY")
+    if warp.available():
+        if await asyncio.to_thread(warp.ensure_started):
+            await run("through Cloudflare WARP")
+        else:
+            log.warning("WARP didn't start, so it wasn't probed (see the lines above)")
     while True:
         await asyncio.sleep(3600)
 

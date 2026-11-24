@@ -57,6 +57,9 @@ anything else is treated as a search or rejected.
 | `YTDL_ATTEMPT_BUDGET` | `75` | Seconds after which no further client groups are tried for one request |
 | `YTDL_COOKIES_FILE` | unset | Cookies file passed to yt-dlp |
 | `YTDL_CACHE_DIR` | temp folder | Where yt-dlp caches YouTube's player code between plays |
+| `YTDL_WARP` | `auto` | Cloudflare WARP for YouTube: `auto` when YouTube blocks the host's IP, `on` always, `off` never (see below) |
+| `WARP_DIR` | temp folder | Where the WARP registration and the `wireproxy` binary are kept |
+| `WIREPROXY_PATH` | download | Use this `wireproxy` binary instead of downloading the pinned release |
 | `MUSIC_WARMUP` | `on` | `off` skips the YouTube check the bot runs once at startup |
 | `PREVIEW_RUN_BOT` | unset | `1` lets a Render pull-request preview log in to Discord (see below) |
 | `FFMPEG_PATH` | auto | Path to an ffmpeg binary |
@@ -95,6 +98,25 @@ command and keep kicking each other out of voice). Instead it tests every YouTub
 from Render's network, including fetching a few seconds of audio with ffmpeg, and logs
 lines starting with `probe OK` / `probe FAIL` and a `YouTube probe finished` summary. Set
 `PREVIEW_RUN_BOT=1` on a preview to run the bot there anyway.
+
+### Built-in Cloudflare WARP (free)
+
+Many hosts, Render included, have IP addresses YouTube refuses outright (`HTTP Error 403`
+on its API, or "Sign in to confirm you're not a bot" for every client). When the bot
+sees that, it routes YouTube through [Cloudflare WARP](https://one.one.one.one/), a free
+VPN, by itself:
+
+1. It registers a free WARP device with Cloudflare (a new WireGuard key, made locally).
+2. It downloads [`wireproxy`](https://github.com/windtf/wireproxy) v1.1.3, a userspace
+   WireGuard client that needs no root, and checks it against the release's SHA-256.
+3. It runs it as an HTTP proxy on `127.0.0.1` and confirms through Cloudflare's trace page
+   that traffic really leaves through WARP.
+
+yt-dlp and ffmpeg then both use the tunnel, so the audio comes from the same IP as the
+lookup. The log shows `WARP is up` with the exit location. Nothing needs configuring; set
+`YTDL_WARP=off` to disable it, or `on` to use it from the start. `YTDL_PROXY` always takes
+precedence. YouTube blocks some WARP addresses too; if it does, a residential proxy
+(below) is the next step.
 
 ### Getting past YouTube's bot check
 
