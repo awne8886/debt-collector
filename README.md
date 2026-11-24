@@ -76,18 +76,21 @@ differently, and which ones work depends on the host's IP address, on whether co
 are sent, and on YouTube's changes from week to week. Like the Lavalink YouTube plugin
 most large music bots use, the bot doesn't rely on one client:
 
-1. It first asks with your settings (`YTDL_PLAYER_CLIENTS`, cookies if configured).
-2. If that gives no playable audio or hits a bot check, it tries other groups of clients:
-   with cookies `tv_samsung, tv, web_embedded, mweb, web_music`; then without cookies
-   `visionos, ios_producer, android_vr` (fast, no JavaScript needed) and
-   `tv_samsung, web_embedded, mweb, tv_simply, web_music`. Cookie-less clients only work
-   in a request without cookies, so these attempts drop them.
+1. It first asks with `visionos, ios_producer, android_vr` without cookies: they need no
+   JavaScript, so yt-dlp doesn't start deno, which is fast and keeps memory low (deno
+   can push a 512 MB Render instance over its limit). `YTDL_PLAYER_CLIENTS`, if set,
+   goes first instead.
+2. If that gives no playable audio, it tries yt-dlp's own choice (with your cookies),
+   then with cookies `tv_samsung, tv, web_embedded, mweb, web_music`, then without
+   cookies `tv_samsung, web_embedded, mweb, tv_simply, web_music`. Cookie-less clients
+   only work in a request without cookies, so those attempts drop them.
 3. Whichever group worked is tried first from then on, and the log says
    `YouTube is answering through ...` when that changes.
 4. If a track stops within seconds of starting (YouTube refused the stream), that group
    is set aside and the track is restarted once with the next one.
 
-At startup the bot resolves one known video in the background, so the first `/play`
+At startup the bot resolves one known video in the background (switching to WARP if
+YouTube blocks the host) and settles on a group that plays quickly, so the first `/play`
 doesn't wait through failing clients. Each failed attempt is logged with yt-dlp's
 reasons (`yt-dlp failed for ... via ...`), which is the first place to look when music
 stops working.

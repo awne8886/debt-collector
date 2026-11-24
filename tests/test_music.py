@@ -439,29 +439,36 @@ class TestClientRotation(unittest.TestCase):
     def test_strategy_order_with_cookies(self):
         with patch.dict("os.environ", {}, clear=True):
             order = ytdl.strategies()
-        self.assertEqual(order[0], Strategy((), True))
-        self.assertEqual(order[1], Strategy(ytdl._COOKIE_CLIENTS, True))
-        self.assertIn(Strategy(ytdl._JSLESS_CLIENTS, False), order)
+        self.assertEqual(order, [
+            Strategy(ytdl._JSLESS_CLIENTS, False),  # no deno: fast and light
+            Strategy((), True),
+            Strategy(ytdl._COOKIE_CLIENTS, True),
+            Strategy(ytdl._JS_CLIENTS, False),
+        ])
+        with patch.dict("os.environ", {"YTDL_PLAYER_CLIENTS": "mweb"}, clear=True):
+            self.assertEqual(ytdl.strategies()[0], Strategy(("mweb",), True))
         with patch.dict("os.environ", {"YTDL_CLIENT_ROTATION": "off"}, clear=True):
             self.assertEqual(ytdl.strategies(), [Strategy((), True)])
 
     def test_falls_back_to_cookieless_clients_and_remembers(self):
-        FakeYoutubeDL.behaviour = {(ytdl._JSLESS_CLIENTS, False): dict(self.INFO)}
+        FakeYoutubeDL.behaviour = {(ytdl._COOKIE_CLIENTS, True): dict(self.INFO)}
         track = make_track("song")
         with patch.dict("os.environ", {}, clear=True), self.assertLogs("debt-collector.music", "INFO"):
             stream = ytdl.resolve_stream(track)
         self.assertEqual(stream.url, "https://audio.example/a")
         self.assertEqual(
             FakeYoutubeDL.calls,
-            [((), True), (ytdl._COOKIE_CLIENTS, True), (ytdl._JSLESS_CLIENTS, False)],
+            [(ytdl._JSLESS_CLIENTS, False), ((), True), (ytdl._COOKIE_CLIENTS, True)],
         )
         FakeYoutubeDL.calls = []
         with patch.dict("os.environ", {}, clear=True):
             ytdl.resolve_stream(track)
-        self.assertEqual(FakeYoutubeDL.calls, [(ytdl._JSLESS_CLIENTS, False)])
+        self.assertEqual(FakeYoutubeDL.calls, [(ytdl._COOKIE_CLIENTS, True)])
 
     def test_final_errors_stop_the_rotation(self):
-        FakeYoutubeDL.behaviour = {((), True): "ERROR: [youtube] x: Private video. Sign in"}
+        FakeYoutubeDL.behaviour = {
+            (ytdl._JSLESS_CLIENTS, False): "ERROR: [youtube] x: Private video. Sign in"
+        }
         with patch.dict("os.environ", {}, clear=True), self.assertLogs("debt-collector.music", "WARNING"):
             with self.assertRaises(ExtractionError) as caught:
                 ytdl.resolve_stream(make_track("song"))
@@ -470,8 +477,8 @@ class TestClientRotation(unittest.TestCase):
 
     def test_result_without_audio_moves_on(self):
         FakeYoutubeDL.behaviour = {
-            ((), True): {"id": VID, "title": "Song"},  # no url: only images
-            (ytdl._COOKIE_CLIENTS, True): dict(self.INFO),
+            (ytdl._JSLESS_CLIENTS, False): {"id": VID, "title": "Song"},  # only images
+            ((), True): dict(self.INFO),
         }
         with patch.dict("os.environ", {}, clear=True), self.assertLogs("debt-collector.music", "INFO"):
             stream = ytdl.resolve_stream(make_track("song"))
@@ -480,7 +487,7 @@ class TestClientRotation(unittest.TestCase):
     def test_video_lookup_caches_the_stream_once(self):
         from utils.music import ParsedQuery
 
-        FakeYoutubeDL.behaviour = {((), True): dict(self.INFO)}
+        FakeYoutubeDL.behaviour = {(ytdl._JSLESS_CLIENTS, False): dict(self.INFO)}
         with patch.dict("os.environ", {}, clear=True):
             resolved = ytdl.resolve_tracks(ParsedQuery(QueryKind.VIDEO, CANON), 1, "me")
             track = resolved.tracks[0]
@@ -514,6 +521,9 @@ class TestClientRotation(unittest.TestCase):
                 self.assertLogs("debt-collector.music", "INFO"):
             chosen = ytdl.warm_up()
         self.assertEqual(chosen, Strategy(ytdl._JSLESS_CLIENTS, False))
+        # The 3 s group was fast enough, so the slow cookie groups weren't timed.
+        timed_after_warm = [c for c in FakeYoutubeDL.calls[1:]]
+        self.assertEqual(timed_after_warm, [(ytdl._JSLESS_CLIENTS, False)])
 
     def test_all_failing_reports_first_error(self):
         with patch.dict("os.environ", {}, clear=True), self.assertLogs("debt-collector.music", "WARNING"):
@@ -624,7 +634,7 @@ class TestWarpFallback(unittest.TestCase):
             state["warp"] = "http://127.0.0.1:9"
             return state["warp"]
 
-        FakeYoutubeDL.behaviour = {((), True): dict(self.INFO)}
+        FakeYoutubeDL.behaviour = {(ytdl._JSLESS_CLIENTS, False): dict(self.INFO)}
         with patch("yt_dlp.YoutubeDL", RoutedYoutubeDL), \
                 patch.dict("os.environ", {}, clear=True), \
                 patch("utils.warp.available", return_value=True), \
@@ -642,8 +652,8 @@ class TestWarpFallback(unittest.TestCase):
         import yt_dlp
 
         FakeYoutubeDL.behaviour = {
-            ((), True): "ERROR: [youtube] x: Sign in to confirm you're not a bot",
-            (ytdl._COOKIE_CLIENTS, True): dict(self.INFO),
+            (ytdl._JSLESS_CLIENTS, False): "ERROR: [youtube] x: Sign in to confirm you're not a bot",
+            ((), True): dict(self.INFO),
         }
         with patch.dict("os.environ", {}, clear=True), \
                 patch("utils.warp.available", return_value=True), \

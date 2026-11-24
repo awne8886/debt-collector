@@ -4584,7 +4584,9 @@ async def _run_preview_diagnostics() -> None:
         for url in urls:
             log.warning("Probing YouTube clients %s with %s", route, url)
             try:
-                results = await asyncio.to_thread(probe, url)
+                # Groups only: each single client can start deno, and running them all
+                # back to back has hit the 512 MB limit of Render's free plan.
+                results = await asyncio.to_thread(probe, url, False)
                 working: List[str] = [label for label, ok, _, _ in results if ok]
                 log.warning(
                     "YouTube probe finished %s for %s: %d of %d client setups work%s",

@@ -347,6 +347,7 @@ try:
 except ValueError:
     ATTEMPT_BUDGET_SECONDS = 75.0
 _STREAM_TTL_SECONDS: float = 20 * 60
+_FAST_ENOUGH_SECONDS: float = 8.0
 _PROBE_VIDEO: str = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # "Me at the zoo"
 
 
@@ -375,17 +376,19 @@ def strategies() -> List[Strategy]:
     """Every client group to try, in order. The first is what the owner configured."""
     configured: Tuple[str, ...] = tuple(_player_clients())
     has_cookies: bool = _cookie_file() is not None
-    order: List[Strategy] = [Strategy(configured, has_cookies)]
     if not _rotation_enabled():
-        return order
+        return [Strategy(configured, has_cookies)]
+    order: List[Strategy] = []
+    if configured:
+        order.append(Strategy(configured, has_cookies))
+    # Clients that need no JavaScript come first unless the owner chose clients: they
+    # are the fastest, and the others make yt-dlp start deno, which on a 512 MB host
+    # (Render's free plan) can use enough memory to get the whole bot killed.
+    order.append(Strategy(_JSLESS_CLIENTS, False))
+    order.append(Strategy((), has_cookies))
     if has_cookies:
         order.append(Strategy(_COOKIE_CLIENTS, True))
-    order += [
-        Strategy(_JSLESS_CLIENTS, False),
-        Strategy(_JS_CLIENTS, False),
-    ]
-    if configured and not has_cookies:
-        order.insert(1, Strategy((), False))
+    order.append(Strategy(_JS_CLIENTS, False))
     unique: List[Strategy] = []
     for strategy in order:
         if strategy not in unique:
@@ -685,7 +688,8 @@ def warm_up() -> Optional[Strategy]:
 
     The rotation keeps the first group that works, which can be a slow one (on
     Render through WARP, the cookie groups take ~15 s and the JavaScript-free group
-    ~3 s), so each group is timed once and the fastest becomes the first choice.
+    ~3 s), so groups are timed in order until one is fast enough, and the fastest
+    becomes the first choice.
     """
     try:
         _run_with_rotation(_PROBE_VIDEO, _configure_stream, check=_require_audio)
@@ -697,6 +701,8 @@ def warm_up() -> Optional[Strategy]:
         elapsed: Optional[float] = _time_strategy(strategy)
         if elapsed is not None and (fastest is None or elapsed < fastest[0]):
             fastest = (elapsed, strategy)
+        if fastest is not None and fastest[0] <= _FAST_ENOUGH_SECONDS:
+            break  # timing the slower (deno-running) groups too would only cost memory
     if fastest is not None:
         log.info("Fastest YouTube client group: %s (%.1fs)", fastest[1].label, fastest[0])
         _remember(fastest[1])
@@ -755,7 +761,7 @@ def _check_playable(info: Dict[str, Any], seconds: int = 3) -> Optional[str]:
     return error[0][-160:]
 
 
-def probe(url: str = _PROBE_VIDEO) -> List[Tuple[str, bool, float, str]]:
+def probe(url: str = _PROBE_VIDEO, singles: bool = True) -> List[Tuple[str, bool, float, str]]:
     """Try every client group (not stopping at the first success) and log each result.
 
     Diagnostics for the bot owner: shows which groups work from this host right now.
@@ -764,14 +770,14 @@ def probe(url: str = _PROBE_VIDEO) -> List[Tuple[str, bool, float, str]]:
 
     results: List[Tuple[str, bool, float, str]] = []
     groups: List[Strategy] = strategies()
-    singles: List[Strategy] = []
-    for group in groups:
+    single_clients: List[Strategy] = []
+    for group in groups if singles else []:
         for client in group.clients:
             single = Strategy((client,), group.cookies)
-            if single not in groups and single not in singles:
-                singles.append(single)
-    for strategy in groups + singles:
-        if strategy in singles and not any(ok for _, ok, _, _ in results):
+            if single not in groups and single not in single_clients:
+                single_clients.append(single)
+    for strategy in groups + single_clients:
+        if strategy in single_clients and not any(ok for _, ok, _, _ in results):
             # A group works when any of its clients does, so none of these will.
             log.info("probe: every client group failed, skipping single clients")
             break
