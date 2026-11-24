@@ -120,7 +120,9 @@ class _YtdlLogger:
         pass
 
     def warning(self, message: str) -> None:
-        log.debug("yt-dlp: %s", message)
+        # Warnings (failed JS challenges, missing PO tokens, skipped clients) explain
+        # "no playable audio" failures, so keep them visible in the host logs.
+        log.warning("yt-dlp: %s", message)
 
     def error(self, message: str) -> None:
         log.debug("yt-dlp: %s", message)
@@ -304,18 +306,39 @@ def resolve_tracks(
     return ResolvedQuery(tracks, playlist_title=title)
 
 
+_NO_FORMAT_ERRORS = ("requested format is not available", "only images are available")
+
+
+def _fallback_clients() -> List[str]:
+    """YTDL_FALLBACK_CLIENTS: YouTube clients to retry with when the first try finds no audio."""
+    raw: str = os.getenv("YTDL_FALLBACK_CLIENTS", "default,tv,mweb,web_safari,tv_simply")
+    return [c.strip() for c in raw.split(",") if c.strip()]
+
+
 def resolve_stream(track: Track) -> StreamInfo:
     """Fetch a fresh stream URL (they expire, so this is done right before playing)."""
     import yt_dlp
 
-    options: Dict[str, Any] = _base_options()
-    options["format"] = "bestaudio/best"
-    try:
+    def extract(options: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        options["format"] = "bestaudio/best"
         with yt_dlp.YoutubeDL(options) as ydl:
-            info: Optional[Dict[str, Any]] = ydl.extract_info(track.url, download=False)
+            return ydl.extract_info(track.url, download=False)
+
+    try:
+        info: Optional[Dict[str, Any]] = extract(_base_options())
     except yt_dlp.utils.DownloadError as exc:
         log.warning("yt-dlp failed for %s: %s", track.url, exc)
-        raise ExtractionError(friendly_error(str(exc))) from exc
+        fallback: List[str] = _fallback_clients()
+        if not fallback or not any(e in str(exc).lower() for e in _NO_FORMAT_ERRORS):
+            raise ExtractionError(friendly_error(str(exc))) from exc
+        log.warning("Retrying %s with YouTube clients: %s", track.url, ", ".join(fallback))
+        retry: Dict[str, Any] = _base_options()
+        retry["extractor_args"] = {"youtube": {"player_client": fallback}}
+        try:
+            info = extract(retry)
+        except yt_dlp.utils.DownloadError as retry_exc:
+            log.warning("yt-dlp retry failed for %s: %s", track.url, retry_exc)
+            raise ExtractionError(friendly_error(str(retry_exc))) from retry_exc
 
     if not info:
         raise ExtractionError("That video is unavailable.")
