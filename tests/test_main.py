@@ -378,3 +378,127 @@ class TestPreviewDetection(unittest.TestCase):
         env = {"IS_PULL_REQUEST": "true", "PREVIEW_RUN_BOT": "1"}
         with patch.dict("os.environ", env, clear=True):
             self.assertFalse(_is_preview_deploy())
+
+
+class TestAIPersonasAndSpeakers(unittest.IsolatedAsyncioTestCase):
+    """Combos, late messages and per-user personas must stay tied to the right person."""
+
+    def setUp(self):
+        from unittest.mock import patch
+
+        self.bot_patch = patch("main.bot")
+        self.mock_bot = self.bot_patch.start()
+        self.addCleanup(self.bot_patch.stop)
+        self.mock_bot.ai_history_buffer = {}
+        self.mock_bot.ai_pending = {}
+        self.mock_bot.ai_history_dirty = set()
+        self.mock_bot.ai_lru = {}
+
+    def entry(self, author, author_id, text, message_id):
+        return {"role": "user", "author": author, "author_id": author_id,
+                "content": text, "message_id": message_id}
+
+    def test_combo_from_a_new_person_is_kept(self):
+        from main import _ai_remember
+
+        _ai_remember(1, self.entry("Alice", 11, "W", 101))
+        _ai_remember(1, self.entry("Bob", 22, "W", 102))  # Bob joins the combo
+        _ai_remember(1, self.entry("Bob", 22, "w", 103))  # Bob repeating himself
+        history = self.mock_bot.ai_history_buffer[1]
+        self.assertEqual([e["author_id"] for e in history], [11, 22])
+
+    def test_transcript_ends_with_the_trigger(self):
+        from main import _format_history
+
+        history = [
+            self.entry("Alice", 11, "hi bot", 101),
+            self.entry("Carol", 33, "said after Alice", 102),
+        ]
+        names = {"11": "Alice", "33": "Carol"}
+        messages = _format_history(history, names, history[0])
+        self.assertEqual(len(messages), 1)
+        self.assertIn('from="Alice" id="11"', messages[-1]["content"])
+
+        missing = self.entry("Dave", 44, "not stored", 999)
+        messages = _format_history(history, names, missing)
+        self.assertIn('id="44"', messages[-1]["content"])
+        self.assertEqual(len(messages), 3)
+
+    def test_prompt_names_the_speaker_and_their_persona(self):
+        from main import _ai_names, build_system_prompt
+
+        guild = MagicMock()
+        guild.get_member.return_value = None  # members not cached
+        history = [self.entry("Alice", 11, "W", 101), self.entry("Bob", 22, "W", 102)]
+        names = _ai_names(guild, history, {"22": "Bob"})
+        config = {"persona": "You are a pirate.",
+                  "personas": {"11": "call her captain", "22": "speak only in rhymes"}}
+        prompt = build_system_prompt(guild, 5, config, ["22", "11", "22"],
+                                     speaker_id="22", names=names)
+        self.assertIn('replying to Bob (id="22")', prompt)
+        self.assertIn("Follow it in this reply: speak only in rhymes", prompt)
+        self.assertIn('- Alice (id="11"): call her captain', prompt)
+        self.assertNotIn("user 11", prompt)
+        # The speaker's section comes after the rules, so the model reads it last.
+        self.assertGreater(prompt.index("replying to Bob"), prompt.index("NON-NEGOTIABLE"))
+
+    async def test_reply_uses_the_trigger_author_even_if_others_spoke(self):
+        import discord
+        from unittest.mock import AsyncMock, patch
+
+        history = [self.entry("Alice", 11, "W", 101)]
+        self.mock_bot.ai_history_buffer = {789: history}
+
+        message = MagicMock(spec=discord.Message)
+        message.id = 102
+        message.guild = MagicMock(id=123)
+        message.guild.get_member.return_value = None
+        message.author = MagicMock(bot=False, id=22, display_name="Bob", roles=[])
+        message.channel = MagicMock(id=789)
+        message.content = "W"
+        message.stickers = []
+        message.attachments = []
+        message.mention_everyone = False
+        message.reply = AsyncMock()
+
+        class Typing:
+            async def __aenter__(self_inner):
+                # Someone else talks while the model is thinking.
+                history.append(self.entry("Carol", 33, "unrelated", 103))
+
+            async def __aexit__(self_inner, *exc):
+                pass
+
+        message.channel.typing.return_value = Typing()
+        captured = {}
+
+        async def fake_generate(guild_id, system_prompt, messages, config):
+            captured["prompt"], captured["messages"] = system_prompt, messages
+            return "ahoy", "openrouter"
+
+        config = {"enabled": True, "channels": ["789"], "probability": 100.0, "cooldown": 0,
+                  "daily_limit": 0, "provider_order": ["openrouter"], "models": {},
+                  "persona": "You are a pirate.", "personas": {"22": "speak only in rhymes"}}
+        self.mock_bot.user = MagicMock(id=999, display_name="BotName")
+        self.mock_bot.user.mentioned_in.return_value = True
+        self.mock_bot.settings.peek_settings.return_value = {"prefix": "!"}
+        self.mock_bot.ai_active_conversations = {}
+        self.mock_bot.ai_next_fire = {}
+        self.mock_bot.ai_locks = {}
+        self.mock_bot.ai_user_recent = {}
+        self.mock_bot.ai_repeat = {}
+        self.mock_bot.ai_daily = {}
+
+        with patch("main.ai_config", return_value=config), \
+             patch("main._get_ai_history", side_effect=lambda cid: history), \
+             patch("main._reply_target_is_bot", return_value=(False, None)), \
+             patch("main.ai_generate_reply", side_effect=fake_generate):
+            from main import _handle_ai
+            await _handle_ai(message)
+
+        last = captured["messages"][-1]["content"]
+        self.assertIn('from="Bob" id="22"', last)
+        self.assertNotIn("Carol", " ".join(m["content"] for m in captured["messages"]))
+        self.assertIn('replying to Bob (id="22")', captured["prompt"])
+        self.assertIn("speak only in rhymes", captured["prompt"])
+        message.reply.assert_called_once()
