@@ -136,6 +136,11 @@ def _js_runtimes() -> Dict[str, Dict[str, Any]]:
     runtimes: Dict[str, Dict[str, Any]] = {"deno": {}}
     runtimes.update({name: {} for name in ("node", "bun") if shutil.which(name)})
     found: List[str] = [name for name in ("deno", "node", "bun") if _runtime_installed(name)]
+    try:
+        from yt_dlp.version import __version__ as ytdlp_version
+    except Exception:
+        ytdlp_version = "unknown"
+    log.info("yt-dlp version %s", ytdlp_version)
     if found:
         log.info("JavaScript runtimes available to yt-dlp: %s", ", ".join(found))
     else:
