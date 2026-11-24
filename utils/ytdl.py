@@ -112,6 +112,18 @@ def friendly_error(message: str) -> str:
     if "confirm your age" in text or "age-restricted" in text or "age restricted" in text:
         return "That video is age-restricted and can't be played without a logged-in account."
     if "not a bot" in text or "sign in to confirm" in text:
+        configured: str = os.getenv("YTDL_COOKIES_FILE", "").strip()
+        if configured and _cookie_file() is None:
+            return (
+                "YouTube is blocking this server's IP with a bot check, and the cookies file "
+                f"in `YTDL_COOKIES_FILE` (`{configured}`) doesn't exist. Check the path "
+                "(on Render it's `/etc/secrets/<file name>`, starting with `/`)."
+            )
+        if configured:
+            return (
+                "YouTube is blocking this server's IP with a bot check and didn't accept "
+                "the cookies. Export fresh cookies, or route YouTube through a proxy (`YTDL_PROXY`)."
+            )
         return (
             "YouTube is blocking this server's IP with a bot check. "
             "The bot owner can route YouTube through a proxy (`YTDL_PROXY`) "
@@ -179,6 +191,25 @@ def _player_clients() -> List[str]:
     return [c.strip() for c in raw.split(",") if c.strip()]
 
 
+def _cookie_file() -> Optional[str]:
+    """The cookies file from YTDL_COOKIES_FILE, or None (with a warning) if it isn't there."""
+    configured: str = os.getenv("YTDL_COOKIES_FILE", "").strip()
+    return _find_cookie_file(configured) if configured else None
+
+
+@functools.lru_cache(maxsize=4)
+def _find_cookie_file(configured: str) -> Optional[str]:
+    if os.path.isfile(configured):
+        return configured
+    # A common slip: "etc/secrets/cookies.txt" instead of "/etc/secrets/cookies.txt".
+    rooted: str = os.path.join(os.sep, configured)
+    if not os.path.isabs(configured) and os.path.isfile(rooted):
+        log.warning("YTDL_COOKIES_FILE=%s not found; using %s instead", configured, rooted)
+        return rooted
+    log.warning("YTDL_COOKIES_FILE=%s doesn't exist; YouTube will be used without cookies", configured)
+    return None
+
+
 @functools.lru_cache(maxsize=4)
 def _copy_cookies(path: str, signature: Tuple[int, int, int]) -> str:
     """Copy a read-only cookies file. `signature` is the *source's* mtime/size/inode, so a
@@ -224,12 +255,9 @@ def _base_options() -> Dict[str, Any]:
     runtimes: Dict[str, Dict[str, Any]] = _js_runtimes()
     if runtimes:
         options["js_runtimes"] = runtimes
-    cookies: str = os.getenv("YTDL_COOKIES_FILE", "")
+    cookies: Optional[str] = _cookie_file()
     if cookies:
-        if os.path.isfile(cookies):
-            options["cookiefile"] = _writable_cookie_file(cookies)
-        else:
-            log.warning("YTDL_COOKIES_FILE=%s does not exist; continuing without cookies.", cookies)
+        options["cookiefile"] = _writable_cookie_file(cookies)
     proxy: str = os.getenv("YTDL_PROXY", "").strip()
     if proxy:
         # The proxy has its own address, so don't pin the outgoing socket to IPv4.

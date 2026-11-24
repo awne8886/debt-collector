@@ -24,6 +24,7 @@ from utils.ytdl import (
     ExtractionError,
     StreamInfo,
     _base_options,
+    _find_cookie_file,
     _writable_cookie_file,
     _entry_to_track,
     friendly_error,
@@ -265,7 +266,8 @@ class TestClock(unittest.TestCase):
 
 class TestYtdlHelpers(unittest.TestCase):
     def test_friendly_errors(self):
-        bot_check = friendly_error("ERROR: Sign in to confirm you're not a bot")
+        with patch.dict("os.environ", {}, clear=True):
+            bot_check = friendly_error("ERROR: Sign in to confirm you're not a bot")
         self.assertIn("YTDL_PROXY", bot_check)
         self.assertIn("YTDL_COOKIES_FILE", bot_check)
         self.assertIn("private", friendly_error("ERROR: Private video. Sign in"))
@@ -309,6 +311,37 @@ class TestYtdlHelpers(unittest.TestCase):
             self.assertEqual(options["cookiefile"], os.path.join(tmp, "ytdl-cookies.txt"))
             with open(options["cookiefile"]) as handle:
                 self.assertIn("Netscape", handle.read())
+
+    def test_missing_cookie_file_is_reported(self):
+        _find_cookie_file.cache_clear()
+        env = {"YTDL_COOKIES_FILE": "no/such/dir/cookies.txt"}
+        with patch.dict("os.environ", env, clear=True), self.assertLogs(
+            "debt-collector.music", "WARNING"
+        ):
+            options = _base_options()
+            message = friendly_error("Sign in to confirm you're not a bot")
+        _find_cookie_file.cache_clear()
+        self.assertNotIn("cookiefile", options)
+        self.assertIn("doesn't exist", message)
+        self.assertIn("no/such/dir/cookies.txt", message)
+
+    def test_cookie_path_missing_leading_slash_is_fixed(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as src_dir:
+            source = os.path.join(src_dir, "cookies.txt")
+            open(source, "w").close()
+            relative = source.lstrip(os.sep)
+            _find_cookie_file.cache_clear()
+            _writable_cookie_file.cache_clear()
+            with patch.dict("os.environ", {"YTDL_COOKIES_FILE": relative}, clear=True):
+                options = _base_options()
+                message = friendly_error("Sign in to confirm you're not a bot")
+            _find_cookie_file.cache_clear()
+            _writable_cookie_file.cache_clear()
+            self.assertEqual(options["cookiefile"], source)
+            self.assertIn("didn't accept the cookies", message)
 
     def test_writable_cookies_are_used_in_place(self):
         import os
