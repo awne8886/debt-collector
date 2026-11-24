@@ -43,6 +43,9 @@ anything else is treated as a search or rejected.
   YouTube decides this by the host's IP address, so a fix needs one of the options under
   [Getting past YouTube's bot check](#getting-past-youtubes-bot-check).
 * Keep `yt-dlp` current (`pip install -U yt-dlp`); YouTube changes break old versions.
+  Hosts that cache packages between builds (Render) keep an old copy until the minimum
+  version in `requirements.txt` is raised or the build cache is cleared. The bot logs
+  the yt-dlp version it is running the first time it uses YouTube.
 
 ### Optional environment variables
 
