@@ -374,6 +374,11 @@ class TestYtdlHelpers(unittest.TestCase):
             self.assertEqual(ffmpeg_input_options(), [])
         _warn_socks_once.cache_clear()
 
+    def test_region_lock_is_final_and_explained(self):
+        message = "ERROR: [youtube] x: The uploader has not made this video available in your country"
+        self.assertTrue(ytdl._is_final(message))
+        self.assertIn("region-locked", friendly_error(message))
+
     def test_entry_to_track(self):
         entry = {"id": VID, "title": "Song", "duration": 212.0, "channel": "Artist"}
         track = _entry_to_track(entry, 5, "Me")
@@ -582,7 +587,7 @@ class TestWarp(unittest.TestCase):
         self.assertEqual(again, account)
         self.assertEqual(account["endpoint"], "162.159.192.8:2408")
         config = self.warp._wireproxy_config(account, 4000)
-        self.assertIn("Address = 172.16.0.2/32, 2606:4700::1/128", config)
+        self.assertIn("Address = 172.16.0.2/32\n", config)  # IPv4 only by default
         self.assertIn("PublicKey = PEERKEY=", config)
         self.assertIn("[http]\nBindAddress = 127.0.0.1:4000", config)
         self.assertEqual(len(__import__("base64").b64decode(account["private_key"])), 32)
@@ -599,6 +604,17 @@ class TestWarp(unittest.TestCase):
             with self.assertRaises(self.warp.WarpError) as caught:
                 self.warp._wireproxy_binary()
         self.assertIn("SHA-256", str(caught.exception))
+
+    def test_tunnel_is_ipv4_only_unless_asked(self):
+        account = {"private_key": "K", "peer_public_key": "P", "address_v4": "172.16.0.2",
+                   "address_v6": "2606::1", "endpoint": "1.2.3.4:2408"}
+        with patch.dict("os.environ", {}, clear=True):
+            config = self.warp._wireproxy_config(account, 1)
+        self.assertIn("Address = 172.16.0.2/32\n", config)
+        self.assertIn("AllowedIPs = 0.0.0.0/0\n", config)
+        with patch.dict("os.environ", {"WARP_IPV6": "1"}, clear=True):
+            config = self.warp._wireproxy_config(account, 1)
+        self.assertIn("2606::1/128", config)
 
     def test_failed_start_is_not_retried_at_once(self):
         with patch.dict("os.environ", {}, clear=True), \
