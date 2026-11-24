@@ -20,7 +20,13 @@ from utils.music import (
     progress_bar,
     required_votes,
 )
-from utils.ytdl import ExtractionError, StreamInfo, _entry_to_track, friendly_error
+from utils.ytdl import (
+    ExtractionError,
+    StreamInfo,
+    _base_options,
+    _entry_to_track,
+    friendly_error,
+)
 
 VID = "dQw4w9WgXcQ"
 CANON = f"https://www.youtube.com/watch?v={VID}"
@@ -258,10 +264,32 @@ class TestClock(unittest.TestCase):
 
 class TestYtdlHelpers(unittest.TestCase):
     def test_friendly_errors(self):
-        self.assertIn("cookies", friendly_error("ERROR: Sign in to confirm you're not a bot"))
+        bot_check = friendly_error("ERROR: Sign in to confirm you're not a bot")
+        self.assertIn("YTDL_PROXY", bot_check)
+        self.assertIn("YTDL_COOKIES_FILE", bot_check)
         self.assertIn("private", friendly_error("ERROR: Private video. Sign in"))
         self.assertIn("age-restricted", friendly_error("Sign in to confirm your age"))
         self.assertEqual(friendly_error("???"), "I couldn't load that from YouTube.")
+
+    def test_base_options_defaults(self):
+        with patch.dict("os.environ", {}, clear=True):
+            options = _base_options()
+        self.assertEqual(options["source_address"], "0.0.0.0")
+        self.assertNotIn("proxy", options)
+        self.assertNotIn("extractor_args", options)
+
+    def test_base_options_proxy_and_clients(self):
+        env = {
+            "YTDL_PROXY": " socks5://127.0.0.1:40000 ",
+            "YTDL_PLAYER_CLIENTS": "tv_simply, web_embedded,,",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            options = _base_options()
+        self.assertEqual(options["proxy"], "socks5://127.0.0.1:40000")
+        self.assertNotIn("source_address", options)
+        self.assertEqual(
+            options["extractor_args"], {"youtube": {"player_client": ["tv_simply", "web_embedded"]}}
+        )
 
     def test_entry_to_track(self):
         entry = {"id": VID, "title": "Song", "duration": 212.0, "channel": "Artist"}
