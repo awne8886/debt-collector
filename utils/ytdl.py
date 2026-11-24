@@ -170,6 +170,12 @@ def _runtime_installed(name: str) -> bool:
     return bool(scripts) and shutil.which(name, path=scripts) is not None
 
 
+# yt-dlp runs deno to solve YouTube's JavaScript challenge. Uncapped, that took the
+# 512 MB Render instance over its limit, which kills the whole bot; with a capped heap,
+# deno failing just fails that client group and the rotation moves on.
+os.environ.setdefault("DENO_V8_FLAGS", "--max-old-space-size=128")
+
+
 def _base_options() -> Dict[str, Any]:
     options: Dict[str, Any] = {
         "logger": _YtdlLogger(),
