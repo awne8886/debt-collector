@@ -1,4 +1,4 @@
-discord.py[voice]>=2.7.0
+discord.py[voice]>=2.7.1
 # davey 0.2 changed the DAVE (voice encryption) API that discord.py 2.7.1 uses: the bot
 # "speaks" but nobody can hear it. Keep it below 0.2 until discord.py supports it.
 davey>=0.1.7,<0.2
