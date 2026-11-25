@@ -660,32 +660,147 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 # --------------------------------------------------------------------------- #
 
 
-class CountingSaveView(discord.ui.View):
-    def __init__(self, state: dict, guild_id: int, channel_id: int):
-        super().__init__(timeout=None)
-        self.state = state
-        self.guild_id = guild_id
-        self.channel_id = channel_id
+COUNTING_SAVE_ID_PREFIX: str = "counting:save:"
+COUNTING_SAVE_TTL_S: int = 2 * 86400  # save counters are per UTC day
+_COUNTING_LOCKS: Dict[int, asyncio.Lock] = {}
 
-    @discord.ui.button(
-        label="Save Streak (-1 Save)", style=discord.ButtonStyle.success, emoji="🚑"
+
+def _counting_lock(guild_id: int) -> asyncio.Lock:
+    """One lock per guild around every counting read-modify-write."""
+    lock = _COUNTING_LOCKS.get(guild_id)
+    if lock is None:
+        lock = _COUNTING_LOCKS[guild_id] = asyncio.Lock()
+    return lock
+
+
+def _counting_today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _counting_fresh_state(guild_id: int) -> Dict[str, Any]:
+    return {
+        "guild_id": guild_id,
+        "current": 0,
+        "last_user": None,
+        "streak": 0,
+        "broken": False,
+        "broken_time": None,
+    }
+
+
+async def _counting_load(guild_id: int) -> Optional[Dict[str, Any]]:
+    state = await asyncio.to_thread(
+        bot.settings.counting.find_one, {"guild_id": guild_id}
     )
-    async def save_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        settings = bot.settings.peek_settings(self.guild_id)
-        max_saves = settings.get("counting", {}).get("default_saves", 3)
+    if state is not None:
+        state.pop("_id", None)
+    return state
 
-        import datetime
 
-        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-        user_id = interaction.user.id
+async def _counting_store(guild_id: int, state: Dict[str, Any]) -> None:
+    fields = {k: v for k, v in state.items() if k != "_id"}
+    await asyncio.to_thread(
+        bot.settings.counting.update_one,
+        {"guild_id": guild_id},
+        {"$set": fields},
+        upsert=True,
+    )
 
-        save_record = bot.settings.counting_saves.find_one(
-            {"user_id": user_id, "date": today}
+
+def _counting_save_key(guild_id: int, user_id: int, day: str) -> Dict[str, Any]:
+    # guild_id is part of the key: a save used in one server is not used up in others.
+    return {"guild_id": guild_id, "user_id": user_id, "date": day}
+
+
+async def _counting_saves_used(guild_id: int, user_id: int, day: str) -> int:
+    record = await asyncio.to_thread(
+        bot.settings.counting_saves.find_one,
+        _counting_save_key(guild_id, user_id, day),
+    )
+    return int((record or {}).get("used", 0))
+
+
+async def _counting_spend_save(guild_id: int, user_id: int, day: str) -> None:
+    await asyncio.to_thread(
+        bot.settings.counting_saves.update_one,
+        _counting_save_key(guild_id, user_id, day),
+        {
+            "$inc": {"used": 1},
+            "$setOnInsert": {"created_at": datetime.now(timezone.utc)},
+        },
+        upsert=True,
+    )
+
+
+def _counting_max_saves(settings: Dict[str, Any]) -> int:
+    try:
+        return int((settings.get("counting") or {}).get("default_saves", 3))
+    except (TypeError, ValueError):
+        return 3
+
+
+class CountingSaveButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"counting:save:(?P<guild_id>[0-9]{1,20})",
+):
+    """The "Save Streak" button. Persistent: it works after a restart because the
+    guild is in its custom_id and the state is read from the database on click."""
+
+    def __init__(self, guild_id: int) -> None:
+        super().__init__(
+            discord.ui.Button(
+                label="Save Streak (-1 Save)",
+                style=discord.ButtonStyle.success,
+                emoji="\U0001f691",
+                custom_id=f"{COUNTING_SAVE_ID_PREFIX}{guild_id}",
+            )
         )
-        used_saves = save_record["used"] if save_record else 0
+        self.guild_id: int = guild_id
 
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Button,
+        match: "re.Match[str]",
+    ) -> "CountingSaveButton":
+        return cls(int(match["guild_id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await _counting_use_save(interaction, self.guild_id)
+
+
+class CountingSaveView(discord.ui.View):
+    def __init__(self, guild_id: int) -> None:
+        super().__init__(timeout=None)
+        self.add_item(CountingSaveButton(guild_id))
+
+
+def _counting_saved_embed(
+    original: Optional[discord.Embed], user: discord.abc.User, state: Dict[str, Any]
+) -> discord.Embed:
+    embed = original.copy() if original is not None else discord.Embed()
+    embed.color = discord.Color.green()
+    embed.title = "Streak Saved!"
+    embed.description = (
+        f"{user.mention} used a save! The streak continues at "
+        f"**{state['streak']}**. Next number is **{state['current'] + 1}**."
+    )
+    return embed
+
+
+async def _counting_use_save(interaction: discord.Interaction, guild_id: int) -> None:
+    if interaction.guild_id != guild_id:
+        await interaction.response.send_message(
+            "This button belongs to another server.", ephemeral=True
+        )
+        return
+    user_id: int = interaction.user.id
+    today: str = _counting_today()
+    async with _counting_lock(guild_id):
+        settings = await bot.settings.fetch_settings(guild_id)
+        max_saves: int = _counting_max_saves(settings)
+        used_saves: int = await _counting_saves_used(guild_id, user_id, today)
         if used_saves >= max_saves:
             await interaction.response.send_message(
                 f"You have already used all {max_saves} of your saves today!",
@@ -693,33 +808,27 @@ class CountingSaveView(discord.ui.View):
             )
             return
 
-        current_state = bot.settings.counting.find_one({"guild_id": self.guild_id})
-        if not current_state or not current_state.get("broken"):
+        state = await _counting_load(guild_id)
+        if not state or not state.get("broken"):
             await interaction.response.send_message(
                 "The streak is no longer broken!", ephemeral=True
             )
             return
 
-        bot.settings.counting_saves.update_one(
-            {"user_id": user_id, "date": today}, {"$inc": {"used": 1}}, upsert=True
-        )
+        await _counting_spend_save(guild_id, user_id, today)
+        state["broken"] = False
+        state["broken_time"] = None
+        await _counting_store(guild_id, state)
 
-        current_state["broken"] = False
-        current_state["broken_time"] = None
-        bot.settings.counting.update_one(
-            {"guild_id": self.guild_id}, {"$set": current_state}
-        )
-
-        for item in self.children:
-            item.disabled = True
-
-        embed = interaction.message.embeds[0]
-        embed.color = discord.Color.green()
-        embed.title = "Streak Saved!"
-        embed.description = f"{interaction.user.mention} used a save! The streak continues at **{current_state['streak']}**. Next number is **{current_state['current'] + 1}**."
-
-        await interaction.message.edit(embed=embed, view=self)
-        await interaction.response.defer()
+    message = interaction.message
+    original = message.embeds[0] if message is not None and message.embeds else None
+    disabled = CountingSaveView(guild_id)
+    for child in disabled.children:
+        child.disabled = True
+    # Answer the interaction itself (not message.edit + defer), within Discord's 3 s.
+    await interaction.response.edit_message(
+        embed=_counting_saved_embed(original, interaction.user, state), view=disabled
+    )
 
 
 def _parse_counting_number(text: str):
@@ -757,16 +866,31 @@ def _extract_and_parse_number(content: str):
     return None
 
 
-async def _break_counting_streak(message: discord.Message, state: dict, reason: str):
-
+def _counting_mark_broken(state: Dict[str, Any]) -> None:
     state["broken"] = True
     state["broken_time"] = time.time()
-    bot.settings.counting.update_one(
-        {"guild_id": message.guild.id}, {"$set": state}, upsert=True
+
+
+def _counting_broken_embed(
+    author: discord.abc.User, state: Dict[str, Any], reason: str, saves: int
+) -> discord.Embed:
+    per_day: str = f"{saves} save{'s' if saves != 1 else ''} per day"
+    return discord.Embed(
+        title="Streak Broken!",
+        description=(
+            f"{author.mention} ruined the streak at **{state['streak']}**.\n\n"
+            f"{reason}\n\n"
+            f"You have {per_day} to restore the streak. Click below to use one!"
+        ),
+        color=discord.Color.red(),
     )
 
-    # Handle streak ruiner role
-    settings = bot.settings.peek_settings(message.guild.id)
+
+async def _announce_counting_break(
+    message: discord.Message, state: Dict[str, Any], reason: str
+) -> None:
+    """Ruiner role, reaction and the "Streak Broken" message. Runs outside the lock."""
+    settings = await bot.settings.fetch_settings(message.guild.id)
     counting_settings = settings.get("counting") or {}
     ruiner_role_id = counting_settings.get("ruiner_role_id")
     if ruiner_role_id:
@@ -790,96 +914,111 @@ async def _break_counting_streak(message: discord.Message, state: dict, reason: 
             except discord.HTTPException:
                 pass
 
-    embed = discord.Embed(
-        title="Streak Broken!",
-        description=f"{message.author.mention} ruined the streak at **{state['streak']}**.\n\n{reason}\n\nYou have 3 saves per day to restore the streak. Click below to use one!",
-        color=discord.Color.red(),
+    embed = _counting_broken_embed(
+        message.author, state, reason, _counting_max_saves(settings)
     )
     try:
-        await message.add_reaction("❌")
+        await message.add_reaction("\u274c")
     except discord.HTTPException:
         pass
-    view = CountingSaveView(state, message.guild.id, message.channel.id)
-    await message.channel.send(embed=embed, view=view)
+    await message.channel.send(embed=embed, view=CountingSaveView(message.guild.id))
+
+
+def _is_counting_channel(guild_id: int, channel_id: int) -> bool:
+    counting_settings = bot.settings.peek_settings(guild_id).get("counting") or {}
+    configured = counting_settings.get("channel_id")
+    try:
+        return bool(configured) and int(configured) == channel_id
+    except (TypeError, ValueError):
+        return False
+
+
+COUNTING_MILESTONES: Dict[int, str] = {
+    69: "\U0001f60f",
+    77: "\U0001f3b0",
+    100: "\U0001f4af",
+    420: "\U0001f33f",
+    666: "\U0001f608",
+}
+
+
+def _counting_reaction(number: int) -> str:
+    if number in COUNTING_MILESTONES:
+        return COUNTING_MILESTONES[number]
+    if number % 1000 == 0:
+        return "\U0001f389"
+    if number % 100 == 0:
+        return "\U0001f31f"
+    return "\u2705"
 
 
 async def handle_counting(message: discord.Message) -> None:
     if message.author.bot or not message.guild:
         return
-    settings = bot.settings.peek_settings(message.guild.id)
-    counting_settings = settings.get("counting") or {}
-    if not counting_settings.get("channel_id") or message.channel.id != int(
-        counting_settings["channel_id"]
-    ):
+    if not _is_counting_channel(message.guild.id, message.channel.id):
         return
 
     parsed = _extract_and_parse_number(message.content)
     if parsed is None:
         return
 
-    state = bot.settings.counting.find_one({"guild_id": message.guild.id})
-    if not state:
-        state = {
-            "guild_id": message.guild.id,
-            "current": 0,
-            "last_user": None,
-            "streak": 0,
-            "broken": False,
-            "broken_time": None,
-        }
+    guild_id: int = message.guild.id
+    broke_reason: Optional[str] = None
+    async with _counting_lock(guild_id):
+        state = await _counting_load(guild_id) or _counting_fresh_state(guild_id)
 
-    if state.get("broken"):
+        if state.get("broken"):
+            if state.get("broken_time") and time.time() - state["broken_time"] > 86400:
+                state.update(_counting_fresh_state(guild_id))
+                await _counting_store(guild_id, state)
+            else:
+                return
 
-        if state.get("broken_time") and time.time() - state["broken_time"] > 86400:
-            state["broken"] = False
-            state["current"] = 0
-            state["last_user"] = None
-            state["streak"] = 0
-            state["broken_time"] = None
-            bot.settings.counting.update_one(
-                {"guild_id": message.guild.id}, {"$set": state}, upsert=True
-            )
+        expected = state["current"] + 1
+        if parsed != expected:
+            broke_reason = f"Expected {expected}, but got {parsed}."
+        elif state["last_user"] == message.author.id:
+            broke_reason = f"{message.author.mention} tried to count twice in a row!"
+
+        if broke_reason is not None:
+            _counting_mark_broken(state)
         else:
-            return
+            state["current"] = expected
+            state["last_user"] = message.author.id
+            state["streak"] += 1
+        await _counting_store(guild_id, state)
 
-    expected = state["current"] + 1
-    if parsed != expected:
-        await _break_counting_streak(
-            message, state, f"Expected {expected}, but got {parsed}."
-        )
-    elif state["last_user"] == message.author.id:
-        await _break_counting_streak(
-            message, state, f"{message.author.mention} tried to count twice in a row!"
-        )
-    else:
-        state["current"] = expected
-        state["last_user"] = message.author.id
-        state["streak"] += 1
-        bot.settings.counting.update_one(
-            {"guild_id": message.guild.id}, {"$set": state}, upsert=True
-        )
+    if broke_reason is not None:
+        await _announce_counting_break(message, state, broke_reason)
+        return
+    try:
+        await message.add_reaction(_counting_reaction(expected))
+    except discord.HTTPException:
+        pass
 
-        # Add dynamic milestone reactions
-        reaction = "✅"
-        if expected == 69:
-            reaction = "😏"
-        elif expected == 77:
-            reaction = "🎰"
-        elif expected == 100:
-            reaction = "💯"
-        elif expected == 420:
-            reaction = "🌿"
-        elif expected == 666:
-            reaction = "😈"
-        elif expected % 1000 == 0:
-            reaction = "🎉"
-        elif expected % 100 == 0:
-            reaction = "🌟"
 
-        try:
-            await message.add_reaction(reaction)
-        except discord.HTTPException:
-            pass
+async def handle_counting_retraction(
+    message: discord.Message, announce_on: discord.Message, verb: str
+) -> bool:
+    """A valid count was edited or deleted: break the streak. Returns True if it did."""
+    if message.guild is None or message.author.bot:
+        return False
+    if not _is_counting_channel(message.guild.id, message.channel.id):
+        return False
+    parsed = _extract_and_parse_number(message.content)
+    if parsed is None:
+        return False
+    guild_id: int = message.guild.id
+    async with _counting_lock(guild_id):
+        state = await _counting_load(guild_id)
+        if not state or state.get("broken") or parsed != state.get("current"):
+            return False
+        _counting_mark_broken(state)
+        await _counting_store(guild_id, state)
+    await _announce_counting_break(
+        announce_on, state, f"{message.author.mention} {verb} their valid count!"
+    )
+    return True
 
 
 class MultiTenantSettingsManager:
@@ -1002,6 +1141,17 @@ class MultiTenantSettingsManager:
             (self.reminders, "due_at", {}),
             (self.reminders, "user_id", {}),
             (self.backups, "createdAt", {"expireAfterSeconds": 259200}),
+            (self.counting, "guild_id", {}),
+            (
+                self.counting_saves,
+                [("guild_id", 1), ("user_id", 1), ("date", 1)],
+                {},
+            ),
+            (
+                self.counting_saves,
+                "created_at",
+                {"expireAfterSeconds": COUNTING_SAVE_TTL_S},
+            ),
         ):
             try:
                 collection.create_index(spec, **options)
@@ -1582,6 +1732,7 @@ class DebtCollectorBot(commands.Bot):
             log.warning("Index setup failed: %s", exc)
         self.add_view(ModmailPanelView())
         self.add_view(TicketCloseView())
+        self.add_dynamic_items(CountingSaveButton)
         try:
             await self.load_extension("cogs.music")
         except Exception as exc:
@@ -2062,20 +2213,7 @@ async def on_message_edit(before: discord.Message, after: discord.Message) -> No
     if before.content == after.content:
         return
     try:
-        settings = bot.settings.peek_settings(before.guild.id)
-        counting_settings = settings.get("counting") or {}
-        if counting_settings.get("channel_id") and before.channel.id == int(
-            counting_settings["channel_id"]
-        ):
-            parsed = _extract_and_parse_number(before.content)
-            if parsed is not None:
-                state = bot.settings.counting.find_one({"guild_id": before.guild.id})
-                if state and not state.get("broken") and parsed == state.get("current"):
-                    await _break_counting_streak(
-                        after,
-                        state,
-                        f"{after.author.mention} edited their valid count!",
-                    )
+        await handle_counting_retraction(before, after, "edited")
     except Exception as exc:
         log.error("on_message_edit counting error: %s", exc)
 
@@ -2100,20 +2238,7 @@ async def on_message_delete(message: discord.Message) -> None:
         log.error("on_message_delete error: %s", exc)
 
     try:
-        settings = bot.settings.peek_settings(message.guild.id)
-        counting_settings = settings.get("counting") or {}
-        if counting_settings.get("channel_id") and message.channel.id == int(
-            counting_settings["channel_id"]
-        ):
-            parsed = _extract_and_parse_number(message.content)
-            if parsed is not None:
-                state = bot.settings.counting.find_one({"guild_id": message.guild.id})
-                if state and not state.get("broken") and parsed == state.get("current"):
-                    await _break_counting_streak(
-                        message,
-                        state,
-                        f"{message.author.mention} deleted their valid count!",
-                    )
+        await handle_counting_retraction(message, message, "deleted")
     except Exception as exc:
         log.error("on_message_delete counting error: %s", exc)
 
@@ -9692,16 +9817,13 @@ async def counting_set_channel(
     guild_id = interaction.guild_id
     if not guild_id:
         return
-    settings = await bot.settings.fetch_settings(guild_id)
-    if "counting" not in settings:
-        settings["counting"] = copy.deepcopy(DEFAULT_SETTINGS["counting"])
     if channel:
-        settings["counting"]["channel_id"] = channel.id
+        value: Optional[int] = channel.id
         msg = f"Counting channel set to {channel.mention}."
     else:
-        settings["counting"]["channel_id"] = None
+        value = None
         msg = "Counting disabled."
-    await bot.settings.push_settings(guild_id, settings)
+    await bot.settings.push_fields(guild_id, {"counting.channel_id": value})
     await interaction.response.send_message(msg, ephemeral=True)
 
 
@@ -9715,11 +9837,7 @@ async def counting_set_saves(
     guild_id = interaction.guild_id
     if not guild_id:
         return
-    settings = await bot.settings.fetch_settings(guild_id)
-    if "counting" not in settings:
-        settings["counting"] = copy.deepcopy(DEFAULT_SETTINGS["counting"])
-    settings["counting"]["default_saves"] = saves
-    await bot.settings.push_settings(guild_id, settings)
+    await bot.settings.push_fields(guild_id, {"counting.default_saves": saves})
     await interaction.response.send_message(
         f"Counting default saves per day set to {saves}.", ephemeral=True
     )
@@ -9737,16 +9855,13 @@ async def counting_set_ruiner_role(
     guild_id = interaction.guild_id
     if not guild_id:
         return
-    settings = await bot.settings.fetch_settings(guild_id)
-    if "counting" not in settings:
-        settings["counting"] = copy.deepcopy(DEFAULT_SETTINGS["counting"])
     if role:
-        settings["counting"]["ruiner_role_id"] = role.id
+        value: Optional[int] = role.id
         msg = f"Streak ruiner role set to {role.mention}."
     else:
-        settings["counting"]["ruiner_role_id"] = None
+        value = None
         msg = "Streak ruiner role disabled."
-    await bot.settings.push_settings(guild_id, settings)
+    await bot.settings.push_fields(guild_id, {"counting.ruiner_role_id": value})
     await interaction.response.send_message(msg, ephemeral=True)
 
 
@@ -9757,25 +9872,8 @@ async def counting_reset(interaction: discord.Interaction):
     guild_id = interaction.guild_id
     if not guild_id:
         return
-    state = bot.settings.counting.find_one({"guild_id": guild_id})
-    if not state:
-        state = {
-            "guild_id": guild_id,
-            "current": 0,
-            "last_user": None,
-            "streak": 0,
-            "broken": False,
-            "broken_time": None,
-        }
-    else:
-        state["current"] = 0
-        state["last_user"] = None
-        state["streak"] = 0
-        state["broken"] = False
-        state["broken_time"] = None
-    bot.settings.counting.update_one(
-        {"guild_id": guild_id}, {"$set": state}, upsert=True
-    )
+    async with _counting_lock(guild_id):
+        await _counting_store(guild_id, _counting_fresh_state(guild_id))
     await interaction.response.send_message(
         "The counting streak has been reset to 0.", ephemeral=True
     )
