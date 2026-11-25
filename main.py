@@ -33,6 +33,7 @@ import features.purge  # noqa: F401
 import features.autopurge  # noqa: F401
 import features.server_settings  # noqa: F401
 import features.automations  # noqa: F401
+import features.sticky  # noqa: F401
 from core.config import COMMAND_PREFIX, DEFAULT_SETTINGS, SnipedMessage
 from core.permissions import (
     custom_has_permissions,
@@ -58,6 +59,7 @@ from features.help import _uncategorised_roots
 from features.counting import handle_counting, handle_counting_retraction
 from features.utility import _handle_afk_mentions, _handle_afk_return
 from features.automations import _apply_guild_automations, _parse_emoji_tokens
+from features.sticky import _handle_sticky
 
 log: logging.Logger = logging.getLogger("debt-collector")
 
@@ -1063,16 +1065,6 @@ async def reminder_loop():
 async def before_reminder_loop():
     await bot.wait_until_ready()
 
-
-# --------------------------------------------------------------------------- #
-# AI Commands
-# --------------------------------------------------------------------------- #
-
-# --------------------------------------------------------------------------- #
-# AI subsystem — configuration, providers, memory, commands
-# --------------------------------------------------------------------------- #
-
-STICKY_MIN_INTERVAL: float = 6.0
 
 AI_HISTORY_CAP: int = 50
 AI_CONTEXT_TURNS: int = 15
@@ -3002,162 +2994,6 @@ async def aiopt_cmd(
         else "✅ The AI will treat your messages normally again."
     )
     await ctx.send(f"{_saved_mark(saved)} {text}{_saved_suffix(saved)}", ephemeral=True)
-
-
-async def _handle_sticky(message: discord.Message) -> None:
-    """Re-post the channel's sticky message underneath new chatter."""
-    assert message.guild is not None
-    settings = await bot.settings.fetch_settings(message.guild.id)
-    sticky: Dict[str, Any] = settings.get("sticky") or {}
-    entry: Optional[Dict[str, Any]] = sticky.get(str(message.channel.id))
-    if not entry or not entry.get("content"):
-        return
-
-    channel_id: int = message.channel.id
-    now: float = time.time()
-    if now - bot.sticky_last.get(channel_id, 0.0) < STICKY_MIN_INTERVAL:
-        return
-
-    lock: asyncio.Lock = bot.sticky_locks.setdefault(channel_id, asyncio.Lock())
-    if lock.locked():
-        return
-
-    async with lock:
-        bot.sticky_last[channel_id] = now
-        previous_id = entry.get("last_id")
-        if previous_id:
-            try:
-                previous = await message.channel.fetch_message(int(previous_id))
-                await previous.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
-
-        embed = discord.Embed(description=str(entry["content"])[:4000], color=0x5865F2)
-        embed.set_author(name="📌 Sticky")
-        try:
-            sent = await message.channel.send(
-                embed=embed, allowed_mentions=discord.AllowedMentions.none()
-            )
-        except discord.HTTPException as exc:
-            bot.log_error("sticky", exc)
-            return
-
-        record: Dict[str, Any] = dict(entry)
-        record["last_id"] = sent.id
-        updated: Dict[str, Any] = dict(settings.get("sticky") or {})
-        updated[str(channel_id)] = record
-        await bot.settings.push_settings(message.guild.id, {"sticky": updated})
-
-
-@bot.hybrid_group(
-    name="sticky",
-    description="Keep a message pinned to the bottom of a channel",
-    fallback="set",
-    invoke_without_command=True,
-)
-@app_commands.default_permissions(manage_messages=True)
-@commands.guild_only()
-@app_commands.describe(message="Text to keep at the bottom of this channel")
-async def sticky_group(ctx: commands.Context, *, message: str):
-    if not member_has_perms(ctx.author, manage_messages=True):
-        return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
-
-    content: str = message.strip()
-    if not content:
-        return await ctx.send("❌ Give me some text to stick.", ephemeral=True)
-
-    settings = await bot.settings.fetch_settings(ctx.guild.id)
-    sticky: Dict[str, Any] = dict(settings.get("sticky") or {})
-    existing: Dict[str, Any] = sticky.get(str(ctx.channel.id)) or {}
-    sticky[str(ctx.channel.id)] = {
-        "content": sanitize_mass_pings(content)[:4000],
-        "last_id": existing.get("last_id"),
-        "by": ctx.author.id,
-        "at": int(time.time()),
-    }
-    saved: bool = await bot.settings.push_settings(ctx.guild.id, {"sticky": sticky})
-    bot.sticky_last.pop(ctx.channel.id, None)
-
-    await ctx.send(
-        f"{'✅' if saved else '⚠️'} Sticky set for {ctx.channel.mention} — it re-posts under new "
-        f"messages, at most once every {STICKY_MIN_INTERVAL:.0f}s."
-        + ("" if saved else " (database write failed)"),
-        ephemeral=True,
-    )
-
-
-@sticky_group.command(name="off", description="Stop the sticky message in a channel")
-@app_commands.describe(channel="Channel (default: this one)")
-async def sticky_off(
-    ctx: commands.Context, channel: Optional[discord.TextChannel] = None
-):
-    if not member_has_perms(ctx.author, manage_messages=True):
-        return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
-
-    target = channel or ctx.channel
-    settings = await bot.settings.fetch_settings(ctx.guild.id)
-    sticky: Dict[str, Any] = dict(settings.get("sticky") or {})
-    entry: Optional[Dict[str, Any]] = sticky.pop(str(target.id), None)
-    if entry is None:
-        return await ctx.send(
-            f"ℹ️ No sticky message is set in {target.mention}.", ephemeral=True
-        )
-
-    last_id = entry.get("last_id")
-    if last_id:
-        try:
-            previous = await target.fetch_message(int(last_id))
-            await previous.delete()
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
-
-    bot.sticky_last.pop(target.id, None)
-    saved: bool = await bot.settings.push_settings(ctx.guild.id, {"sticky": sticky})
-    await ctx.send(
-        f"{'✅' if saved else '⚠️'} Sticky removed from {target.mention}."
-        + ("" if saved else " (database write failed)"),
-        ephemeral=True,
-    )
-
-
-@sticky_group.command(
-    name="list", description="Show every channel with a sticky message"
-)
-async def sticky_list(ctx: commands.Context):
-    if not member_has_perms(ctx.author, manage_messages=True):
-        return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
-
-    settings = await bot.settings.fetch_settings(ctx.guild.id)
-    sticky: Dict[str, Any] = settings.get("sticky") or {}
-    if not sticky:
-        return await ctx.send(
-            "No sticky messages are set. Add one with `/sticky set <message>`.",
-            ephemeral=True,
-        )
-
-    lines: List[str] = []
-    for channel_id, entry in sticky.items():
-        channel = (
-            ctx.guild.get_channel(int(channel_id)) if channel_id.isdigit() else None
-        )
-        where: str = (
-            channel.mention
-            if channel is not None
-            else f"*deleted channel* (`{channel_id}`)"
-        )
-        preview: str = str(entry.get("content", ""))[:120].replace("\n", " ")
-        author_id = entry.get("by")
-        byline: str = f" · by <@{author_id}>" if author_id else ""
-        lines.append(f"{where}{byline}\n└ {preview}")
-
-    pages = build_pages(
-        "Sticky messages",
-        lines,
-        0x5865F2,
-        per_page=8,
-        footer=f"{len(sticky)} channel(s)",
-    )
-    await send_pages(ctx, pages, ephemeral=True)
 
 
 @bot.hybrid_command(name="case", description="Show moderation history for a member")
