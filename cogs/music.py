@@ -9,8 +9,10 @@ import contextlib
 import logging
 import os
 import shlex
+import sys
 import time
-from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Set, Union
+from collections import deque
+from typing import Any, AsyncIterator, Deque, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import discord
 from discord import app_commands
@@ -36,7 +38,10 @@ from utils.ytdl import (
     ATTEMPT_BUDGET_SECONDS,
     ExtractionError,
     StreamInfo,
+    LOG_GUILD,
+    environment_report,
     ffmpeg_executable,
+    memory_snapshot,
     ffmpeg_input_options,
     resolve_stream,
     stream_failed,
@@ -53,6 +58,8 @@ IDLE_TIMEOUT: float = 180.0  # leave this long after the queue runs dry
 ALONE_TIMEOUT: float = 120.0  # leave this long after everyone else has left
 # The client rotation stops starting new attempts after its budget; leave room for the last one.
 RESOLVE_TIMEOUT: float = ATTEMPT_BUDGET_SECONDS + 45.0
+STALL_CHECK_SECONDS: float = 6.0  # no audio from ffmpeg this long after play() = stalled stream
+DAVE_READY_TIMEOUT: float = 5.0  # wait this long for voice end-to-end encryption to be ready
 INSTANT_FAILURE_SECONDS: float = 3.0  # a track that ends sooner than this "died"
 MIN_TRACK_FOR_FAILURE_CHECK: int = 10  # ...but only judge tracks at least this long
 MAX_QUICK_FAILURES: int = 3
@@ -166,12 +173,151 @@ def _humans(channel: Optional[VoiceChannel]) -> List[discord.Member]:
     return [m for m in channel.members if not m.bot]
 
 
+class _GuildLog(logging.LoggerAdapter):
+    """Tags every line with the guild id (shown in /errors music, filtered per server)."""
+
+    def process(self, msg: Any, kwargs: Any) -> Tuple[Any, Any]:
+        extra: Dict[str, Any] = dict(self.extra or {})
+        extra.update(kwargs.get("extra") or {})
+        kwargs["extra"] = extra
+        return f"[g:{extra.get('guild_id')}] {msg}", kwargs
+
+
+class MusicTrace(logging.Handler):
+    """Keeps the recent music log in memory for `/errors music`. Warnings are also mirrored into
+    the regular /errors list (errors already get there through the bot-wide log handler)."""
+
+    def __init__(self, cog: "MusicCog") -> None:
+        super().__init__(level=logging.INFO)
+        self.cog: "MusicCog" = cog
+        self.lines: Deque[Tuple[float, str, Optional[int], str]] = deque(maxlen=250)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message: str = record.getMessage()
+            guild_id: Optional[int] = getattr(record, "guild_id", None)
+            if guild_id is None:
+                guild_id = LOG_GUILD.get()  # resolver/yt-dlp lines: the guild the lookup ran for
+            self.lines.append((record.created, record.levelname, guild_id, message))
+            if record.levelno == logging.WARNING and not getattr(record, "no_feed", False):
+                self.cog.record_threadsafe("music:warning", message, guild_id)
+        except Exception:  # a logging handler must never raise
+            pass
+
+    def tail(self, limit: int, guild_id: Optional[int] = None, everything: bool = False) -> List[str]:
+        """Newest-last lines. Without `everything`, other servers' lines are left out."""
+        # emit() runs on other threads (ffmpeg, yt-dlp); iterating a deque that is being appended
+        # to raises RuntimeError, so take a snapshot under the handler lock first.
+        self.acquire()
+        try:
+            snapshot = list(self.lines)
+        finally:
+            self.release()
+        picked: List[str] = []
+        for created, level, line_guild, message in snapshot:
+            if not everything and line_guild is not None and line_guild != guild_id:
+                continue
+            stamp: str = time.strftime("%H:%M:%S", time.gmtime(created))
+            picked.append(f"{stamp} {level[:4]} {message}")
+        return picked[-limit:]
+
+
+class _FfmpegStderr:
+    """Sink for ffmpeg's stderr. It has no fileno(), so discord.py pipes ffmpeg's stderr into
+    write(); every line then goes to the real stderr (Render logs), the music log and /errors."""
+
+    MAX_RECORDED: int = 8  # per track, so a noisy ffmpeg can't flood /errors
+
+    def __init__(self, player: "GuildPlayer", label: str) -> None:
+        self._player: "GuildPlayer" = player
+        self._label: str = label
+        self._partial: str = ""
+        self._recorded: int = 0
+
+    def write(self, data: bytes) -> int:
+        if not data:
+            time.sleep(0.05)  # discord.py's reader keeps calling this at EOF; don't spin the CPU
+            return 0
+        text: str = self._partial + data.decode("utf-8", errors="replace")
+        chunks: List[str] = text.replace("\r", "\n").split("\n")
+        self._partial = chunks.pop()
+        for line in chunks:
+            self._emit(line.strip())
+        return len(data)
+
+    def _emit(self, line: str) -> None:
+        if not line:
+            return
+        with contextlib.suppress(Exception):
+            sys.stderr.write(f"[ffmpeg {self._label}] {line}\n")
+            sys.stderr.flush()
+        self._player.log.warning("ffmpeg: %s", line[:300], extra={"no_feed": True})
+        if self._recorded < self.MAX_RECORDED:
+            self._recorded += 1
+            self._player.cog.record_threadsafe("music:ffmpeg", line[:300], self._player.guild.id)
+
+    def flush(self) -> None:
+        pass
+
+
+class ExtractionBusy(asyncio.TimeoutError):
+    """The extraction slot never freed up, so nothing was attempted (the track isn't broken)."""
+
+
+class _ProbedSource(discord.AudioSource):
+    """Wraps an audio source and counts what ffmpeg really delivers: frames, time to the first
+    frame and (PCM only) peak amplitude. That tells "ffmpeg is silent" from "stalled stream"
+    from "audio is fine but nobody can hear it"."""
+
+    PEAK_FRAMES: int = 250  # measure the first ~5 s of 20 ms frames
+
+    def __init__(self, inner: discord.AudioSource, *, pcm: bool) -> None:
+        self.inner: discord.AudioSource = inner
+        self.pcm: bool = pcm
+        self.created: float = time.monotonic()
+        self.first_frame_at: Optional[float] = None
+        self.frames: int = 0
+        self.peak: int = 0
+
+    def read(self) -> bytes:
+        data: bytes = self.inner.read()
+        if not data:
+            # discord.py's player looks for the ffmpeg failure on the source it was given
+            error = getattr(self.inner, "_current_error", None)
+            if error is not None:
+                self._current_error = error
+        if data:
+            self.frames += 1
+            if self.first_frame_at is None:
+                self.first_frame_at = time.monotonic()
+            if self.pcm and self.frames <= self.PEAK_FRAMES:
+                samples = memoryview(data[: len(data) // 2 * 2]).cast("h")
+                if len(samples):
+                    self.peak = max(self.peak, max(samples), -min(samples))
+        return data
+
+    def is_opus(self) -> bool:
+        return self.inner.is_opus()
+
+    def cleanup(self) -> None:
+        self.inner.cleanup()
+
+    def summary(self) -> str:
+        first = "never" if self.first_frame_at is None else f"{self.first_frame_at - self.created:.1f}s"
+        peak = f" peak={self.peak}" if self.pcm else ""
+        return f"frames={self.frames} first_frame={first}{peak}"
+
+
 class GuildPlayer:
     """Queue, voice state and the playback loop for one guild."""
 
     def __init__(self, cog: "MusicCog", guild: discord.Guild) -> None:
         self.cog: "MusicCog" = cog
         self.guild: discord.Guild = guild
+        self.log: _GuildLog = _GuildLog(log, {"guild_id": getattr(guild, "id", None)})
+        self._probe: Optional[_ProbedSource] = None
+        self._busy: bool = False  # set when _start gave up only because the extractor was busy
+        self._watchers: Set["asyncio.Task[None]"] = set()
         self.queue: MusicQueue = MusicQueue()
         self.clock: PlaybackClock = PlaybackClock()
         self.volume: int = DEFAULT_VOLUME
@@ -226,40 +372,82 @@ class GuildPlayer:
             before.append(f"-user_agent {shlex.quote(agent)}")
         if position >= 1:
             before.append(f"-ss {int(position)}")
-        before.extend(shlex.quote(part) for part in ffmpeg_input_options())
+        shown: str = " ".join(before)  # for the log: the proxy URL can carry a password
+        proxy_parts: List[str] = [shlex.quote(part) for part in ffmpeg_input_options()]
+        if proxy_parts:
+            shown += " <proxy options hidden>"
+        before.extend(proxy_parts)
         before_options: str = " ".join(before)
+        mode: str = "pcm" if self.cog.pcm else "opus"
+        stderr = _FfmpegStderr(self, mode)  # no fileno(): discord.py pipes it through write()
 
         if self.cog.pcm:
-            raw = discord.FFmpegPCMAudio(
-                stream.url, executable=executable, before_options=before_options, options="-vn"
+            raw: discord.AudioSource = discord.FFmpegPCMAudio(
+                stream.url,
+                executable=executable,
+                stderr=stderr,
+                before_options=before_options,
+                options="-vn",
             )
-            return discord.PCMVolumeTransformer(raw, volume=self.volume / 100)
-        # No libopus on this host: hand ffmpeg's Opus output straight to Discord and
-        # apply volume as an ffmpeg filter (takes effect on the next (re)start).
-        return discord.FFmpegOpusAudio(
-            stream.url,
-            executable=executable,
-            before_options=before_options,
-            options=f"-vn -af volume={self.volume / 100:.2f}",
+            probe = _ProbedSource(raw, pcm=True)
+            source: discord.AudioSource = discord.PCMVolumeTransformer(probe, volume=self.volume / 100)
+            volume_note: str = f"PCMVolumeTransformer={self.volume / 100:.2f}"
+        else:
+            # No libopus on this host: hand ffmpeg's Opus output straight to Discord and
+            # apply volume as an ffmpeg filter (takes effect on the next (re)start).
+            raw = discord.FFmpegOpusAudio(
+                stream.url,
+                executable=executable,
+                stderr=stderr,
+                before_options=before_options,
+                options=f"-vn -af volume={self.volume / 100:.2f}",
+            )
+            probe = _ProbedSource(raw, pcm=False)
+            source = probe
+            volume_note = f"ffmpeg -af volume={self.volume / 100:.2f}"
+        self._probe = probe
+        self.log.info(
+            "ffmpeg spawned: exe=%s mode=%s volume=%s(%d%%) host=%s position=%ss before_options=%r",
+            executable,
+            mode,
+            volume_note,
+            self.volume,
+            stream.host,
+            int(position),
+            shown if not agent else shown.replace(shlex.quote(agent), "<ua>"),
         )
+        return source
 
     async def _start(self, track: Track, position: float = 0.0, *, announce: bool = True) -> bool:
         """Begin playing `track`. Caller holds the lock. False means it couldn't play."""
+        self._busy = False  # reflects only this call (seek never clears it otherwise)
         vc = self.voice
         if vc is None:
+            self.log.warning("play: voice client isn't connected (still reconnecting?); can't start %s", track.url)
             return False
+        self.log.info("play: preparing %s at %ss | %s", track.url, int(position), memory_snapshot())
         try:
-            stream: StreamInfo = await asyncio.wait_for(
-                asyncio.to_thread(resolve_stream, track), RESOLVE_TIMEOUT
-            )
+            # Resolved right now (never from the queue): YouTube stream URLs expire. One
+            # extraction at a time, because yt-dlp's JS runtime is the memory spike on small hosts.
+            stream: StreamInfo = await self.cog.extract(self.guild.id, resolve_stream, track)
+            await self._check_voice_ready(vc)
             source = self._build_source(stream, position)
         except MusicError as exc:
+            self.log.error("play: %s", exc)
             await self.notify(f"❌ {exc}")
             return False
         except ExtractionError as exc:
+            self.log.warning("play: skipping %s: %s", track.url, exc)
             await self.notify(f"⚠️ Skipping **{_clean_title(track.title)}** — {exc}")
             return False
+        except ExtractionBusy:
+            # never ran: another server's extraction held the slot. Keep the track queued.
+            self.log.warning("play: extractor busy, keeping %s queued", track.url)
+            self._busy = True
+            await self.notify("⏳ Another song is still loading — try again in a moment.")
+            return False
         except asyncio.TimeoutError:
+            self.log.error("play: resolving %s timed out after %.0fs", track.url, RESOLVE_TIMEOUT)
             await self.notify(f"⚠️ Skipping **{_clean_title(track.title)}** — YouTube took too long to respond.")
             return False
         except Exception as exc:
@@ -275,13 +463,17 @@ class GuildPlayer:
 
         vc = self.voice  # may have dropped while we were resolving
         if vc is None:
+            self.log.warning("play: voice connection dropped while preparing %s", track.url)
+            source.cleanup()
             return False
 
         self._gen += 1
         generation: int = self._gen
         if vc.is_playing() or vc.is_paused():
+            self.log.info("play: stopping the previous source first")
             vc.stop()
-        vc.play(source, after=lambda error, g=generation: self._after(g, error))
+        vc.play(source, after=lambda error, g=generation, p=self._probe: self._after(g, error, p))
+        self.log.info("play: vc.play() called, is_playing=%s | %s", vc.is_playing(), memory_snapshot())
         self.clock.start(position)
         log.info(
             "Playing %s (%s) in guild %s from %ss; %s",
@@ -289,12 +481,105 @@ class GuildPlayer:
             _voice_encryption_state(vc),
         )
         self.refresh_timer()
+        self._watch_audio(generation)
         if announce:
             await self.notify(embed=self.cog.now_playing_embed(self, title="▶️ Now playing"))
         return True
 
-    def _after(self, generation: int, error: Optional[Exception]) -> None:
-        """Runs on discord.py's player thread when a source finishes or is stopped."""
+    # -- voice health ----------------------------------------------------- #
+
+    def _voice_problems(self, vc: discord.VoiceClient) -> List[str]:
+        """Reasons the bot could be connected yet inaudible. Only explicit True/False count."""
+        problems: List[str] = []
+        me = self.guild.me
+        if me is None:
+            return problems
+        with contextlib.suppress(Exception):
+            perms = vc.channel.permissions_for(me)
+            if perms.connect is False:
+                problems.append("missing the Connect permission")
+            if perms.speak is False:
+                problems.append("missing the Speak permission")
+            state = me.voice
+            if state is not None:
+                if state.mute is True:
+                    problems.append("server-muted")
+                if state.suppress is True:
+                    problems.append("suppressed (Stage channel: an admin must invite it to speak)")
+        return problems
+
+    async def _check_voice_ready(self, vc: discord.VoiceClient) -> None:
+        """Log (and tell the channel about) anything that would make playback inaudible, and give
+        voice end-to-end encryption (DAVE) a moment to finish its handshake: audio sent before
+        it's ready goes out unencrypted and other clients drop it."""
+        problems: List[str] = self._voice_problems(vc)
+        if problems:
+            self.log.warning("voice: I may be inaudible: %s", ", ".join(problems))
+            await self.notify(f"🔇 I might not be heard: I'm {', '.join(problems)} in this channel.")
+
+        conn = getattr(vc, "_connection", None)
+        version = getattr(conn, "dave_protocol_version", None)
+        if not isinstance(version, int):
+            return
+        if version == 0:
+            self.log.info("voice: DAVE end-to-end encryption not active (protocol 0)")
+            return
+        loop = asyncio.get_running_loop()
+        deadline: float = loop.time() + DAVE_READY_TIMEOUT
+        # noqa below: polling discord.py's connection state, there is no event to await
+        while getattr(conn, "can_encrypt", True) is False and loop.time() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.25)
+        if getattr(conn, "can_encrypt", True) is False:
+            self.log.warning(
+                "voice: DAVE session still not ready after %.0fs; audio may be dropped by listeners",
+                DAVE_READY_TIMEOUT,
+            )
+        else:
+            self.log.info("voice: DAVE ready (protocol %s)", version)
+
+    def _watch_audio(self, generation: int) -> None:
+        task: "asyncio.Task[None]" = asyncio.get_running_loop().create_task(self._audio_watchdog(generation))
+        self._watchers.add(task)
+        task.add_done_callback(self._watchers.discard)
+
+    async def _audio_watchdog(self, generation: int) -> None:
+        """A few seconds after play(), report whether ffmpeg is really delivering audio."""
+        probe: Optional[_ProbedSource] = self._probe
+        if probe is None:
+            return
+        await asyncio.sleep(STALL_CHECK_SECONDS)
+        if generation != self._gen or probe is not self._probe:
+            return
+        vc = self.voice
+        if vc is None or vc.is_paused():
+            return
+        if probe.frames == 0:
+            self.log.error(
+                "audio: ffmpeg delivered NO data %.0fs after play() (blocked, throttled or stalled "
+                "stream); %s",
+                STALL_CHECK_SECONDS,
+                probe.summary(),
+            )
+            await self.notify(
+                "⚠️ YouTube isn't sending any audio right now, so you'll hear nothing. "
+                "An admin can check `/errors` (and `/errors music`) for why."
+            )
+        elif probe.pcm and probe.frames >= 50 and probe.peak == 0:
+            self.log.error("audio: ffmpeg is delivering pure silence; %s", probe.summary())
+        else:
+            self.log.info("audio: flowing; %s | %s", probe.summary(), memory_snapshot())
+
+    def _after(self, generation: int, error: Optional[Exception], probe: Optional[_ProbedSource] = None) -> None:
+        """Runs on discord.py's player thread when a source finishes or is stopped.
+        `probe` is the finishing source's own stats (self._probe may already be the next one)."""
+        stats: str = probe.summary() if probe is not None else "no stats"
+        if error is not None:
+            # Printed straight to stderr as well, so it shows up in the Render logs whatever
+            # the logging configuration is.
+            print(f"[music] playback error in guild {self.guild.id}: {error!r} ({stats})", file=sys.stderr, flush=True)
+            self.log.error("after(): playback error: %r (%s)", error, stats)
+        else:
+            self.log.info("after(): source ended without error (gen=%s, current=%s, %s)", generation, self._gen, stats)
         future = asyncio.run_coroutine_threadsafe(self._on_end(generation, error), self.cog.bot.loop)
         future.add_done_callback(self._log_future)
 
@@ -377,6 +662,10 @@ class GuildPlayer:
             self.skip_votes.clear()
             if await self._start(track, announce=announce):
                 return True
+            if self._busy:  # don't burn through the queue while the extractor is occupied
+                self._busy = False
+                self._halt()
+                return False
 
     def _halt(self) -> None:
         self._gen += 1
@@ -503,6 +792,13 @@ class MusicCog(commands.Cog, name="Music"):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot: commands.Bot = bot
         self.players: Dict[int, GuildPlayer] = {}
+        # One yt-dlp extraction at a time: each spins up a JS runtime (Deno), which together with
+        # ffmpeg is what could push a 512 MB Render instance over its memory limit.
+        self.extract_lock: asyncio.Lock = asyncio.Lock()
+        self.trace: MusicTrace = MusicTrace(self)
+        log.addHandler(self.trace)  # feeds `/errors music`
+        if log.level == logging.NOTSET or log.level > logging.INFO:
+            log.setLevel(logging.INFO)  # the play path logs at INFO; make sure it isn't filtered out
         self.pcm: bool = opus_available()
         if not self.pcm:
             log.warning(
@@ -561,6 +857,10 @@ class MusicCog(commands.Cog, name="Music"):
             warm_up()
 
     async def cog_load(self) -> None:
+        """Log the facts that decide whether audio can work (shows in Render logs and /errors music)."""
+        log.info("music: libopus loaded=%s -> %s path", self.pcm, "PCM" if self.pcm else "Opus passthrough")
+        for level, line in await asyncio.to_thread(environment_report):
+            log.log(level, "music env: %s", line)
         # Find a YouTube client group that works from this host before anyone asks,
         # so the first /play doesn't wait through the failing ones.
         warm: bool = os.getenv("MUSIC_WARMUP", "1").strip().lower() not in ("0", "false", "off", "no")
@@ -568,6 +868,7 @@ class MusicCog(commands.Cog, name="Music"):
             self._warm_up_task = asyncio.create_task(asyncio.to_thread(self.boot_youtube, warm))
 
     async def cog_unload(self) -> None:
+        log.removeHandler(self.trace)
         if self._warm_up_task is not None:
             self._warm_up_task.cancel()
         if self._meta is not None:
@@ -580,12 +881,61 @@ class MusicCog(commands.Cog, name="Music"):
 
     # -- plumbing --------------------------------------------------------- #
 
-    def record_error(self, where: str, error: BaseException, guild: Optional[discord.Guild]) -> None:
+    def record_error(self, where: str, error: Any, guild: Optional[discord.Guild]) -> None:
         recorder = getattr(self.bot, "log_error", None)
         if recorder is None:
             return
         with contextlib.suppress(Exception):
             recorder(where, error, guild=guild)
+
+    async def extract(self, guild_id: Optional[int], func: Any, *args: Any) -> Any:
+        """Run a blocking yt-dlp call in a worker thread, one at a time.
+
+        The lock is released when the *worker* finishes, not when the caller gives up: a timeout
+        abandons the wait (asyncio.TimeoutError) but the thread keeps running, and letting the
+        next extraction start meanwhile would break the one-at-a-time memory guarantee.
+
+        One RESOLVE_TIMEOUT deadline covers waiting for the lock *and* the extraction itself, so a
+        stuck worker can't leave other servers (or this server's skip/stop) waiting forever."""
+        LOG_GUILD.set(guild_id)  # tags the worker's log lines with this server
+        loop = asyncio.get_running_loop()
+        deadline: float = loop.time() + RESOLVE_TIMEOUT
+        if self.extract_lock.locked():
+            log.info("extract: waiting for another extraction to finish")
+        try:
+            await asyncio.wait_for(self.extract_lock.acquire(), RESOLVE_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("extract: gave up waiting %.0fs for another extraction to finish", RESOLVE_TIMEOUT)
+            raise ExtractionBusy() from None
+        remaining: float = deadline - loop.time()
+        if remaining <= 0:  # the wait used the whole budget; don't start work nobody is waiting for
+            self.extract_lock.release()
+            raise ExtractionBusy()
+        try:
+            worker: "asyncio.Future[Any]" = asyncio.ensure_future(asyncio.to_thread(func, *args))
+        except BaseException:
+            self.extract_lock.release()
+            raise
+
+        def _finished(done: "asyncio.Future[Any]") -> None:
+            self.extract_lock.release()
+            if not done.cancelled():
+                done.exception()  # mark retrieved: a caller that timed out never awaits it
+
+        worker.add_done_callback(_finished)
+        return await asyncio.wait_for(asyncio.shield(worker), remaining)
+
+    def record_threadsafe(self, where: str, message: str, guild_id: Optional[int]) -> None:
+        """Feed /errors from any thread (ffmpeg's stderr reader, yt-dlp worker, logging)."""
+
+        def _record() -> None:
+            guild = self.bot.get_guild(guild_id) if guild_id else None
+            self.record_error(where, message, guild)
+
+        try:
+            self.bot.loop.call_soon_threadsafe(_record)
+        except Exception:  # loop closed or not running (shutdown): nothing useful left to do
+            pass
 
     def get_player(self, guild: discord.Guild) -> GuildPlayer:
         player = self.players.get(guild.id)
@@ -756,15 +1106,17 @@ class MusicCog(commands.Cog, name="Music"):
         if len(player.queue) >= player.queue.max_size and not front:
             raise MusicError(f"The queue is full ({player.queue.max_size} tracks).")
 
+        player.log.info("command: play query=%.80r front=%s user=%s", query, front, ctx.author.id)
         async with ctx.typing():
             try:
-                resolved = await asyncio.wait_for(
-                    asyncio.to_thread(resolve_tracks, parsed, ctx.author.id, ctx.author.display_name),
-                    RESOLVE_TIMEOUT,
+                resolved = await self.extract(
+                    ctx.guild.id, resolve_tracks, parsed, ctx.author.id, ctx.author.display_name
                 )
             except ExtractionError as exc:
+                player.log.warning("command: lookup failed: %s", exc)
                 raise MusicError(str(exc)) from None
             except asyncio.TimeoutError:
+                player.log.error("command: lookup timed out after %.0fs", RESOLVE_TIMEOUT)
                 raise MusicError("YouTube took too long to respond. Try again in a moment.") from None
             except Exception as exc:
                 log.exception("resolve_tracks failed for %r", query)

@@ -234,6 +234,7 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "errors": "Recent runtime errors, deduplicated and newest first.",
     "errors detail": "Full traceback and context for one error id.",
     "errors stats": "Error totals grouped by exception type.",
+    "errors music": "Recent music log: voice, yt-dlp and ffmpeg lines, to see why a song is silent.",
     "errors clear": "Empty the in-memory error buffer (bot superuser only).",
     "screening": "Screen new joins for alt accounts and ban evasion, and act on the risky ones.",
     "screening config": "Turn screening on or off and tune the threshold, action and signals.",

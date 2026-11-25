@@ -3,16 +3,22 @@
 import functools
 import logging
 import os
+import re
 import shutil
+import subprocess
+import sys
 import sysconfig
 import tempfile
 import threading
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from utils import warp
 from utils.music import (
+    YOUTUBE_HOSTS,
     ParsedQuery,
     QueryKind,
     Track,
@@ -22,9 +28,45 @@ from utils.music import (
 
 log = logging.getLogger("debt-collector.music")
 
+# The guild a lookup is running for. asyncio.to_thread copies the context into its worker
+# thread, so log lines from yt-dlp/resolver code get tagged with it (and are only shown in
+# that server's `/errors music`). Unset means process-wide diagnostics.
+LOG_GUILD: ContextVar[Optional[int]] = ContextVar("music_log_guild", default=None)
+
 MAX_PLAYLIST_ITEMS: int = int(os.getenv("MUSIC_MAX_PLAYLIST", "50"))
 
 _UNAVAILABLE_TITLES = ("[private video]", "[deleted video]")
+
+# Render's build step installs Deno under /opt/render/project/.deno/bin, but that folder is
+# not on the PATH of the running service. yt-dlp looks runtimes up by bare name, so without
+# this it silently runs with no JavaScript runtime, can't solve YouTube's challenges, and the
+# stream URLs it hands back can be refused or throttled (the bot "plays" but nothing is heard).
+_RUNTIME_DIRS: Tuple[str, ...] = (
+    "/opt/render/project/.deno/bin",
+    "~/.deno/bin",
+    "~/.bun/bin",
+)
+
+
+def _extend_path() -> List[str]:
+    """Put the usual Deno/Bun install folders on PATH. Returns the folders it added."""
+    candidates: List[str] = []
+    install: Optional[str] = os.getenv("DENO_INSTALL")
+    if install:
+        candidates.append(os.path.join(install, "bin"))
+    candidates.extend(os.path.expanduser(p) for p in _RUNTIME_DIRS)
+
+    entries: List[str] = [e for e in os.environ.get("PATH", "").split(os.pathsep) if e]
+    added: List[str] = []
+    for directory in candidates:
+        if os.path.isdir(directory) and directory not in entries and directory not in added:
+            added.append(directory)
+    if added:
+        os.environ["PATH"] = os.pathsep.join(added + entries)
+    return added
+
+
+PATH_ADDITIONS: List[str] = _extend_path()
 
 
 class ExtractionError(Exception):
@@ -39,6 +81,7 @@ class StreamInfo:
     is_live: bool = False
     thumbnail: Optional[str] = None
     title: Optional[str] = None
+    host: Optional[str] = None  # for logs only; the full URL carries signed tokens
 
 
 @dataclass
@@ -117,6 +160,17 @@ def friendly_error(message: str) -> str:
     return "I couldn't load that from YouTube."
 
 
+def _redact(text: Any) -> str:
+    """Log-safe yt-dlp text. A malformed cookies file makes CPython/yt-dlp echo the offending
+    row (a live session cookie) in its error, and /errors music is readable by server admins,
+    so anything cookie-related or tab-separated is replaced by a generic note."""
+    message: str = str(text)
+    lowered: str = message.lower()
+    if "cookie" in lowered or "\t" in message or "set-cookie" in lowered:
+        return "cookie-related problem (details hidden; check YTDL_COOKIES_FILE is a valid Netscape cookies.txt)"
+    return message[:500]
+
+
 class _YtdlLogger:
     """Keep yt-dlp out of stderr; real failures surface as ExtractionError instead.
 
@@ -134,24 +188,28 @@ class _YtdlLogger:
         pass
 
     def warning(self, message: str) -> None:
-        log.debug("yt-dlp: %s", message)
+        log.debug("yt-dlp: %s", _redact(message))
         if len(self.warnings) < 20:
-            self.warnings.append(message)
+            self.warnings.append(_redact(message))
 
     def error(self, message: str) -> None:
-        log.debug("yt-dlp: %s", message)
+        log.warning("yt-dlp: %s", _redact(message))
 
 
-@functools.lru_cache(maxsize=1)
 def _js_runtimes() -> Dict[str, Dict[str, Any]]:
-    """YouTube needs a JavaScript runtime; yt-dlp only auto-enables deno, so enable any we find.
-
-    deno is always listed: yt-dlp also finds the copy pip installs (yt-dlp[deno]) next to
-    Python, which isn't always on PATH.
+    """YouTube needs a JavaScript runtime; yt-dlp only auto-enables a bare `deno`, so every
+    runtime found is passed by full path (Render's Deno isn't on the service PATH, though
+    `_extend_path` fixes that). deno is always listed: yt-dlp also finds the copy that pip
+    installs (yt-dlp[deno]) next to Python, which isn't always on PATH.
     """
     runtimes: Dict[str, Dict[str, Any]] = {"deno": {}}
-    runtimes.update({name: {} for name in ("node", "bun") if shutil.which(name)})
-    found: List[str] = [name for name in ("deno", "node", "bun") if _runtime_installed(name)]
+    found: List[str] = []
+    scripts: str = sysconfig.get_path("scripts") or ""
+    for name in ("deno", "node", "bun"):
+        path: Optional[str] = shutil.which(name) or (shutil.which(name, path=scripts) if scripts else None)
+        if path:
+            runtimes[name] = {"path": path}
+            found.append(name)
     try:
         from yt_dlp.version import __version__ as ytdlp_version
     except Exception:
@@ -165,13 +223,6 @@ def _js_runtimes() -> Dict[str, Dict[str, Any]]:
             "Install requirements.txt again (it includes deno)."
         )
     return runtimes
-
-
-def _runtime_installed(name: str) -> bool:
-    if shutil.which(name):
-        return True
-    scripts: str = sysconfig.get_path("scripts") or ""
-    return bool(scripts) and shutil.which(name, path=scripts) is not None
 
 
 # yt-dlp runs deno to solve YouTube's JavaScript challenge. Uncapped, that took the
@@ -270,10 +321,10 @@ def _find_cookie_file(configured: str) -> Optional[str]:
 
 
 @functools.lru_cache(maxsize=4)
-def _writable_cookie_file(path: str) -> str:
-    """yt-dlp rewrites the cookies file, so copy a read-only one (e.g. a Render Secret File)."""
-    if os.access(path, os.W_OK):
-        return path
+def _copy_cookies(path: str, signature: Tuple[int, int, int]) -> str:
+    """Copy a read-only cookies file. `signature` is the *source's* mtime/size/inode, so a
+    replaced source is copied again (the cache is keyed on it, never on the copy that yt-dlp
+    keeps rewriting)."""
     target: str = os.path.join(tempfile.gettempdir(), "ytdl-cookies.txt")
     try:
         shutil.copyfile(path, target)
@@ -283,6 +334,125 @@ def _writable_cookie_file(path: str) -> str:
         return path
     log.info("Cookies file %s is read-only; using a writable copy at %s", path, target)
     return target
+
+
+def _writable_cookie_file(path: str) -> str:
+    """yt-dlp rewrites the cookies file, so copy a read-only one (e.g. a Render Secret File)."""
+    if os.access(path, os.W_OK):
+        return path
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return path
+    return _copy_cookies(path, (stat.st_mtime_ns, stat.st_size, stat.st_ino))
+
+
+_writable_cookie_file.cache_clear = _copy_cookies.cache_clear  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostics
+# --------------------------------------------------------------------------- #
+
+
+def memory_snapshot() -> str:
+    """This process' RSS plus the container's usage/limit (Render caps small plans at 512 MB)."""
+    parts: List[str] = []
+    try:
+        with open("/proc/self/status", encoding="ascii", errors="ignore") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    parts.append(f"rss={int(line.split()[1]) // 1024}MB")
+                    break
+    except OSError:
+        pass
+    for used_path, limit_path in (
+        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+        ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ):
+        try:
+            with open(used_path, encoding="ascii") as handle:
+                used = int(handle.read().strip()) // (1024 * 1024)
+            with open(limit_path, encoding="ascii") as handle:
+                raw = handle.read().strip()
+            limit = f"{int(raw) // (1024 * 1024)}MB" if raw.isdigit() and int(raw) < 1 << 50 else "unlimited"
+            parts.append(f"container={used}MB/{limit}")
+            break
+        except (OSError, ValueError):
+            continue
+    return " ".join(parts) or "n/a"
+
+
+def _run_text(command: List[str], timeout: float = 10.0) -> str:
+    try:
+        done = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout, errors="ignore"
+        )
+        return (done.stdout or "") + (done.stderr or "")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def environment_report() -> List[Tuple[int, str]]:
+    """Blocking. (log level, line) facts that decide whether music can work on this host."""
+    report: List[Tuple[int, str]] = []
+    try:
+        import yt_dlp
+
+        report.append((logging.INFO, f"yt-dlp {yt_dlp.version.__version__}"))
+    except Exception as exc:
+        report.append((logging.ERROR, f"yt-dlp is not importable: {exc}"))
+
+    if PATH_ADDITIONS:
+        report.append((logging.INFO, f"Added to PATH: {', '.join(PATH_ADDITIONS)}"))
+
+    ffmpeg: Optional[str] = ffmpeg_executable()
+    if ffmpeg is None:
+        report.append((logging.ERROR, "ffmpeg: NOT FOUND (set FFMPEG_PATH or install imageio-ffmpeg)"))
+    else:
+        first = (_run_text([ffmpeg, "-hide_banner", "-version"]).splitlines() or ["?"])[0]
+        encoders = _run_text([ffmpeg, "-hide_banner", "-encoders"])
+        protocols = _run_text([ffmpeg, "-hide_banner", "-protocols"])
+        has_opus = "libopus" in encoders
+        has_https = bool(re.search(r"^\s+https\s*$", protocols, re.MULTILINE))
+        report.append((logging.INFO, f"ffmpeg: {ffmpeg} | {first[:80]}"))
+        if not has_opus:
+            report.append((logging.WARNING, "ffmpeg has no libopus encoder: Opus fallback playback will fail"))
+        if not has_https:
+            report.append((logging.ERROR, "ffmpeg has no https support: it can't open YouTube streams"))
+
+    runtimes: Dict[str, Dict[str, Any]] = {n: c for n, c in _js_runtimes().items() if c.get("path")}
+    if not runtimes:
+        report.append(
+            (
+                logging.ERROR,
+                "No JavaScript runtime (deno/node/bun) found on PATH: yt-dlp can't solve YouTube's "
+                "challenges, so stream URLs may be refused or throttled",
+            )
+        )
+    for name, config in runtimes.items():
+        version = (_run_text([config["path"], "--version"]).splitlines() or ["?"])[0].strip()
+        report.append((logging.INFO, f"JS runtime {name}: {config['path']} ({version[:40]})"))
+        match = re.search(r"deno (\d+)\.(\d+)\.(\d+)", version) if name == "deno" else None
+        if match and tuple(int(g) for g in match.groups()) < (2, 3, 0):
+            report.append((logging.WARNING, f"Deno {version} is older than 2.3.0, which yt-dlp requires"))
+
+    cookies_env: Optional[str] = os.getenv("YTDL_COOKIES_FILE")
+    if not cookies_env:
+        report.append((logging.INFO, "Cookies: YTDL_COOKIES_FILE not set"))
+    elif not os.path.isfile(cookies_env):
+        report.append((logging.WARNING, f"Cookies: {cookies_env} does not exist"))
+    else:
+        report.append((logging.INFO, f"Cookies: {cookies_env} ({os.path.getsize(cookies_env)} bytes)"))
+
+    # Never log the proxy URL itself: it can carry credentials.
+    report.append((logging.INFO, f"Proxy: {'configured (YTDL_PROXY)' if os.getenv('YTDL_PROXY', '').strip() else 'none'}"))
+    clients_cfg: List[str] = _player_clients()
+    report.append((logging.INFO, f"YouTube player clients: {', '.join(clients_cfg) or 'yt-dlp default'}"))
+
+    report.append((logging.INFO, f"Memory: {memory_snapshot()}"))
+    report.append((logging.INFO, f"Python {sys.version.split()[0]}"))
+    return report
 
 
 def _player_clients() -> List[str]:
@@ -605,7 +775,7 @@ def _rotate(
             log.warning(
                 "yt-dlp failed for %s via %s in %.1fs: %s",
                 target, strategy.label, time.monotonic() - attempt_started,
-                message.splitlines()[0][:400] if message else message,
+                _redact(message.splitlines()[0][:400] if message else message),
             )
             for warning in logger.warnings[-5:]:
                 log.info("  yt-dlp said: %s", warning)
@@ -731,8 +901,21 @@ def _cached_stream(url: str) -> Optional["StreamInfo"]:
 
 def _to_stream(info: Dict[str, Any]) -> "StreamInfo":
     url: Optional[str] = _stream_url(info)
+    log.info("stream: url_empty=%s", not url)
     if not url:
+        log.error("stream: no direct audio URL (formats missing)")
         raise ExtractionError("YouTube gave me no playable audio for that video.")
+    parsed = urlparse(url)
+    host: str = (parsed.hostname or "").lower()
+    # A watch-page URL here means yt-dlp didn't resolve a media format, so ffmpeg would get HTML.
+    if parsed.scheme not in ("http", "https") or host in YOUTUBE_HOSTS:
+        log.error("stream: got %s://%s instead of a direct audio URL", parsed.scheme, host)
+        raise ExtractionError("YouTube gave me no playable audio for that video.")
+    log.info(
+        "stream: host=%s format_id=%s ext=%s protocol=%s acodec=%s abr=%s live=%s",
+        host, info.get("format_id"), info.get("ext"), info.get("protocol"),
+        info.get("acodec"), info.get("abr"), bool(info.get("is_live")),
+    )
     duration = info.get("duration")
     return StreamInfo(
         url=url,
@@ -741,6 +924,7 @@ def _to_stream(info: Dict[str, Any]) -> "StreamInfo":
         is_live=bool(info.get("is_live")),
         thumbnail=info.get("thumbnail"),
         title=info.get("title"),
+        host=host,
     )
 
 
@@ -750,8 +934,10 @@ def resolve_stream(track: Track) -> StreamInfo:
     Cached URLs are used once: a seek or a volume restart asks again, so a URL that
     YouTube has since revoked can't get stuck.
     """
+    log.info("resolve_stream: %s | memory %s", track.url, memory_snapshot())
     cached: Optional[StreamInfo] = _cached_stream(track.url)
     if cached is not None:
+        log.info("resolve_stream: using the stream found while queueing")
         return cached
     return _to_stream(_run_with_rotation(track.url, _configure_stream, check=_require_audio))
 
@@ -767,7 +953,7 @@ def warm_up() -> Optional[Strategy]:
     try:
         _run_with_rotation(_PROBE_VIDEO, _configure_stream, check=_require_audio)
     except ExtractionError as exc:
-        log.warning("YouTube warm-up failed with every client group: %s", exc)
+        log.warning("YouTube warm-up failed with every client group: %s", _redact(exc))
         return None
     fastest: Optional[Tuple[float, Strategy]] = None
     for strategy in strategies():
@@ -867,7 +1053,7 @@ def probe(url: str = _PROBE_VIDEO, singles: bool = True) -> List[Tuple[str, bool
             if fetched is not None:
                 detail += f" resolved, but ffmpeg couldn't fetch it: {fetched}"
         except yt_dlp.utils.DownloadError as exc:
-            detail = str(exc).replace("ERROR: ", "")[:160]
+            detail = _redact(exc).replace("ERROR: ", "")[:160]
             ok = False
         elapsed: float = time.monotonic() - started
         results.append((strategy.label, ok, elapsed, detail))

@@ -1,5 +1,5 @@
 {
- "command_signature": "d13a575b5971168733057712512ffaa0252a71178245d71a462a76eba1e54abc",
+ "command_signature": "cbfb60334a443c18a7af80c774c2ebb6d73fd3ec50fdf2bc2062768e35c19836",
  "setup_hook": {
   "sync_digest_matches_signature": true,
   "first_sync_calls": 1,
@@ -2134,6 +2134,28 @@
      "type": "string",
      "required": true,
      "description": "The short id shown by /errors, e.g. 3f9a1c2b",
+     "choices": [],
+     "min_value": null,
+     "max_value": null,
+     "channel_types": [],
+     "autocomplete": false
+    }
+   ]
+  },
+  {
+   "qualified_name": "errors music",
+   "group": false,
+   "description": "Show the music player's recent log (voice, yt-dlp and ffmpeg)",
+   "default_permissions": null,
+   "guild_only": false,
+   "nsfw": false,
+   "checks": [],
+   "parameters": [
+    {
+     "name": "lines",
+     "type": "integer",
+     "required": false,
+     "description": "How many recent log lines to show (default 40, max 150)",
      "choices": [],
      "min_value": null,
      "max_value": null,
@@ -7165,6 +7187,19 @@
      "options": []
     },
     {
+     "name": "music",
+     "description": "Show the music player's recent log (voice, yt-dlp and ffmpeg)",
+     "type": 1,
+     "options": [
+      {
+       "type": 4,
+       "name": "lines",
+       "description": "How many recent log lines to show (default 40, max 150)",
+       "required": false
+      }
+     ]
+    },
+    {
      "name": "clear",
      "description": "Empty the in-memory error buffer",
      "type": 1,
@@ -10786,6 +10821,25 @@
    "help": null,
    "usage": null,
    "signature": "<error_id>",
+   "invoke_without_command": null,
+   "checks": [
+    "custom_has_permissions.<locals>.predicate"
+   ],
+   "cooldown": null,
+   "is_group": false
+  },
+  {
+   "qualified_name": "errors music",
+   "kind": "HybridCommand",
+   "cog": null,
+   "aliases": [],
+   "hidden": false,
+   "enabled": true,
+   "description": "Show the music player's recent log (voice, yt-dlp and ffmpeg)",
+   "brief": null,
+   "help": null,
+   "usage": null,
+   "signature": "[lines=40]",
    "invoke_without_command": null,
    "checks": [
     "custom_has_permissions.<locals>.predicate"

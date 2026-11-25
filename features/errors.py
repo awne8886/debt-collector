@@ -153,6 +153,40 @@ async def errors_stats(ctx: commands.Context) -> None:
     await ctx.send(embed=embed, ephemeral=True)
 
 
+@errors_group.command(
+    name="music",
+    description="Show the music player's recent log (voice, yt-dlp and ffmpeg)",
+)
+@custom_has_permissions(administrator=True)
+@app_commands.describe(lines="How many recent log lines to show (default 40, max 150)")
+async def errors_music(ctx: commands.Context, lines: int = 40) -> None:
+    if not member_has_perms(ctx.author, administrator=True):
+        return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
+
+    cog: Any = bot.get_cog("Music")
+    trace: Any = getattr(cog, "trace", None)
+    if trace is None:
+        return await ctx.send("❌ The music module isn't loaded.", ephemeral=True)
+
+    lines = max(5, min(lines, 150))
+    # Other servers' lines are only shown to a bot superuser.
+    entries: List[str] = trace.tail(
+        lines, guild_id=ctx.guild.id, everything=is_superuser(ctx.author)
+    )
+    if not entries:
+        return await ctx.send(
+            "ℹ️ The music log is empty. Try `/play` and run this again.", ephemeral=True
+        )
+    text: str = "\n".join(entries)
+    if len(text) <= 1900:
+        return await ctx.send(f"```\n{text}\n```", ephemeral=True)
+    await ctx.send(
+        f"📜 Last {len(entries)} music log lines:",
+        file=discord.File(io.BytesIO(text.encode("utf-8")), filename="music-log.txt"),
+        ephemeral=True,
+    )
+
+
 @errors_group.command(name="clear", description="Empty the in-memory error buffer")
 @custom_has_permissions(administrator=True)
 async def errors_clear(ctx: commands.Context) -> None:
