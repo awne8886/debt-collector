@@ -87,44 +87,46 @@ class TestAttachmentCacheWiring(unittest.IsolatedAsyncioTestCase):
         return message
 
     async def test_selection_respects_config_and_size(self):
-        import main
+        import features.messagelog as messagelog
 
         small, huge, text = _media(10), _media(50 * 1024 * 1024), _media(10, "text/plain")
         message = self._message([small, huge, text])
         enabled = {"enabled": True, "channel_id": 9, "ignored_channels": [], "cache_attachments": True}
-        with patch("main._messagelog_config", return_value=enabled):
-            self.assertEqual(main._attachments_to_cache(message), [small])
-        with patch("main._messagelog_config", return_value={**enabled, "enabled": False}):
-            self.assertEqual(main._attachments_to_cache(message), [])
-        with patch("main._messagelog_config", return_value={**enabled, "ignored_channels": ["2"]}):
-            self.assertEqual(main._attachments_to_cache(message), [])
-        with patch("main._messagelog_config", return_value={**enabled, "cache_attachments": False}):
-            self.assertEqual(main._attachments_to_cache(message), [])
+        with patch("features.messagelog._messagelog_config", return_value=enabled):
+            self.assertEqual(messagelog._attachments_to_cache(message), [small])
+        with patch("features.messagelog._messagelog_config", return_value={**enabled, "enabled": False}):
+            self.assertEqual(messagelog._attachments_to_cache(message), [])
+        with patch("features.messagelog._messagelog_config", return_value={**enabled, "ignored_channels": ["2"]}):
+            self.assertEqual(messagelog._attachments_to_cache(message), [])
+        with patch("features.messagelog._messagelog_config", return_value={**enabled, "cache_attachments": False}):
+            self.assertEqual(messagelog._attachments_to_cache(message), [])
 
     async def test_download_goes_into_the_cache(self):
-        import main
+        import features.messagelog as messagelog
+        from core.bot import bot
 
         attachment = _media(10)
-        await main._cache_single_attachment(4242, attachment)
+        await messagelog._cache_single_attachment(4242, attachment)
         try:
-            self.assertEqual(len(main.bot.attachment_cache.get(4242)), 1)
+            self.assertEqual(len(bot.attachment_cache.get(4242)), 1)
         finally:
-            main.bot.attachment_cache.pop(4242)
+            bot.attachment_cache.pop(4242)
 
-        oversize = _media(main.bot.attachment_cache.per_file_limit + 1)
-        await main._cache_single_attachment(4243, oversize)
+        oversize = _media(bot.attachment_cache.per_file_limit + 1)
+        await messagelog._cache_single_attachment(4243, oversize)
         oversize.read.assert_not_awaited()
 
     async def test_delete_pops_the_cached_entry(self):
-        import main
+        import features.messagelog as messagelog
+        from core.bot import bot
 
-        main.bot.attachment_cache.put(555, "a.png", "image/png", b"abc")
+        bot.attachment_cache.put(555, "a.png", "image/png", b"abc")
         payload = MagicMock()
         payload.guild_id = 1
         payload.message_id = 555
-        with patch.object(main.bot, "get_guild", return_value=None):
-            await main.messagelog_delete(payload)
-        self.assertNotIn(555, main.bot.attachment_cache)
+        with patch.object(bot, "get_guild", return_value=None):
+            await messagelog.messagelog_delete(payload)
+        self.assertNotIn(555, bot.attachment_cache)
 
 
 class TestStateJanitor(unittest.IsolatedAsyncioTestCase):
@@ -133,7 +135,7 @@ class TestStateJanitor(unittest.IsolatedAsyncioTestCase):
         from datetime import datetime, timezone
         from types import SimpleNamespace
 
-        from main import SnipedMessage
+        from core.config import SnipedMessage
 
         now = 100_000.0
 
@@ -162,7 +164,7 @@ class TestStateJanitor(unittest.IsolatedAsyncioTestCase):
         return target, held, now
 
     async def test_prunes_idle_entries_only(self):
-        from main import prune_idle_state
+        from features.maintenance import prune_idle_state
 
         target, held, now = self._target()
         async with held:
@@ -184,7 +186,7 @@ class TestStateJanitor(unittest.IsolatedAsyncioTestCase):
     async def test_extra_and_monotonic_maps(self):
         from types import SimpleNamespace
 
-        from main import prune_idle_state
+        from features.maintenance import prune_idle_state
 
         modmail = {(1, 1): 0.0, (1, 2): 9_999.0}
         cooldowns = {("ping", "user", 1): [10.0], ("ping", "user", 2): [5_000.0]}

@@ -1,4 +1,4 @@
-"""Regression test: async code in main.py must not make blocking MongoDB calls.
+"""Regression test: async bot code must not make blocking MongoDB calls.
 
 A synchronous pymongo call on the event loop freezes the whole bot (gateway
 heartbeats, music, every command) for as long as Atlas takes to answer. Async
@@ -7,11 +7,17 @@ or wrap the call in asyncio.to_thread(...).
 """
 
 import ast
+import glob
 import os
 import unittest
 from typing import List, Set
 
-MAIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# main.py and every module split out of it (core/, features/).
+SOURCES = [os.path.join(ROOT, "main.py")] + sorted(
+    glob.glob(os.path.join(ROOT, "core", "*.py"))
+    + glob.glob(os.path.join(ROOT, "features", "*.py"))
+)
 
 BLOCKING_SETTINGS_METHODS = {
     "get_settings",
@@ -58,7 +64,7 @@ def _is_settings_collection_call(func: ast.Attribute) -> bool:
     )
 
 
-def blocking_calls(source: str) -> List[str]:
+def blocking_calls(source: str, filename: str = "main.py") -> List[str]:
     tree = ast.parse(source)
     found: List[str] = []
     seen: Set[int] = set()
@@ -75,7 +81,7 @@ def blocking_calls(source: str) -> List[str]:
                 key = id(node)
                 if key not in seen:
                     seen.add(key)
-                    found.append(f"main.py:{node.lineno} {function}() calls .{name}(")
+                    found.append(f"{filename}:{node.lineno} {function}() calls .{name}(")
         for child in ast.iter_child_nodes(node):
             visit(child, function)
 
@@ -88,8 +94,11 @@ def blocking_calls(source: str) -> List[str]:
 
 class TestNoBlockingDatabaseCalls(unittest.TestCase):
     def test_async_code_does_not_call_sync_mongo(self):
-        with open(MAIN, encoding="utf-8") as handle:
-            offenders = blocking_calls(handle.read())
+        self.assertGreater(len(SOURCES), 1)
+        offenders = []
+        for path in SOURCES:
+            with open(path, encoding="utf-8") as handle:
+                offenders += blocking_calls(handle.read(), os.path.relpath(path, ROOT))
         self.assertEqual(offenders, [], "\n".join(offenders))
 
     def test_detector_catches_and_allows_the_right_things(self):
@@ -115,7 +124,7 @@ def sync_is_fine():
 
 class TestMongoClientOptions(unittest.TestCase):
     def test_defaults(self):
-        from main import mongo_client_options
+        from core.settings import mongo_client_options
 
         options = mongo_client_options("mongodb+srv://user:pw@cluster.example.net/db")
         self.assertEqual(options["timeoutMS"], 8000)
@@ -123,7 +132,7 @@ class TestMongoClientOptions(unittest.TestCase):
         self.assertEqual(options["serverSelectionTimeoutMS"], 5000)
 
     def test_uri_options_win(self):
-        from main import mongo_client_options
+        from core.settings import mongo_client_options
 
         options = mongo_client_options(
             "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&TIMEOUTMS=100"
@@ -133,9 +142,9 @@ class TestMongoClientOptions(unittest.TestCase):
         self.assertEqual(options["connectTimeoutMS"], 5000)
 
     def test_live_client_uses_them(self):
-        import main
+        from core.bot import settings_manager
 
-        client_options = main.settings_manager._client.options
+        client_options = settings_manager._client.options
         self.assertEqual(client_options.timeout, 8.0)
         self.assertEqual(client_options.pool_options.connect_timeout, 5.0)
 
@@ -144,7 +153,7 @@ class TestAutopurgeWritesExactPaths(unittest.IsolatedAsyncioTestCase):
     async def test_autopurge_on_writes_one_dotted_field(self):
         from unittest.mock import AsyncMock, MagicMock, patch
 
-        import main
+        import features.autopurge as autopurge
 
         bot = MagicMock()
         bot.settings.fetch_settings = AsyncMock(
@@ -157,9 +166,10 @@ class TestAutopurgeWritesExactPaths(unittest.IsolatedAsyncioTestCase):
         ctx.guild.id = 1
         channel = MagicMock()
         channel.id = 55
-        with patch("main.bot", bot), patch("main.member_has_perms", return_value=True):
-            await main.autopurge_on.callback(ctx, channel, None, None)
-            await main.autopurge_off.callback(ctx, channel)
+        with patch("features.autopurge.bot", bot), \
+                patch("features.autopurge.member_has_perms", return_value=True):
+            await autopurge.autopurge_on.callback(ctx, channel, None, None)
+            await autopurge.autopurge_off.callback(ctx, channel)
         bot.settings.push_settings.assert_not_awaited()
         calls = [c.args[1] for c in bot.settings.push_fields.await_args_list]
         self.assertEqual(calls[0], {"autopurge.channels.55": {"until": None}})

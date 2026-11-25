@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 class TestSafeCountingParser(unittest.TestCase):
     def test_existing_calculator_syntax_still_works(self):
-        from main import _parse_counting_number
+        from features.counting import _parse_counting_number
 
         self.assertEqual(_parse_counting_number("2^3"), 8)
         self.assertEqual(_parse_counting_number("sqrt(16)"), 4)
@@ -22,7 +22,7 @@ class TestSafeCountingParser(unittest.TestCase):
         self.assertIsNone(_parse_counting_number("sqrt(-4)"))
 
     def test_code_is_never_run(self):
-        from main import _parse_counting_number
+        from features.counting import _parse_counting_number
 
         hostile = [
             "__import__('os').getpid()",
@@ -46,7 +46,7 @@ class TestSafeCountingParser(unittest.TestCase):
         getpid.assert_not_called()
 
     def test_expensive_inputs_are_refused_quickly(self):
-        from main import _parse_counting_number
+        from features.counting import _parse_counting_number
 
         for text in ("9**9**9", "10**100", "2**64**2", "1/0", "5//0", "5%0", "1e400"):
             with self.subTest(text=text):
@@ -68,7 +68,7 @@ class TestSafeCountingParser(unittest.TestCase):
         self.assertIsNone(safe_eval(None))  # type: ignore[arg-type]
 
     def test_thousand_hostile_inputs_under_a_second(self):
-        from main import _extract_and_parse_number, _parse_counting_number
+        from features.counting import _extract_and_parse_number, _parse_counting_number
 
         samples = [
             "9**9**9",
@@ -90,9 +90,9 @@ class TestSafeCountingParser(unittest.TestCase):
         self.assertLess(time.perf_counter() - started, 1.0)
 
     def test_extract_only_tries_first_twelve_words(self):
-        from main import _extract_and_parse_number
+        from features.counting import _extract_and_parse_number
 
-        with patch("main._parse_counting_number", return_value=None) as parser:
+        with patch("features.counting._parse_counting_number", return_value=None) as parser:
             _extract_and_parse_number(" ".join(["x"] * 50))
         self.assertEqual(parser.call_count, 12)
         self.assertEqual(_extract_and_parse_number("5 is the number"), 5)
@@ -106,7 +106,7 @@ class TestSafeCountingParser(unittest.TestCase):
 
 class TestSuperuserIds(unittest.TestCase):
     def test_env_set_is_used_exactly(self):
-        from main import resolve_superuser_ids
+        from core.config import resolve_superuser_ids
 
         with self.assertNoLogs("debt-collector", level="WARNING"):
             result = resolve_superuser_ids("111, 222")
@@ -114,7 +114,7 @@ class TestSuperuserIds(unittest.TestCase):
         self.assertNotIn(1120393965485703219, result)
 
     def test_unset_falls_back_with_one_warning(self):
-        from main import DEFAULT_SUPERUSER_IDS, resolve_superuser_ids
+        from core.config import DEFAULT_SUPERUSER_IDS, resolve_superuser_ids
 
         for raw in (None, "", "   "):
             with self.subTest(raw=raw):
@@ -128,15 +128,16 @@ class TestSuperuserIds(unittest.TestCase):
         )
 
     def test_only_invalid_entries_fall_back(self):
-        from main import DEFAULT_SUPERUSER_IDS, resolve_superuser_ids
+        from core.config import DEFAULT_SUPERUSER_IDS, resolve_superuser_ids
 
         with self.assertLogs("debt-collector", level="WARNING"):
             self.assertEqual(resolve_superuser_ids("abc"), DEFAULT_SUPERUSER_IDS)
 
 
 class TestPaginatorSuperuserLookup(unittest.IsolatedAsyncioTestCase):
-    async def test_superuser_found_when_bot_runs_as_main_script(self):
-        from types import SimpleNamespace
+    async def test_superuser_passes_interaction_check(self):
+        # The superuser check comes from core.permissions. It used to be looked up in
+        # sys.modules["main"], which is "__main__" under `python main.py`.
         from unittest.mock import AsyncMock, MagicMock
 
         import discord
@@ -145,36 +146,45 @@ class TestPaginatorSuperuserLookup(unittest.IsolatedAsyncioTestCase):
 
         paginator = Paginator([discord.Embed(title="a"), discord.Embed(title="b")], author_id=1)
         interaction = MagicMock()
-        interaction.user.id = 99
         interaction.response.send_message = AsyncMock()
-        fake_main = SimpleNamespace(is_superuser=lambda user: user.id == 99)
-        modules = {k: v for k, v in sys.modules.items() if k != "main"}
-        modules["__main__"] = fake_main
-        with patch.dict(sys.modules, modules, clear=True):
+        with patch("core.permissions.SUPERUSER_IDS", frozenset({99})):
+            interaction.user.id = 99  # a superuser, not the author
             self.assertTrue(await paginator.interaction_check(interaction))
-        interaction.user.id = 100
-        with patch.dict(sys.modules, modules, clear=True):
+            interaction.user.id = 1  # the author
+            self.assertTrue(await paginator.interaction_check(interaction))
+            interaction.user.id = 100  # anyone else
             self.assertFalse(await paginator.interaction_check(interaction))
+        interaction.response.send_message.assert_awaited_once()
+
+    async def test_music_superuser_check_uses_core_permissions(self):
+        from unittest.mock import MagicMock
+
+        from cogs.music import _is_superuser
+
+        with patch("core.permissions.SUPERUSER_IDS", frozenset({99})):
+            self.assertTrue(_is_superuser(MagicMock(id=99)))
+            self.assertFalse(_is_superuser(MagicMock(id=100)))
 
 
 class TestCloneCommandsCanRun(unittest.TestCase):
     def test_asyncio_is_not_shadowed_by_a_local_import(self):
         # A late `import asyncio` inside the function made the first
         # asyncio.to_thread call raise UnboundLocalError (rollback_clone always failed).
-        import main
+        from features.server_clone import clone_server, rollback_clone
 
-        for command in (main.clone_server, main.rollback_clone):
+        for command in (clone_server, rollback_clone):
             with self.subTest(command=command.name):
                 self.assertNotIn("asyncio", command.callback.__code__.co_varnames)
 
 
 class TestCommandCategories(unittest.TestCase):
     def test_every_root_command_has_a_category(self):
-        import main
+        import main  # noqa: F401  # registers every command
+        from features.help import COMMAND_CATEGORY, _uncategorised_roots
 
-        self.assertEqual(main.COMMAND_CATEGORY.get("clone_server"), "config")
-        self.assertEqual(main.COMMAND_CATEGORY.get("rollback_clone"), "config")
-        self.assertEqual(main._uncategorised_roots(), [])
+        self.assertEqual(COMMAND_CATEGORY.get("clone_server"), "config")
+        self.assertEqual(COMMAND_CATEGORY.get("rollback_clone"), "config")
+        self.assertEqual(_uncategorised_roots(), [])
 
 
 if __name__ == "__main__":

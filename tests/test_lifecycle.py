@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import math
 import os
@@ -49,7 +50,7 @@ class TestRuntimeStats(unittest.TestCase):
             self.assertEqual(runtime_stats.rss_bytes(), runtime_stats.peak_rss_bytes())
 
     def test_collect_runtime_stats(self):
-        from main import _format_memory_line, collect_runtime_stats
+        from core.stats import _format_memory_line, collect_runtime_stats
 
         stats = collect_runtime_stats(_fake_bot())
         self.assertEqual(stats["guilds"], 2)
@@ -79,14 +80,14 @@ class TestRuntimeStats(unittest.TestCase):
 
 class TestHealth(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        from main import SHUTDOWN
+        from core.lifecycle import SHUTDOWN
 
         SHUTDOWN.reset()
 
     tearDown = setUp
 
     def test_ready_is_ok(self):
-        from main import build_health_payload
+        from core.web import build_health_payload
 
         code, body = build_health_payload(_fake_bot(), now=1000.0)
         self.assertEqual(code, 200)
@@ -99,7 +100,7 @@ class TestHealth(unittest.IsolatedAsyncioTestCase):
         json.dumps(body)  # serialisable
 
     def test_startup_grace_then_503(self):
-        from main import build_health_payload
+        from core.web import build_health_payload
 
         bot = _fake_bot(ready=False, latency=float("inf"))
         code, body = build_health_payload(bot, now=60.0, preview=True)
@@ -110,7 +111,7 @@ class TestHealth(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((code, body["status"]), (503, "unavailable"))
 
     def test_infinite_latency_after_grace_is_503(self):
-        from main import build_health_payload
+        from core.web import build_health_payload
 
         code, _ = build_health_payload(_fake_bot(latency=math.inf), now=10_000.0)
         self.assertEqual(code, 503)
@@ -118,29 +119,30 @@ class TestHealth(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(code, 503)
 
     def test_shutting_down_is_503(self):
-        from main import SHUTDOWN, build_health_payload
+        from core.lifecycle import SHUTDOWN
+        from core.web import build_health_payload
 
         SHUTDOWN.request("SIGTERM")
         code, body = build_health_payload(_fake_bot(), now=10.0)
         self.assertEqual((code, body["status"]), (503, "shutting_down"))
 
     async def test_handler_returns_json(self):
-        import main
+        import core.web as web
 
-        with patch("main.bot", _fake_bot(ready=False, start_time=0.0)), \
-             patch("main.time.time", return_value=10_000.0):
-            response = await main._health_handler(MagicMock())
+        with patch("core.web.bot", _fake_bot(ready=False, start_time=0.0)), \
+             patch("core.web.time.time", return_value=10_000.0):
+            response = await web._health_handler(MagicMock())
         self.assertEqual(response.status, 503)
         self.assertEqual(json.loads(response.text)["status"], "unavailable")
 
     async def test_server_root_always_ok_and_no_access_log(self):
-        import main
+        import core.web as web
 
-        with patch.dict(os.environ, {"PORT": "0"}), patch("main.bot", _fake_bot(ready=False)), \
-             patch("main.time.time", return_value=10_000.0):
-            await main._start_keepalive_server()
+        with patch.dict(os.environ, {"PORT": "0"}), patch("core.web.bot", _fake_bot(ready=False)), \
+             patch("core.web.time.time", return_value=10_000.0):
+            await web._start_keepalive_server()
             try:
-                port = main._KEEPALIVE_RUNNER.addresses[0][1]
+                port = web._KEEPALIVE_RUNNER.addresses[0][1]
                 base = f"http://127.0.0.1:{port}"
                 with self.assertNoLogs("aiohttp.access", level="DEBUG"):
                     async with aiohttp.ClientSession() as session:
@@ -152,19 +154,19 @@ class TestHealth(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(resp.status, 503)
                             self.assertFalse((await resp.json())["ready"])
             finally:
-                await main._stop_keepalive_server()
+                await web._stop_keepalive_server()
 
 
 class TestShutdown(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        from main import SHUTDOWN
+        from core.lifecycle import SHUTDOWN
 
         SHUTDOWN.reset()
 
     tearDown = setUp
 
     async def test_signal_sets_flag_and_closes_once(self):
-        from main import SHUTDOWN, handle_shutdown_signal
+        from core.lifecycle import SHUTDOWN, handle_shutdown_signal
 
         close = AsyncMock()
         with self.assertLogs("debt-collector", level="INFO") as logs:
@@ -177,7 +179,7 @@ class TestShutdown(unittest.IsolatedAsyncioTestCase):
         close.assert_awaited_once()
 
     async def test_close_is_time_boxed(self):
-        from main import _close_within
+        from core.lifecycle import _close_within
 
         async def slow():
             await asyncio.sleep(10)
@@ -186,7 +188,7 @@ class TestShutdown(unittest.IsolatedAsyncioTestCase):
             await _close_within(slow, budget=0.05)
 
     async def test_install_signal_handlers(self):
-        from main import install_signal_handlers
+        from core.lifecycle import install_signal_handlers
 
         loop = MagicMock()
         self.assertEqual(install_signal_handlers(loop, AsyncMock()), ["SIGTERM", "SIGINT"])
@@ -194,7 +196,7 @@ class TestShutdown(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(install_signal_handlers(loop, AsyncMock()), [])
 
     async def test_supervisor_does_not_start_after_shutdown(self):
-        from main import SHUTDOWN, supervise
+        from core.lifecycle import SHUTDOWN, supervise
 
         SHUTDOWN.request("SIGTERM")
         start = AsyncMock()
@@ -202,27 +204,27 @@ class TestShutdown(unittest.IsolatedAsyncioTestCase):
         start.assert_not_awaited()
 
     async def test_supervisor_stops_reconnecting_when_signalled_during_backoff(self):
-        from main import SHUTDOWN, supervise
+        from core.lifecycle import SHUTDOWN, supervise
 
         start = AsyncMock(side_effect=OSError("network down"))
         loop = asyncio.get_running_loop()
         loop.call_later(0.05, SHUTDOWN.request, "SIGTERM")
-        with patch("main.random.uniform", return_value=0.0):
+        with patch("core.lifecycle.random.uniform", return_value=0.0):
             result = await asyncio.wait_for(supervise(start, base_backoff=30.0), 2.0)
         self.assertEqual(result, "shutdown")
         self.assertEqual(start.await_count, 1)
 
     async def test_supervisor_retries_then_exits_on_clean_close(self):
-        from main import supervise
+        from core.lifecycle import supervise
 
         start = AsyncMock(side_effect=[OSError("blip"), None])
-        with patch("main.random.uniform", return_value=0.0):
+        with patch("core.lifecycle.random.uniform", return_value=0.0):
             result = await supervise(start, base_backoff=0.01)
         self.assertEqual(result, "clean")
         self.assertEqual(start.await_count, 2)
 
     async def test_supervisor_exits_when_start_returns_during_shutdown(self):
-        from main import SHUTDOWN, supervise
+        from core.lifecycle import SHUTDOWN, supervise
 
         async def start():
             SHUTDOWN.request("SIGTERM")
@@ -230,48 +232,48 @@ class TestShutdown(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await supervise(start), "shutdown")
 
     async def test_supervisor_exits_if_client_closed(self):
-        from main import supervise
+        from core.lifecycle import supervise
 
         start = AsyncMock(side_effect=OSError("gone"))
         self.assertEqual(await supervise(start, is_closed=lambda: True), "closed")
 
     async def test_bot_close_runs_steps_in_order(self):
-        import main
+        import core.bot
         from discord.ext import commands
 
         order = []
-        bot = main.DebtCollectorBot(MagicMock())
+        bot = core.bot.DebtCollectorBot(MagicMock())
         bot.settings.close = MagicMock(side_effect=lambda: order.append("mongo"))
 
         async def record(name):
             order.append(name)
 
-        with patch("main.ai_flush", AsyncMock(side_effect=lambda: order.append("flush"))), \
+        with patch("core.bot.ai_flush", AsyncMock(side_effect=lambda: order.append("flush"))), \
              patch.object(bot, "_leave_voice", AsyncMock(side_effect=lambda: order.append("voice"))), \
              patch.object(bot, "_close_http_session", AsyncMock(side_effect=lambda: order.append("http"))), \
-             patch.object(main.DebtCollectorBot, "_stop_warp", staticmethod(lambda: order.append("warp"))), \
+             patch.object(core.bot.DebtCollectorBot, "_stop_warp", staticmethod(lambda: order.append("warp"))), \
              patch.object(commands.Bot, "close", AsyncMock(side_effect=lambda: order.append("gateway"))):
             await bot.close()
             await bot.close()  # a second close does not repeat the teardown
         self.assertEqual(order, ["flush", "voice", "http", "mongo", "warp", "gateway", "gateway"])
 
     async def test_bot_close_survives_a_failing_step(self):
-        import main
+        import core.bot
         from discord.ext import commands
 
-        bot = main.DebtCollectorBot(MagicMock())
+        bot = core.bot.DebtCollectorBot(MagicMock())
         bot.settings.close = MagicMock(side_effect=RuntimeError("boom"))
-        with patch("main.ai_flush", AsyncMock(side_effect=RuntimeError("flush failed"))), \
-             patch.object(main.DebtCollectorBot, "_stop_warp", staticmethod(lambda: None)), \
+        with patch("core.bot.ai_flush", AsyncMock(side_effect=RuntimeError("flush failed"))), \
+             patch.object(core.bot.DebtCollectorBot, "_stop_warp", staticmethod(lambda: None)), \
              patch.object(commands.Bot, "close", AsyncMock()) as gateway_close:
             with self.assertLogs("debt-collector", level="WARNING"):
                 await bot.close()
         gateway_close.assert_awaited_once()
 
     async def test_leave_voice_unloads_music_and_disconnects(self):
-        import main
+        import core.bot
 
-        bot = main.DebtCollectorBot(MagicMock())
+        bot = core.bot.DebtCollectorBot(MagicMock())
         voice = MagicMock()
         voice.disconnect = AsyncMock()
         with patch.object(type(bot), "extensions", new={"cogs.music": object()}), \
@@ -284,7 +286,7 @@ class TestShutdown(unittest.IsolatedAsyncioTestCase):
 
 class TestDiagnose(unittest.TestCase):
     def test_embed_has_the_new_sections(self):
-        import main
+        import features.info as info
 
         bot = _fake_bot()
         bot.errors = MagicMock()
@@ -294,9 +296,11 @@ class TestDiagnose(unittest.TestCase):
         bot.get_cog = lambda name: None
         guild = MagicMock()
         guild.me.guild_permissions = discord.Permissions.all()
-        settings = main.copy.deepcopy(main.DEFAULT_SETTINGS)
+        from core.config import DEFAULT_SETTINGS
+
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
         settings["counting"]["channel_id"] = 123
-        embed = main.build_diagnose_embed(
+        embed = info.build_diagnose_embed(
             bot, guild, db_ok=True, db_ms=12.0, guild_settings=settings
         )
         names = [field.name for field in embed.fields]
@@ -313,7 +317,7 @@ class TestDiagnose(unittest.TestCase):
         self.assertIn("Attachment cache", memory)
 
     def test_database_down_is_red(self):
-        import main
+        import features.info as info
 
         bot = _fake_bot()
         bot.errors = MagicMock()
@@ -323,7 +327,7 @@ class TestDiagnose(unittest.TestCase):
         bot.get_cog = lambda name: None
         guild = MagicMock()
         guild.me.guild_permissions = discord.Permissions.none()
-        embed = main.build_diagnose_embed(bot, guild, db_ok=False, db_ms=5000.0)
+        embed = info.build_diagnose_embed(bot, guild, db_ok=False, db_ms=5000.0)
         self.assertEqual(embed.color, discord.Color.red())
         self.assertIn("database unreachable", embed.description.lower())
 
