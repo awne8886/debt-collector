@@ -170,7 +170,7 @@ class TestCloneCommandsCanRun(unittest.TestCase):
     def test_asyncio_is_not_shadowed_by_a_local_import(self):
         # A late `import asyncio` inside the function made the first
         # asyncio.to_thread call raise UnboundLocalError (rollback_clone always failed).
-        from main import clone_server, rollback_clone
+        from features.server_clone import clone_server, rollback_clone
 
         for command in (clone_server, rollback_clone):
             with self.subTest(command=command.name):
