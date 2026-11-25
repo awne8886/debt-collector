@@ -180,7 +180,7 @@ class TestCloneCommandsCanRun(unittest.TestCase):
 class TestCommandCategories(unittest.TestCase):
     def test_every_root_command_has_a_category(self):
         import main  # noqa: F401  # registers every command
-        from main import COMMAND_CATEGORY, _uncategorised_roots
+        from features.help import COMMAND_CATEGORY, _uncategorised_roots
 
         self.assertEqual(COMMAND_CATEGORY.get("clone_server"), "config")
         self.assertEqual(COMMAND_CATEGORY.get("rollback_clone"), "config")
