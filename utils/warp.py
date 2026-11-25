@@ -264,10 +264,18 @@ def _wireproxy_binary() -> str:
     override: str = os.getenv("WIREPROXY_PATH", "").strip()
     if override:
         return override
-    asset, digest = _WIREPROXY_ASSETS[_machine()]
     target: str = os.path.join(_state_dir(), f"wireproxy-{WIREPROXY_VERSION}")
     if os.path.isfile(target) and os.access(target, os.X_OK):
         return target
+    return download_wireproxy(target)
+
+
+def download_wireproxy(target: str, machine: Optional[str] = None) -> str:
+    """Download the pinned wireproxy release to ``target`` after checking its SHA-256.
+
+    Used at runtime and by scripts/fetch_wireproxy.py at build time.
+    """
+    asset, digest = _WIREPROXY_ASSETS[machine or _machine()]
     url: str = _WIREPROXY_URL.format(version=WIREPROXY_VERSION, asset=asset)
     with urllib.request.urlopen(url, timeout=60) as response:
         data: bytes = response.read()
