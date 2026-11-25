@@ -13,7 +13,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import aiohttp
-import sympy
 from word2number import w2n
 
 import discord
@@ -22,6 +21,8 @@ from discord.ext import commands, tasks
 from pymongo import MongoClient, UpdateOne
 from pymongo.collection import Collection
 from pymongo.errors import PyMongoError
+
+from utils.safe_math import safe_eval_int
 
 # --------------------------------------------------------------------------- #
 # Logging
@@ -686,19 +687,16 @@ class CountingSaveView(discord.ui.View):
 
 
 def _parse_counting_number(text: str):
+    """Parse a counting message: a plain number, a restricted calculator expression
+    (see utils.safe_math - no eval), or a spelled-out number. Never raises."""
     if not text or len(text) > 100:
         return None
     text = text.lower().strip()
     if text.isdigit():
         return int(text)
-    try:
-        expr = sympy.sympify(text)
-        if expr.is_real and expr.is_integer:
-            return int(expr)
-        elif expr.is_real and float(expr).is_integer():
-            return int(float(expr))
-    except Exception:
-        pass
+    value = safe_eval_int(text)
+    if value is not None:
+        return value
     try:
         val = w2n.word_to_num(text)
         if isinstance(val, (int, float)) and float(val).is_integer():
@@ -708,8 +706,13 @@ def _parse_counting_number(text: str):
     return None
 
 
+COUNTING_MAX_WORDS = 12
+
+
 def _extract_and_parse_number(content: str):
-    words = content.split()
+    # Only the first few words are tried, longest prefix first, so a long message
+    # costs a bounded amount of parsing.
+    words = (content or "").split()[:COUNTING_MAX_WORDS]
     for i in range(len(words), 0, -1):
         prefix = " ".join(words[:i]).rstrip(",.!?")
         parsed = _parse_counting_number(prefix)
