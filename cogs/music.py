@@ -10,6 +10,7 @@ import logging
 import os
 import shlex
 import sys
+import time
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Set, Union
 
 import discord
@@ -166,6 +167,7 @@ class GuildPlayer:
         self._quick_failures: int = 0  # consecutive tracks that died almost instantly
         self._lock: asyncio.Lock = asyncio.Lock()
         self._timer: Optional[asyncio.Task] = None
+        self.last_used: float = time.monotonic()  # for the bot's idle-state janitor
 
     # -- state ------------------------------------------------------------ #
 
@@ -526,7 +528,28 @@ class MusicCog(commands.Cog, name="Music"):
         if player is None:
             player = GuildPlayer(self, guild)
             self.players[guild.id] = player
+        player.last_used = time.monotonic()
         return player
+
+    async def prune_idle_players(self, idle_seconds: float) -> int:
+        """Drop players with no voice connection that nobody has used for a while.
+
+        A player normally goes away when the bot leaves voice; this catches ones left
+        behind by a connect that failed half-way. Players whose lock is held are kept.
+        """
+        now = time.monotonic()
+        stale = [
+            guild_id
+            for guild_id, player in self.players.items()
+            if player.voice is None
+            and not player._lock.locked()
+            and now - player.last_used > idle_seconds
+        ]
+        for guild_id in stale:
+            player = self.players.pop(guild_id, None)
+            if player is not None:
+                player.shutdown()
+        return len(stale)
 
     async def destroy_player(self, guild: discord.Guild, *, disconnect: bool) -> None:
         player = self.players.pop(guild.id, None)
