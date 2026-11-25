@@ -2,8 +2,7 @@ import discord
 from discord.ext import commands
 from typing import List, Optional, Union
 
-# Paginator.interaction_check needs main.is_superuser. utils/ must not import main
-# (that would be circular), so it is looked up at call time instead.
+from core.permissions import is_superuser
 
 EMBED_DESCRIPTION_LIMIT: int = 4000
 
@@ -54,18 +53,7 @@ class Paginator(discord.ui.View):
         self.counter.label = f"{self.index + 1}/{len(self.embeds)}"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # is_superuser lives in main.py; look it up at call time (no circular import).
-        # Run as `python main.py`, the module is "__main__" rather than "main".
-        import sys
-
-        is_superuser = None
-        for module_name in ("main", "__main__"):
-            module = sys.modules.get(module_name)
-            is_superuser = getattr(module, "is_superuser", None) if module else None
-            if is_superuser is not None:
-                break
-
-        is_su = is_superuser(interaction.user) if is_superuser else False
+        is_su = is_superuser(interaction.user)
 
         if interaction.user.id == self.author_id or is_su:
             return True

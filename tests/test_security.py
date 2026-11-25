@@ -135,8 +135,9 @@ class TestSuperuserIds(unittest.TestCase):
 
 
 class TestPaginatorSuperuserLookup(unittest.IsolatedAsyncioTestCase):
-    async def test_superuser_found_when_bot_runs_as_main_script(self):
-        from types import SimpleNamespace
+    async def test_superuser_passes_interaction_check(self):
+        # The superuser check comes from core.permissions. It used to be looked up in
+        # sys.modules["main"], which is "__main__" under `python main.py`.
         from unittest.mock import AsyncMock, MagicMock
 
         import discord
@@ -145,16 +146,24 @@ class TestPaginatorSuperuserLookup(unittest.IsolatedAsyncioTestCase):
 
         paginator = Paginator([discord.Embed(title="a"), discord.Embed(title="b")], author_id=1)
         interaction = MagicMock()
-        interaction.user.id = 99
         interaction.response.send_message = AsyncMock()
-        fake_main = SimpleNamespace(is_superuser=lambda user: user.id == 99)
-        modules = {k: v for k, v in sys.modules.items() if k != "main"}
-        modules["__main__"] = fake_main
-        with patch.dict(sys.modules, modules, clear=True):
+        with patch("core.permissions.SUPERUSER_IDS", frozenset({99})):
+            interaction.user.id = 99  # a superuser, not the author
             self.assertTrue(await paginator.interaction_check(interaction))
-        interaction.user.id = 100
-        with patch.dict(sys.modules, modules, clear=True):
+            interaction.user.id = 1  # the author
+            self.assertTrue(await paginator.interaction_check(interaction))
+            interaction.user.id = 100  # anyone else
             self.assertFalse(await paginator.interaction_check(interaction))
+        interaction.response.send_message.assert_awaited_once()
+
+    async def test_music_superuser_check_uses_core_permissions(self):
+        from unittest.mock import MagicMock
+
+        from cogs.music import _is_superuser
+
+        with patch("core.permissions.SUPERUSER_IDS", frozenset({99})):
+            self.assertTrue(_is_superuser(MagicMock(id=99)))
+            self.assertFalse(_is_superuser(MagicMock(id=100)))
 
 
 class TestCloneCommandsCanRun(unittest.TestCase):
