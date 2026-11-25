@@ -18,6 +18,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from core.permissions import is_superuser
 from utils.music import (
     InvalidQuery,
     LoopMode,
@@ -162,12 +163,8 @@ def _track_link(track: Track, limit: int = 60) -> str:
 
 
 def _is_superuser(user: discord.abc.User) -> bool:
-    """The bot's superuser check lives in main.py, which is `__main__` when run as a script."""
-    for module_name in ("__main__", "main"):
-        checker = getattr(sys.modules.get(module_name), "is_superuser", None)
-        if callable(checker):
-            return bool(checker(user))
-    return False
+    """The bot's superuser check (core.permissions)."""
+    return is_superuser(user)
 
 
 def _humans(channel: Optional[VoiceChannel]) -> List[discord.Member]:
