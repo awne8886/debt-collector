@@ -76,10 +76,10 @@ class TestAIRateLimitHandling(unittest.IsolatedAsyncioTestCase):
         mock_message.reply = AsyncMock()
 
         with patch_bot(MagicMock()) as mock_bot, \
-             patch("main.ai_config", return_value={"enabled": True, "channels": ["789"], "probability": 100.0, "cooldown": 0, "daily_limit": 0, "provider_order": ["openrouter"], "models": {}}), \
-             patch("main._get_ai_history", return_value=[{"role": "user", "author": "TestUser", "author_id": 456, "content": "hello bot"}]), \
-             patch("main._reply_target_is_bot", return_value=(False, None)), \
-             patch("main.ai_generate_reply", return_value=("Hello response", "openrouter")):
+             patch("features.ai.ai_config", return_value={"enabled": True, "channels": ["789"], "probability": 100.0, "cooldown": 0, "daily_limit": 0, "provider_order": ["openrouter"], "models": {}}), \
+             patch("features.ai._get_ai_history", return_value=[{"role": "user", "author": "TestUser", "author_id": 456, "content": "hello bot"}]), \
+             patch("features.ai._reply_target_is_bot", return_value=(False, None)), \
+             patch("features.ai.ai_generate_reply", return_value=("Hello response", "openrouter")):
 
             mock_bot.user = MagicMock()
             mock_bot.user.id = 999
@@ -91,7 +91,7 @@ class TestAIRateLimitHandling(unittest.IsolatedAsyncioTestCase):
             mock_bot.ai_locks = {}
             mock_bot.log_error = MagicMock()
 
-            from main import _handle_ai
+            from features.ai import _handle_ai
             await _handle_ai(mock_message)
 
             mock_bot.log_error.assert_called_with("ai:typing_ratelimit", unittest.mock.ANY)
@@ -128,10 +128,10 @@ class TestAITargeting(unittest.IsolatedAsyncioTestCase):
         mock_msg1.channel.typing.return_value = DummyTyping()
 
         with patch_bot(MagicMock()) as mock_bot, \
-             patch("main.ai_config", return_value={"enabled": True, "channels": ["789"], "probability": 100.0, "cooldown": 0, "daily_limit": 0, "provider_order": ["openrouter"], "models": {}}), \
-             patch("main._get_ai_history", return_value=[{"role": "user", "author": "User1", "author_id": 111, "content": "hello bot from user 1"}]), \
-             patch("main._reply_target_is_bot", return_value=(False, None)), \
-             patch("main.ai_generate_reply", return_value=("AI response to user 1", "openrouter")):
+             patch("features.ai.ai_config", return_value={"enabled": True, "channels": ["789"], "probability": 100.0, "cooldown": 0, "daily_limit": 0, "provider_order": ["openrouter"], "models": {}}), \
+             patch("features.ai._get_ai_history", return_value=[{"role": "user", "author": "User1", "author_id": 111, "content": "hello bot from user 1"}]), \
+             patch("features.ai._reply_target_is_bot", return_value=(False, None)), \
+             patch("features.ai.ai_generate_reply", return_value=("AI response to user 1", "openrouter")):
 
             mock_bot.user = MagicMock(id=999, display_name="BotName")
             mock_bot.user.mentioned_in.return_value = True
@@ -141,7 +141,7 @@ class TestAITargeting(unittest.IsolatedAsyncioTestCase):
             mock_bot.ai_locks = {}
             mock_bot.log_error = MagicMock()
 
-            from main import _handle_ai
+            from features.ai import _handle_ai
             await _handle_ai(mock_msg1)
 
             mock_msg1.reply.assert_called_once_with("AI response to user 1", mention_author=False, allowed_mentions=unittest.mock.ANY)
@@ -182,7 +182,7 @@ class TestConcurrentAIMessages(unittest.IsolatedAsyncioTestCase):
         mock_msg1.channel.typing.side_effect = lambda: DelayTyping()
         mock_msg2.channel.typing.side_effect = lambda: DelayTyping()
 
-        with patch_bot(MagicMock()) as mock_bot,              patch("main.ai_config", return_value={"enabled": True, "channels": ["789"], "probability": 100.0, "cooldown": 0, "daily_limit": 0, "provider_order": ["openrouter"], "models": {}}),              patch("main._get_ai_history", side_effect=lambda cid: mock_bot.ai_history_buffer.get(cid, [])),              patch("main._reply_target_is_bot", return_value=(False, None)),              patch("main.ai_generate_reply", side_effect=[("Reply 1", "openrouter"), ("Reply 2", "openrouter")]):
+        with patch_bot(MagicMock()) as mock_bot,              patch("features.ai.ai_config", return_value={"enabled": True, "channels": ["789"], "probability": 100.0, "cooldown": 0, "daily_limit": 0, "provider_order": ["openrouter"], "models": {}}),              patch("features.ai._get_ai_history", side_effect=lambda cid: mock_bot.ai_history_buffer.get(cid, [])),              patch("features.ai._reply_target_is_bot", return_value=(False, None)),              patch("features.ai.ai_generate_reply", side_effect=[("Reply 1", "openrouter"), ("Reply 2", "openrouter")]):
 
             mock_bot.user = MagicMock(id=999, display_name="BotName")
             mock_bot.user.mentioned_in.return_value = True
@@ -196,7 +196,7 @@ class TestConcurrentAIMessages(unittest.IsolatedAsyncioTestCase):
             mock_bot.ai_lru = {}
             mock_bot.ai_daily = {}
 
-            from main import _handle_ai
+            from features.ai import _handle_ai
             await asyncio.gather(_handle_ai(mock_msg1), _handle_ai(mock_msg2))
 
             mock_msg1.reply.assert_called_once_with("Reply 1", mention_author=False, allowed_mentions=unittest.mock.ANY)
@@ -398,7 +398,7 @@ class TestAIPersonasAndSpeakers(unittest.IsolatedAsyncioTestCase):
                 "content": text, "message_id": message_id}
 
     def test_combo_from_a_new_person_is_kept(self):
-        from main import _ai_remember
+        from features.ai import _ai_remember
 
         _ai_remember(1, self.entry("Alice", 11, "W", 101))
         _ai_remember(1, self.entry("Bob", 22, "W", 102))  # Bob joins the combo
@@ -407,7 +407,7 @@ class TestAIPersonasAndSpeakers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["author_id"] for e in history], [11, 22])
 
     def test_transcript_ends_with_the_trigger(self):
-        from main import _format_history
+        from features.ai import _format_history
 
         history = [
             self.entry("Alice", 11, "hi bot", 101),
@@ -424,7 +424,7 @@ class TestAIPersonasAndSpeakers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(messages), 3)
 
     def test_prompt_names_the_speaker_and_their_persona(self):
-        from main import _ai_names, build_system_prompt
+        from features.ai import _ai_names, build_system_prompt
 
         guild = MagicMock()
         guild.get_member.return_value = None  # members not cached
@@ -488,11 +488,11 @@ class TestAIPersonasAndSpeakers(unittest.IsolatedAsyncioTestCase):
         self.mock_bot.ai_repeat = {}
         self.mock_bot.ai_daily = {}
 
-        with patch("main.ai_config", return_value=config), \
-             patch("main._get_ai_history", side_effect=lambda cid: history), \
-             patch("main._reply_target_is_bot", return_value=(False, None)), \
-             patch("main.ai_generate_reply", side_effect=fake_generate):
-            from main import _handle_ai
+        with patch("features.ai.ai_config", return_value=config), \
+             patch("features.ai._get_ai_history", side_effect=lambda cid: history), \
+             patch("features.ai._reply_target_is_bot", return_value=(False, None)), \
+             patch("features.ai.ai_generate_reply", side_effect=fake_generate):
+            from features.ai import _handle_ai
             await _handle_ai(message)
 
         last = captured["messages"][-1]["content"]
