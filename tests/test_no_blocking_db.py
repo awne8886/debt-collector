@@ -153,7 +153,7 @@ class TestAutopurgeWritesExactPaths(unittest.IsolatedAsyncioTestCase):
     async def test_autopurge_on_writes_one_dotted_field(self):
         from unittest.mock import AsyncMock, MagicMock, patch
 
-        import main as autopurge
+        import features.autopurge as autopurge
 
         bot = MagicMock()
         bot.settings.fetch_settings = AsyncMock(
@@ -166,8 +166,8 @@ class TestAutopurgeWritesExactPaths(unittest.IsolatedAsyncioTestCase):
         ctx.guild.id = 1
         channel = MagicMock()
         channel.id = 55
-        with patch("main.bot", bot), \
-                patch("main.member_has_perms", return_value=True):
+        with patch("features.autopurge.bot", bot), \
+                patch("features.autopurge.member_has_perms", return_value=True):
             await autopurge.autopurge_on.callback(ctx, channel, None, None)
             await autopurge.autopurge_off.callback(ctx, channel)
         bot.settings.push_settings.assert_not_awaited()
