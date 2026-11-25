@@ -41,8 +41,11 @@ from utils.ytdl import (
     resolve_stream,
     stream_failed,
     resolve_tracks,
+    set_route_hooks,
+    start_warp_early,
     warm_up,
 )
+from utils import warp
 
 log = logging.getLogger("debt-collector.music")
 
@@ -67,6 +70,21 @@ except ValueError:
     MAX_TRACK_SECONDS = 3 * 3600
 
 VoiceChannel = Union[discord.VoiceChannel, discord.StageChannel]
+
+# Bot-meta keys (MultiTenantSettingsManager.get_meta / set_meta).
+WARP_HINT_KEY: str = "music:warp_needed"  # {"since": unix ts}: YouTube refused this host
+WARP_ACCOUNT_KEY: str = "music:warp_account"  # the WARP registration, private key included
+WARP_HINT_MAX_AGE: float = 7 * 86400.0
+
+
+def warp_hint_is_fresh(record: Any, now: float, max_age: float = WARP_HINT_MAX_AGE) -> bool:
+    """Whether a music:warp_needed record says this host needed WARP recently."""
+    if not isinstance(record, dict):
+        return False
+    since = record.get("since")
+    if isinstance(since, bool) or not isinstance(since, (int, float)):
+        return False
+    return 0 <= now - since < max_age
 
 
 class MusicError(Exception):
@@ -499,16 +517,66 @@ class MusicCog(commands.Cog, name="Music"):
             log.warning("ffmpeg not found - music commands will report that they can't play.")
         _check_davey()
         self._warm_up_task: Optional["asyncio.Task[Any]"] = None
+        self._warp_hint_saved: bool = False
+        # The bot's settings manager, for remembering WARP across restarts. utils/
+        # never imports main, so it gets plain callbacks instead.
+        meta: Any = getattr(bot, "settings", None)
+        self._meta: Any = (
+            meta if callable(getattr(meta, "get_meta", None)) and callable(getattr(meta, "set_meta", None)) else None
+        )
+        if self._meta is not None:
+            warp.set_account_store(self._load_warp_account, self._save_warp_account)
+            set_route_hooks(
+                warp_needed=self._remember_warp_needed,
+                direct_success=self._forget_warp_needed,
+            )
+
+    # -- WARP memory (all called from worker threads) ----------------------- #
+
+    def _load_warp_account(self) -> Optional[Dict[str, Any]]:
+        return self._meta.get_meta(WARP_ACCOUNT_KEY)
+
+    def _save_warp_account(self, account: Optional[Dict[str, Any]]) -> None:
+        self._meta.set_meta(WARP_ACCOUNT_KEY, account)
+
+    def _remember_warp_needed(self) -> None:
+        self._meta.set_meta(WARP_HINT_KEY, {"since": int(time.time())})
+        self._warp_hint_saved = True
+
+    def _forget_warp_needed(self) -> None:
+        if not self._warp_hint_saved:
+            return
+        self._meta.set_meta(WARP_HINT_KEY, None)
+        self._warp_hint_saved = False
+        log.info("YouTube answered this host directly; forgot that it needed WARP")
+
+    def boot_youtube(self, warm: bool) -> None:
+        """Before the first YouTube attempt: start WARP if this host needed it in the
+        last week (skips ~30 s of refused direct attempts), then warm up."""
+        if self._meta is not None and warp.mode() == "auto" and warp.available():
+            record: Any = self._meta.get_meta(WARP_HINT_KEY)
+            if record:
+                self._warp_hint_saved = True  # a direct success will clear it
+            if warp_hint_is_fresh(record, time.time()):
+                log.info("YouTube refused this host in the last 7 days; starting Cloudflare WARP first")
+                if not start_warp_early():
+                    log.warning("WARP didn't start early; trying YouTube directly as usual")
+        if warm:
+            warm_up()
 
     async def cog_load(self) -> None:
         # Find a YouTube client group that works from this host before anyone asks,
         # so the first /play doesn't wait through the failing ones.
-        if os.getenv("MUSIC_WARMUP", "1").strip().lower() not in ("0", "false", "off", "no"):
-            self._warm_up_task = asyncio.create_task(asyncio.to_thread(warm_up))
+        warm: bool = os.getenv("MUSIC_WARMUP", "1").strip().lower() not in ("0", "false", "off", "no")
+        if warm or self._meta is not None:
+            self._warm_up_task = asyncio.create_task(asyncio.to_thread(self.boot_youtube, warm))
 
     async def cog_unload(self) -> None:
         if self._warm_up_task is not None:
             self._warm_up_task.cancel()
+        if self._meta is not None:
+            set_route_hooks()
+            warp.set_account_store(None, None)
         for guild_id in list(self.players):
             guild = self.bot.get_guild(guild_id)
             if guild is not None:

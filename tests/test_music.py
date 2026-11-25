@@ -425,6 +425,7 @@ class TestClientRotation(unittest.TestCase):
     def setUp(self):
         ytdl._preferred = None
         ytdl._stream_cache.clear()
+        ytdl.set_route_hooks()
         FakeYoutubeDL.calls = []
         FakeYoutubeDL.behaviour = {}
         self.ydl_patch = patch("yt_dlp.YoutubeDL", FakeYoutubeDL)
@@ -546,6 +547,7 @@ class TestWarp(unittest.TestCase):
         warp._process = None
         warp._proxy = None
         warp._failed_at = 0.0
+        warp.set_account_store(None, None)
 
     def test_modes_and_availability(self):
         with patch.dict("os.environ", {}, clear=True):
@@ -679,6 +681,216 @@ class TestWarpFallback(unittest.TestCase):
             stream = ytdl.resolve_stream(make_track("song"))
         start.assert_called_once()
         self.assertEqual(stream.url, "https://audio.example/a")
+
+
+class TestWarpMemory(unittest.TestCase):
+    """Phase 4: remember that the host needs WARP, and reuse the WARP registration."""
+
+    REGISTRATION = {
+        "id": "dev", "token": "tok",
+        "config": {
+            "peers": [{"public_key": "PEERKEY=", "endpoint": {"v4": "162.159.192.8:0"}}],
+            "interface": {"addresses": {"v4": "172.16.0.2"}},
+        },
+    }
+    STORED = {
+        "private_key": "U0VDUkVULVBSSVZBVEUtS0VZLTEyMzQ1Njc4OTAxMjM0NTY=",
+        "peer_public_key": "PEERKEY=",
+        "address_v4": "172.16.0.9",
+        "address_v6": "",
+        "endpoint": "162.159.192.8:2408",
+    }
+
+    def setUp(self):
+        from utils import warp
+
+        self.warp = warp
+        warp._process = None
+        warp._proxy = None
+        warp._failed_at = 0.0
+        warp._account_source = "none"
+        warp.set_account_store(None, None)
+        ytdl.set_route_hooks()
+
+    tearDown = setUp
+
+    def test_hint_freshness(self):
+        from cogs.music import warp_hint_is_fresh
+
+        now = 1_000_000.0
+        self.assertTrue(warp_hint_is_fresh({"since": now - 3600}, now))
+        self.assertFalse(warp_hint_is_fresh({"since": now - 8 * 86400}, now))
+        self.assertFalse(warp_hint_is_fresh({"since": now + 60}, now))
+        for bad in (None, {}, {"since": "x"}, {"since": True}, "yes"):
+            self.assertFalse(warp_hint_is_fresh(bad, now))
+
+    def _cog(self, record):
+        from cogs.music import MusicCog
+
+        meta = MagicMock()
+        meta.get_meta.side_effect = lambda key: record if key == "music:warp_needed" else None
+        cog = MusicCog.__new__(MusicCog)
+        cog._meta = meta
+        cog._warp_hint_saved = False
+        return cog, meta
+
+    def test_fresh_hint_starts_warp_before_the_first_attempt(self):
+        import time as _time
+
+        order = []
+        cog, _ = self._cog({"since": _time.time() - 60})
+        with patch("cogs.music.warp.mode", return_value="auto"), \
+                patch("cogs.music.warp.available", return_value=True), \
+                patch("cogs.music.start_warp_early", side_effect=lambda: order.append("warp") or True), \
+                patch("cogs.music.warm_up", side_effect=lambda: order.append("warm")), \
+                self.assertLogs("debt-collector.music", "INFO"):
+            cog.boot_youtube(True)
+        self.assertEqual(order, ["warp", "warm"])
+
+    def test_stale_hint_or_other_modes_do_not_start_warp(self):
+        import time as _time
+
+        for record, mode, available in (
+            ({"since": _time.time() - 8 * 86400}, "auto", True),  # older than 7 days
+            ({"since": _time.time()}, "on", True),  # YTDL_WARP=on already handles it
+            ({"since": _time.time()}, "auto", False),  # off, YTDL_PROXY, or unsupported
+            (None, "auto", True),
+        ):
+            with self.subTest(record=record, mode=mode, available=available):
+                cog, _ = self._cog(record)
+                with patch("cogs.music.warp.mode", return_value=mode), \
+                        patch("cogs.music.warp.available", return_value=available), \
+                        patch("cogs.music.start_warp_early") as early, \
+                        patch("cogs.music.warm_up") as warm:
+                    cog.boot_youtube(True)
+                early.assert_not_called()
+                warm.assert_called_once()
+
+    def test_failed_early_start_falls_back_to_warm_up(self):
+        import time as _time
+
+        cog, _ = self._cog({"since": _time.time()})
+        with patch("cogs.music.warp.mode", return_value="auto"), \
+                patch("cogs.music.warp.available", return_value=True), \
+                patch("cogs.music.start_warp_early", return_value=False), \
+                patch("cogs.music.warm_up") as warm, \
+                self.assertLogs("debt-collector.music", "WARNING"):
+            cog.boot_youtube(True)
+        warm.assert_called_once()
+
+    def test_hint_saved_on_refusal_and_cleared_on_direct_success(self):
+        cog, meta = self._cog(None)
+        cog._remember_warp_needed()
+        key, value = meta.set_meta.call_args.args
+        self.assertEqual(key, "music:warp_needed")
+        self.assertIsInstance(value["since"], int)
+        with self.assertLogs("debt-collector.music", "INFO"):
+            cog._forget_warp_needed()
+        self.assertEqual(meta.set_meta.call_args.args, ("music:warp_needed", None))
+        meta.set_meta.reset_mock()
+        cog._forget_warp_needed()  # nothing saved: no database write
+        meta.set_meta.assert_not_called()
+
+    def test_rotation_calls_the_route_hooks(self):
+        import yt_dlp
+
+        events = []
+        ytdl.set_route_hooks(
+            warp_needed=lambda: events.append("warp_needed"),
+            direct_success=lambda: events.append("direct_ok"),
+        )
+        FakeYoutubeDL.calls = []
+        FakeYoutubeDL.behaviour = {
+            (ytdl._JSLESS_CLIENTS, False): "ERROR: [youtube] x: Sign in to confirm you're not a bot",
+            ((), True): dict(TestClientRotation.INFO),
+        }
+        with patch("yt_dlp.YoutubeDL", FakeYoutubeDL), \
+                patch("utils.ytdl._cookie_file", return_value="/tmp/cookies.txt"), \
+                patch("utils.ytdl._writable_cookie_file", side_effect=lambda p: p), \
+                patch.dict("os.environ", {}, clear=True), \
+                patch("utils.warp.available", return_value=True), \
+                patch("utils.warp.proxy_url", return_value=None), \
+                patch("utils.warp.ensure_started", return_value=None), \
+                self.assertLogs("debt-collector.music", "INFO"):
+            ytdl._preferred = None
+            ytdl._stream_cache.clear()
+            ytdl.resolve_stream(make_track("song"))
+        ytdl._preferred = None
+        ytdl._stream_cache.clear()
+        self.assertEqual(events, ["warp_needed", "direct_ok"])
+
+    def test_registration_is_restored_from_the_store(self):
+        import tempfile
+
+        saved = []
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", {"WARP_DIR": tmp}), \
+                patch("utils.warp._api") as api, \
+                self.assertLogs("debt-collector.music", "INFO") as logs:
+            self.warp.set_account_store(lambda: dict(self.STORED), saved.append)
+            account = self.warp._account()
+        api.assert_not_called()  # no new device registered
+        self.assertEqual(account, self.STORED)
+        self.assertEqual(saved, [])
+        self.assertEqual(self.warp._account_source, "store")
+        self.assertNotIn(self.STORED["private_key"], "\n".join(logs.output))
+
+    def test_new_registration_is_saved_without_logging_the_key(self):
+        import tempfile
+
+        saved = []
+
+        def fake_api(method, path, body, token=""):
+            return self.REGISTRATION if method == "POST" else {}
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", {"WARP_DIR": tmp}), \
+                patch("utils.warp._api", side_effect=fake_api), \
+                self.assertLogs("debt-collector.music", "DEBUG") as logs:
+            self.warp.set_account_store(lambda: None, saved.append)
+            account = self.warp._account()
+        self.assertEqual(saved, [account])
+        self.assertTrue(self.warp.valid_account(account))
+        self.assertNotIn(account["private_key"], "\n".join(logs.output))
+
+    def test_rejected_stored_registration_registers_again(self):
+        saved = []
+        self.warp.set_account_store(lambda: None, saved.append)
+
+        def start():
+            if start.calls == 0:
+                start.calls += 1
+                self.warp._account_source = "store"
+                raise self.warp.TunnelError("no traffic through the tunnel")
+            start.calls += 1
+            self.warp._account_source = "new"
+            return "http://127.0.0.1:9"
+
+        start.calls = 0
+        with patch("utils.warp.available", return_value=True), \
+                patch("utils.warp._start", side_effect=start), \
+                patch("utils.warp._forget_account", wraps=self.warp._forget_account) as forget, \
+                patch.dict("os.environ", {"WARP_DIR": __import__("tempfile").mkdtemp()}), \
+                self.assertLogs("debt-collector.music", "INFO"):
+            proxy = self.warp.ensure_started()
+        self.assertEqual(proxy, "http://127.0.0.1:9")
+        self.assertEqual(start.calls, 2)
+        forget.assert_called_once()
+        self.assertEqual(saved, [None])  # the stored registration was dropped
+        self.warp._proxy = None
+
+    def test_fresh_registration_failure_is_not_retried(self):
+        def start():
+            self.warp._account_source = "new"
+            raise self.warp.TunnelError("no traffic")
+
+        with patch("utils.warp.available", return_value=True), \
+                patch("utils.warp._start", side_effect=start) as started, \
+                self.assertLogs("debt-collector.music", "WARNING"):
+            self.assertIsNone(self.warp.ensure_started())
+        self.assertEqual(started.call_count, 1)
+
+    def test_status_never_exposes_the_proxy_or_key(self):
+        status = self.warp.status()
+        self.assertEqual(set(status), {"mode", "available", "running", "last_failure_s_ago"})
 
 
 # --------------------------------------------------------------------------- #

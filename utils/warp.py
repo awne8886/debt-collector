@@ -4,7 +4,10 @@ YouTube refuses requests from many datacenter IPs (Render's included) with HTTP 
 WARP is Cloudflare's free WireGuard VPN. This module:
 
 1. registers a free WARP device with Cloudflare (a fresh WireGuard key pair, made with
-   PyNaCl), and keeps the registration for the life of the instance;
+   PyNaCl), and keeps the registration in the state folder; with an account store
+   (set_account_store, which the music cog points at the database) it survives
+   redeploys too, so a new device is only registered when none is stored or
+   Cloudflare stops accepting the stored one;
 2. downloads `wireproxy` (a pinned release, checked against its SHA-256), a userspace
    WireGuard client that needs no root and exposes the tunnel as an HTTP proxy;
 3. starts it on 127.0.0.1 and checks through Cloudflare's trace page that traffic
@@ -34,7 +37,7 @@ import tempfile
 import threading
 import time
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 log = logging.getLogger("debt-collector.music")
 
@@ -70,6 +73,36 @@ _failed_at: float = 0.0
 
 class WarpError(Exception):
     pass
+
+
+class TunnelError(WarpError):
+    """wireproxy ran, but no traffic got through WARP (e.g. a rejected registration)."""
+
+
+_ACCOUNT_FIELDS = ("private_key", "peer_public_key", "address_v4", "endpoint")
+_account_loader: Optional[Callable[[], Optional[Dict[str, Any]]]] = None
+_account_saver: Optional[Callable[[Optional[Dict[str, Any]]], None]] = None
+_account_source: str = "none"  # "file", "store" or "new": where the last one came from
+
+
+def set_account_store(
+    load: Optional[Callable[[], Optional[Dict[str, Any]]]],
+    save: Optional[Callable[[Optional[Dict[str, Any]]], None]],
+) -> None:
+    """Keep the WARP registration somewhere durable (Render's disk is not).
+
+    ``load()`` returns a saved registration or None; ``save(account)`` stores one, and
+    ``save(None)`` forgets it. Both are called from worker threads and may block.
+    The registration includes the WireGuard private key: it is never logged.
+    """
+    global _account_loader, _account_saver
+    _account_loader, _account_saver = load, save
+
+
+def valid_account(value: Any) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(value.get(field), str) and value.get(field) for field in _ACCOUNT_FIELDS
+    )
 
 
 def mode() -> str:
@@ -127,7 +160,17 @@ def ensure_started() -> Optional[str]:
         try:
             started: float = time.monotonic()
             log.info("Starting Cloudflare WARP for YouTube traffic")
-            proxy: str = _start()
+            try:
+                proxy: str = _start()
+            except TunnelError as exc:
+                if _account_source == "new":
+                    raise
+                # A reused registration that no longer carries traffic: Cloudflare
+                # has probably dropped it. Register a new device once and retry.
+                log.warning("The saved WARP registration doesn't work (%s); registering a new one", exc)
+                _stop_locked()
+                _forget_account()
+                proxy = _start()
             _proxy = proxy
             _failed_at = 0.0
             log.info("WARP is up in %.1fs; YouTube traffic now goes through it", time.monotonic() - started)
@@ -209,10 +252,10 @@ def _start() -> str:
             break
         except Exception as exc:
             if attempt == 2:
-                raise WarpError(f"no traffic through the tunnel ({exc}); {_tail(log_path)}")
+                raise TunnelError(f"no traffic through the tunnel ({exc}); {_tail(log_path)}")
             time.sleep(2)
     if trace.get("warp") not in ("on", "plus"):
-        raise WarpError(f"traffic isn't going through WARP (warp={trace.get('warp')})")
+        raise TunnelError(f"traffic isn't going through WARP (warp={trace.get('warp')})")
     log.info("WARP exit: ip %s, Cloudflare location %s", trace.get("ip"), trace.get("colo"))
     return proxy
 
@@ -248,17 +291,72 @@ def _wireproxy_binary() -> str:
     return target
 
 
+def _account_path() -> str:
+    return os.path.join(_state_dir(), "account.json")
+
+
+def _forget_account() -> None:
+    """Drop the local and stored registration so the next start registers again."""
+    try:
+        os.remove(_account_path())
+    except OSError:
+        pass
+    if _account_saver is not None:
+        try:
+            _account_saver(None)
+        except Exception as exc:
+            log.warning("Couldn't clear the saved WARP registration: %s", type(exc).__name__)
+
+
+def _load_stored_account() -> Optional[Dict[str, Any]]:
+    if _account_loader is None:
+        return None
+    try:
+        stored = _account_loader()
+    except Exception as exc:
+        log.warning("Couldn't read the saved WARP registration: %s", type(exc).__name__)
+        return None
+    return dict(stored) if valid_account(stored) else None
+
+
+def _save_account(account: Dict[str, Any]) -> None:
+    if _account_saver is None:
+        return
+    try:
+        _account_saver(dict(account))
+    except Exception as exc:
+        log.warning("Couldn't save the WARP registration: %s", type(exc).__name__)
+
+
 def _account() -> Dict[str, Any]:
-    """The WARP registration (made once per instance and kept in the state folder)."""
-    path: str = os.path.join(_state_dir(), "account.json")
+    """The WARP registration: from the state folder, else the account store, else new."""
+    global _account_source
+    path: str = _account_path()
     try:
         with open(path) as handle:
             saved: Dict[str, Any] = json.load(handle)
-        if saved.get("private_key") and saved.get("peer_public_key"):
+        if valid_account(saved):
+            _account_source = "file"
             return saved
     except (OSError, ValueError):
         pass
 
+    stored: Optional[Dict[str, Any]] = _load_stored_account()
+    if stored is not None:
+        _write_private(path, json.dumps(stored))
+        _account_source = "store"
+        log.info("Reusing the saved Cloudflare WARP registration")
+        return stored
+
+    account: Dict[str, Any] = _register()
+    _write_private(path, json.dumps(account))
+    _save_account(account)
+    _account_source = "new"
+    return account
+
+
+def _register() -> Dict[str, Any]:
+    """Register a new free WARP device with Cloudflare."""
     from nacl.public import PrivateKey
 
     private = PrivateKey.generate()
@@ -301,7 +399,6 @@ def _account() -> Dict[str, Any]:
     }
     if not account["endpoint"]:
         raise WarpError("Cloudflare didn't return a WARP endpoint")
-    _write_private(path, json.dumps(account))
     log.info("Registered a free Cloudflare WARP device")
     return account
 
