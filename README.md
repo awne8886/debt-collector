@@ -80,14 +80,14 @@ Slash commands sync automatically whenever the command set changes (set `SYNC_CO
 | Variable | Meaning |
 | --- | --- |
 | `DISCORD_TOKEN` | Your bot token |
-| `MONGO_URI` | MongoDB connection string |
+| `MONGO_URI` | MongoDB connection string. Client defaults: `timeoutMS=8000`, `connectTimeoutMS=5000`, `serverSelectionTimeoutMS=5000`; options written in the URI win |
 
 ### Optional
 
 | Variable | Meaning |
 | --- | --- |
 | `DEFAULT_PREFIX` | Fallback prefix used in DMs and when a server's stored prefix is missing. New servers are saved with `!` (change it per server with the prefix command) |
-| `SUPERUSER_IDS` | Comma-separated Discord user IDs with bot-owner powers (see all servers' errors, clear the error buffer) |
+| `SUPERUSER_IDS` | Comma/space separated user IDs that bypass every permission check, rate limit and owner check in every server (and see all servers' errors). When set, exactly these IDs are used; when unset a built-in list applies |
 | `SYNC_COMMANDS` | Set to `1` to force a slash-command sync on start (otherwise it only syncs when commands change) |
 | `MONGO_DB_NAME`, `MONGO_SETTINGS_COLLECTION`, `MONGO_AI_COLLECTION` | Override database / collection names |
 | `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY` | AI providers; any subset works, the rest are skipped |
@@ -96,7 +96,10 @@ Slash commands sync automatically whenever the command set changes (set `SYNC_CO
 | `ERROR_BUFFER_SIZE` | How many distinct errors `/errors` remembers |
 | `ERROR_PERSIST` | Also store errors in MongoDB |
 | `AFK_GRACE_SECONDS` | Grace period before a message cancels AFK |
-| `PORT` | Port for the keep-alive web server (set automatically by Render) |
+| `PORT` | Starts the keep-alive / health HTTP server on this port (Render sets it); see [Health checks](#health-checks-and-diagnostics) |
+| `ATTACHMENT_CACHE_MB` | Memory budget for the message-log attachment cache (default `24`) |
+| `ATTACHMENT_CACHE_TTL_S` | Seconds a cached attachment is kept (default `21600`) |
+| `MEMORY_LIMIT_MB` | Instance memory limit `/diagnose` compares against (`512` on Render) |
 
 ### Music
 
@@ -110,8 +113,8 @@ Slash commands sync automatically whenever the command set changes (set `SYNC_CO
 | `YTDL_CACHE_DIR` | temp folder | Where yt-dlp caches YouTube's player code between plays |
 | `YTDL_WARP` | `auto` | Cloudflare WARP for YouTube: `auto` when YouTube blocks the host's IP, `on` always, `off` never (see below) |
 | `WARP_IPV6` | off | `1` also sends IPv6 through WARP. Off by default: YouTube treats WARP's IPv6 exits as region-locked and bot-checks them more |
-| `WARP_DIR` | temp folder | Where the WARP registration and the `wireproxy` binary are kept |
-| `WIREPROXY_PATH` | download | Use this `wireproxy` binary instead of downloading the pinned release |
+| `WARP_DIR` | temp folder | Where the WARP registration and the `wireproxy` binary are kept on disk |
+| `WIREPROXY_PATH` | download | Use this `wireproxy` binary instead of downloading the pinned release (see `scripts/fetch_wireproxy.py`) |
 | `MUSIC_WARMUP` | `on` | `off` skips the YouTube check the bot runs once at startup |
 | `PREVIEW_RUN_BOT` | unset | `1` lets a Render pull-request preview log in to Discord (see below) |
 | `FFMPEG_PATH` | auto | Path to an ffmpeg binary |
@@ -149,7 +152,7 @@ Play YouTube and YouTube Music in a voice channel. The bot joins the channel you
 * **Bot permissions:** *Connect* and *Speak* in the voice channels it should use (and it must not be server-muted).
 * **PyNaCl**, **davey** (voice end-to-end encryption) and **yt-dlp** come from `requirements.txt`. `davey` is pinned below 0.2: with 0.2 and discord.py 2.7.1 the bot shows as speaking but nobody hears it. The bot logs a warning at startup if that combination comes back, and logs `DAVE ... ready=` for each track it plays.
 * **ffmpeg** is used from `FFMPEG_PATH`, then `PATH`, then the static build bundled by `imageio-ffmpeg`, so a plain `pip install -r requirements.txt` is enough.
-* **A JavaScript runtime** (`deno`, `node` or `bun`): current yt-dlp needs one to read YouTube. The bot also looks in `/opt/render/project/.deno/bin`, `~/.deno/bin` and `~/.bun/bin` and adds them to `PATH` itself, so a Deno installed during a Render build is found even though Render doesn't put it on `PATH`.
+* **A JavaScript runtime** (`deno`, `node` or `bun`): current yt-dlp needs one to read YouTube. `requirements.txt` installs deno through `yt-dlp[deno]`, so nothing extra is needed. The bot also looks in `/opt/render/project/.deno/bin`, `~/.deno/bin` and `~/.bun/bin` and adds them to `PATH` itself, so a Deno installed during a Render build is found even though Render doesn't put it on `PATH`.
 * **libopus** is optional. Without it the bot falls back to ffmpeg's Opus output and a volume change restarts the current track from where it was.
 * **YouTube bot checks:** many datacenter IPs get *"Sign in to confirm you're not a bot"*. YouTube decides this by the host's IP address, so a fix needs one of the options under [Getting past YouTube's bot check](#getting-past-youtubes-bot-check).
 * Keep `yt-dlp` current (`pip install -U yt-dlp`); YouTube changes break old versions.
@@ -229,7 +232,23 @@ VPN, by itself:
    that traffic really leaves through WARP.
 
 yt-dlp and ffmpeg then both use the tunnel, so the audio comes from the same IP as the
-lookup. The log shows `WARP is up` with the exit location. Nothing needs configuring; set
+lookup. The log shows `WARP is up` with the exit location.
+
+The bot remembers both decisions in the database, so a redeploy is fast:
+
+* `music:warp_needed`: when YouTube refuses the host, the time is saved. For 7 days after
+  that, with `YTDL_WARP=auto`, the bot starts WARP at boot before its first YouTube
+  request instead of spending ~30 s on refused direct attempts. A later successful direct
+  request clears it.
+* `music:warp_account`: the WARP registration (including its WireGuard private key, so
+  treat the database as sensitive). It is reused on every boot; a new device is only
+  registered when none is stored or Cloudflare stops accepting the stored one.
+
+`python scripts/fetch_wireproxy.py` downloads the pinned `wireproxy` into `./bin/` at
+build time (checking its SHA-256); set `WIREPROXY_PATH` to the printed path to skip the
+10 MB download at every boot.
+
+Nothing needs configuring; set
 `YTDL_WARP=off` to disable it, or `on` to use it from the start. `YTDL_PROXY` always takes
 precedence. YouTube blocks some WARP addresses too; if it does, a residential proxy
 (below) is the next step.
@@ -279,6 +298,47 @@ commands need to be grouped.
 
 ---
 
+## 🛠️ Operations
+
+### Health checks and diagnostics
+
+With `PORT` set the bot serves:
+
+* `GET /` (and `HEAD /`): always `200 OK`. Point keep-alive pingers (UptimeRobot,
+  Pulsetic) here.
+* `GET /health`: JSON `{status, ready, latency_ms, guilds, uptime_s, rss_mb, ...}` plus
+  peak memory, event-loop lag, cache and buffer sizes, task counts and the deployed
+  commit. It returns `200` while the Discord gateway is ready with a finite latency, and
+  during the first 3 minutes after start (previews included); otherwise, and while
+  shutting down, `503`. It never touches the database. Point alerting monitors here and
+  alert on non-200.
+
+Requests are not written to the access log. Every 30 minutes the bot logs one
+`Memory: rss_mb=... guilds=... settings_cache=... attachment_cache_bytes=...` line.
+
+`/diagnose` (administrators) shows the same numbers and more: gateway latency and
+uptime, database ping and cache hit rate, memory against the instance limit, event-loop
+lag over the last 5 minutes (high values mean something blocked the bot), Python and
+library versions, voice connections and the YouTube/WARP route, the state of every
+background loop, the features enabled in the server and any missing permissions.
+
+### Clean shutdown
+
+On `SIGTERM` (Render sends it on every deploy and restart) or `SIGINT` the bot logs
+`Shutting down (SIGTERM)`, stops reconnecting, and within 20 seconds: saves the AI
+conversation buffer, leaves voice channels, closes its HTTP session and the MongoDB
+client, stops Cloudflare WARP, and closes the gateway connection.
+
+### Counting
+
+Counting messages may be a plain number, a spelled-out number (`twenty two`) or a small
+calculation. The calculator is restricted on purpose (nothing is evaluated as Python):
+numbers (including `1e2` and `0x10`), `+ - * / // %`, `**` or `^` for powers, brackets,
+and `sqrt(x)` / `abs(x)`. Exponents go up to 64, every intermediate value must stay
+within ±10^15, and only the first 12 words of a message are looked at. Saves
+(`/counting set_saves`) are counted per member, per server, per day, and the "Save
+Streak" button keeps working after a restart.
+
 ## ☁️ Deploying on Render
 
 1. Create a **Web Service** (or Background Worker) from this repo, runtime **Python 3**.
@@ -317,10 +377,12 @@ debt-collector/
 ## 🧪 Tests
 
 ```bash
-python -m unittest tests.test_music
+MONGO_URI="mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200" python -m pytest -q
 ```
 
-`tests/test_main.py` imports `main.py`, so it needs `MONGO_URI` set to run.
+The Mongo client connects lazily, so no database is needed. CI runs the same suite and
+`ruff check --select F,E9,B,S102,S307,ASYNC .` on every push and pull request. The music
+tests alone: `python -m unittest tests.test_music`.
 
 ---
 
