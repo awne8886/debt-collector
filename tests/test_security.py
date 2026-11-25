@@ -168,5 +168,14 @@ class TestCloneCommandsCanRun(unittest.TestCase):
                 self.assertNotIn("asyncio", command.callback.__code__.co_varnames)
 
 
+class TestCommandCategories(unittest.TestCase):
+    def test_every_root_command_has_a_category(self):
+        import main
+
+        self.assertEqual(main.COMMAND_CATEGORY.get("clone_server"), "config")
+        self.assertEqual(main.COMMAND_CATEGORY.get("rollback_clone"), "config")
+        self.assertEqual(main._uncategorised_roots(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3713,6 +3713,8 @@ COMMAND_CATEGORY: Dict[str, str] = {
     "remind": "config",
     "export": "config",
     "import": "config",
+    "clone_server": "config",
+    "rollback_clone": "config",
     "errors": "config",
     "diagnose": "config",
     "screening": "config",
