@@ -2,10 +2,8 @@ import discord
 from discord.ext import commands
 from typing import List, Optional, Union
 
-# This import assumes we need is_superuser for interaction_check
-# But to avoid circular imports we can either import it inside the method or inject it.
-# We will import it locally or from main if needed. Since utils is separate, let's see where is_superuser comes from.
-# In bot.py and main.py, it's defined at the top. Let's just import it locally inside the method to avoid circular imports.
+# Paginator.interaction_check needs main.is_superuser. utils/ must not import main
+# (that would be circular), so it is looked up at call time instead.
 
 EMBED_DESCRIPTION_LIMIT: int = 4000
 
@@ -56,15 +54,16 @@ class Paginator(discord.ui.View):
         self.counter.label = f"{self.index + 1}/{len(self.embeds)}"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Avoid circular imports by importing is_superuser here
-        # is_superuser is in bot.py / main.py
+        # is_superuser lives in main.py; look it up at call time (no circular import).
+        # Run as `python main.py`, the module is "__main__" rather than "main".
         import sys
 
         is_superuser = None
-        if "main" in sys.modules:
-            is_superuser = getattr(sys.modules["main"], "is_superuser", None)
-        if is_superuser is None and "bot" in sys.modules:
-            is_superuser = getattr(sys.modules["bot"], "is_superuser", None)
+        for module_name in ("main", "__main__"):
+            module = sys.modules.get(module_name)
+            is_superuser = getattr(module, "is_superuser", None) if module else None
+            if is_superuser is not None:
+                break
 
         is_su = is_superuser(interaction.user) if is_superuser else False
 

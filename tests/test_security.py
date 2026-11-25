@@ -134,5 +134,28 @@ class TestSuperuserIds(unittest.TestCase):
             self.assertEqual(resolve_superuser_ids("abc"), DEFAULT_SUPERUSER_IDS)
 
 
+class TestPaginatorSuperuserLookup(unittest.IsolatedAsyncioTestCase):
+    async def test_superuser_found_when_bot_runs_as_main_script(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        import discord
+
+        from utils.pagination import Paginator
+
+        paginator = Paginator([discord.Embed(title="a"), discord.Embed(title="b")], author_id=1)
+        interaction = MagicMock()
+        interaction.user.id = 99
+        interaction.response.send_message = AsyncMock()
+        fake_main = SimpleNamespace(is_superuser=lambda user: user.id == 99)
+        modules = {k: v for k, v in sys.modules.items() if k != "main"}
+        modules["__main__"] = fake_main
+        with patch.dict(sys.modules, modules, clear=True):
+            self.assertTrue(await paginator.interaction_check(interaction))
+        interaction.user.id = 100
+        with patch.dict(sys.modules, modules, clear=True):
+            self.assertFalse(await paginator.interaction_check(interaction))
+
+
 if __name__ == "__main__":
     unittest.main()

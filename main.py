@@ -2972,7 +2972,7 @@ async def reaction_cmd(ctx: commands.Context, link: str, emoji: str):
 
 
 # --------------------------------------------------------------------------- #
-# MODERATION & UTILITY (Migrated from bot.py)
+# MODERATION & UTILITY
 # --------------------------------------------------------------------------- #
 
 
