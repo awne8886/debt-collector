@@ -4,9 +4,11 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
+import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -23,6 +25,13 @@ from pymongo.collection import Collection
 from pymongo.errors import PyMongoError
 
 from utils.attachment_cache import AttachmentCache
+from utils.runtime_stats import (
+    LoopLagMonitor,
+    peak_rss_bytes,
+    rss_bytes,
+    thread_count,
+    to_mb,
+)
 from utils.safe_math import safe_eval_int
 
 # --------------------------------------------------------------------------- #
@@ -1051,6 +1060,10 @@ class MultiTenantSettingsManager:
             log.warning("Database ping failed: %s", exc)
             return False
 
+    def close(self) -> None:
+        """Close the Mongo client (blocking; call from a thread)."""
+        self._client.close()
+
     def cache_stats(self) -> Dict[str, int]:
         return {
             "entries": len(self._cache),
@@ -1118,6 +1131,158 @@ async def ai_flush_loop() -> None:
 @ai_flush_loop.before_loop
 async def before_ai_flush_loop() -> None:
     await bot.wait_until_ready()
+
+
+# --------------------------------------------------------------------------- #
+# Clean shutdown (SIGTERM from Render on every deploy / restart)
+# --------------------------------------------------------------------------- #
+
+SHUTDOWN_TIMEOUT_S: float = 20.0  # Render waits 30 s after SIGTERM before SIGKILL
+
+
+class ShutdownState:
+    """Process-wide "we are shutting down" flag, with an event to wait on."""
+
+    def __init__(self) -> None:
+        self.requested: bool = False
+        self.reason: Optional[str] = None
+        self.task: Optional["asyncio.Task[None]"] = None
+        self._event: Optional[asyncio.Event] = None
+
+    def _get_event(self) -> asyncio.Event:
+        if self._event is None:
+            self._event = asyncio.Event()
+            if self.requested:
+                self._event.set()
+        return self._event
+
+    def request(self, reason: str) -> bool:
+        """Set the flag. Returns False if a shutdown was already requested."""
+        if self.requested:
+            return False
+        self.requested = True
+        self.reason = reason
+        if self._event is not None:
+            self._event.set()
+        return True
+
+    async def wait(self, timeout: Optional[float] = None) -> bool:
+        """Wait until shutdown is requested (or ``timeout``). Returns the flag."""
+        if self.requested:
+            return True
+        try:
+            await asyncio.wait_for(self._get_event().wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        return self.requested
+
+    def reset(self) -> None:  # tests only
+        self.__init__()
+
+
+SHUTDOWN: ShutdownState = ShutdownState()
+
+
+async def _close_within(
+    close: Callable[[], Any], timeout: float = SHUTDOWN_TIMEOUT_S
+) -> None:
+    try:
+        await asyncio.wait_for(close(), timeout)
+    except asyncio.TimeoutError:
+        log.warning("Shutdown took longer than %.0fs; exiting anyway.", timeout)
+    except Exception:
+        log.exception("Shutdown failed part-way; exiting anyway.")
+
+
+def handle_shutdown_signal(
+    signal_name: str, close: Callable[[], Any]
+) -> Optional["asyncio.Task[None]"]:
+    """Signal handler body: set the flag once and schedule ``close()`` (time-boxed)."""
+    if not SHUTDOWN.request(signal_name):
+        return None
+    log.info("Shutting down (%s).", signal_name)
+    SHUTDOWN.task = asyncio.get_running_loop().create_task(
+        _close_within(close), name="shutdown"
+    )
+    return SHUTDOWN.task
+
+
+def install_signal_handlers(
+    loop: asyncio.AbstractEventLoop, close: Callable[[], Any]
+) -> List[str]:
+    """Route SIGTERM/SIGINT to handle_shutdown_signal where the platform allows it."""
+    installed: List[str] = []
+    for name in ("SIGTERM", "SIGINT"):
+        sig: Any = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, handle_shutdown_signal, name, close)
+        except (NotImplementedError, RuntimeError, ValueError, AttributeError):
+            continue  # e.g. Windows, or not in the main thread
+        installed.append(name)
+    return installed
+
+
+async def supervise(
+    start: Callable[[], Any],
+    *,
+    is_closed: Callable[[], bool] = lambda: False,
+    base_backoff: float = 15.0,
+    max_backoff: float = 300.0,
+) -> str:
+    """Run ``start()`` and reconnect with backoff, unless a shutdown was requested.
+
+    Returns why it stopped: "clean", "shutdown" or "closed".
+    """
+    backoff: float = base_backoff
+    while not SHUTDOWN.requested:
+        attempt_started: float = time.monotonic()
+        try:
+            await start()
+            if SHUTDOWN.requested:
+                break
+            log.info("Gateway session closed cleanly - exiting supervisor.")
+            return "clean"
+        except (discord.LoginFailure, discord.PrivilegedIntentsRequired) as exc:
+            log.critical("Unrecoverable startup failure: %s", exc)
+            raise SystemExit(1) from exc
+        except discord.HTTPException as exc:
+            if exc.status == 429:
+                log.warning("Rate limited (HTTP 429) during startup: %s", exc)
+            else:
+                log.warning(
+                    "HTTP error during startup (status %s): %s", exc.status, exc
+                )
+        except (
+            discord.ConnectionClosed,
+            discord.GatewayNotFound,
+            aiohttp.ClientError,
+            OSError,
+        ) as exc:
+            log.warning("Transport failure: %s", exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Unexpected supervisor failure.")
+
+        if SHUTDOWN.requested:
+            break
+        if is_closed():
+            # discord.py closed the client itself; it can't log in again in-process.
+            log.warning("Client was closed - exiting so the host restarts the process.")
+            return "closed"
+
+        if time.monotonic() - attempt_started > 600:
+            backoff = base_backoff  # A long-lived session earns a fresh budget.
+
+        delay: float = backoff + random.uniform(0.0, 5.0)
+        log.info("Reconnecting in %.1fs.", delay)
+        if await SHUTDOWN.wait(delay):
+            break
+        backoff = min(backoff * 2, max_backoff)
+    log.info("Shutdown requested - not reconnecting.")
+    return "shutdown"
 
 
 # --------------------------------------------------------------------------- #
@@ -1257,6 +1422,73 @@ async def before_state_janitor_loop() -> None:
     await bot.wait_until_ready()
 
 
+# --------------------------------------------------------------------------- #
+# Runtime stats - one source for the memory log, /diagnose and /health
+# --------------------------------------------------------------------------- #
+
+
+def collect_runtime_stats(target: Any) -> Dict[str, Any]:
+    """Process and in-memory state numbers. Never touches the database or network."""
+    rss = rss_bytes()
+    stats: Dict[str, Any] = {
+        "rss_mb": to_mb(rss),
+        "peak_rss_mb": to_mb(peak_rss_bytes()),
+        "guilds": len(getattr(target, "guilds", None) or []),
+        "threads": thread_count(),
+    }
+    settings = getattr(target, "settings", None)
+    try:
+        stats["settings_cache_entries"] = int(settings.cache_stats()["entries"])
+    except Exception:
+        stats["settings_cache_entries"] = None
+    cache = getattr(target, "attachment_cache", None)
+    try:
+        stats["attachment_cache"] = cache.stats()
+    except Exception:
+        stats["attachment_cache"] = None
+    buffers: Dict[int, List[Any]] = getattr(target, "ai_history_buffer", None) or {}
+    pending: Dict[int, List[Any]] = getattr(target, "ai_pending", None) or {}
+    stats["ai_buffer_channels"] = len(buffers)
+    stats["ai_buffer_messages"] = sum(len(v) for v in buffers.values())
+    stats["ai_pending_messages"] = sum(len(v) for v in pending.values())
+    stats["snipes"] = len(getattr(target, "snipes", None) or {})
+    stats["background_tasks"] = len(getattr(target, "_background_tasks", None) or ())
+    try:
+        stats["asyncio_tasks"] = len(asyncio.all_tasks())
+    except RuntimeError:
+        stats["asyncio_tasks"] = None
+    stats["voice_clients"] = len(getattr(target, "voice_clients", None) or [])
+    lag = getattr(target, "loop_lag", None)
+    stats["loop_lag"] = lag.stats() if isinstance(lag, LoopLagMonitor) else None
+    return stats
+
+
+def _format_memory_line(stats: Dict[str, Any]) -> str:
+    cache = stats.get("attachment_cache") or {}
+    return (
+        f"rss_mb={stats.get('rss_mb')} peak_rss_mb={stats.get('peak_rss_mb')} "
+        f"guilds={stats.get('guilds')} "
+        f"settings_cache={stats.get('settings_cache_entries')} "
+        f"attachment_cache_bytes={cache.get('bytes', 0)} "
+        f"attachment_cache_entries={cache.get('entries', 0)} "
+        f"ai_buffer_channels={stats.get('ai_buffer_channels')} "
+        f"ai_buffer_messages={stats.get('ai_buffer_messages')} "
+        f"ai_pending={stats.get('ai_pending_messages')} "
+        f"snipes={stats.get('snipes')} threads={stats.get('threads')} "
+        f"tasks={stats.get('asyncio_tasks')}"
+    )
+
+
+@tasks.loop(minutes=30)
+async def memory_report_loop() -> None:
+    log.info("Memory: %s", _format_memory_line(collect_runtime_stats(bot)))
+
+
+@memory_report_loop.before_loop
+async def before_memory_report_loop() -> None:
+    await bot.wait_until_ready()
+
+
 class DebtCollectorBot(commands.Bot):
     def __init__(self, settings_manager: MultiTenantSettingsManager) -> None:
         intents: discord.Intents = discord.Intents.default()
@@ -1304,6 +1536,8 @@ class DebtCollectorBot(commands.Bot):
         # after a delete. Byte-budgeted LRU (ATTACHMENT_CACHE_MB / _TTL_S).
         self.attachment_cache: AttachmentCache = AttachmentCache()
         self.attachment_semaphore: asyncio.Semaphore = asyncio.Semaphore(2)
+        self.loop_lag: LoopLagMonitor = LoopLagMonitor()
+        self._closing_started: bool = False
 
     def spawn(self, coro: Any, *, name: Optional[str] = None) -> Any:
         """Fire-and-forget with a hard reference and a terminal error sink."""
@@ -1359,9 +1593,11 @@ class DebtCollectorBot(commands.Bot):
             tempban_loop,
             personal_reminder_loop,
             state_janitor_loop,
+            memory_report_loop,
         ):
             if not loop_task.is_running():
                 loop_task.start()
+        self.loop_lag.start()
 
     async def _sync_commands_if_changed(self) -> None:
         """Only hit Discord's sync endpoint when the command surface actually changed."""
@@ -1386,14 +1622,59 @@ class DebtCollectorBot(commands.Bot):
         else:
             log.info("Command signature unchanged — skipping sync.")
 
+    async def _leave_voice(self) -> None:
+        # Unloading the music cog runs its cog_unload, which stops every player and
+        # disconnects it the same way /stop does.
+        if "cogs.music" in self.extensions:
+            try:
+                await self.unload_extension("cogs.music")
+            except Exception as exc:
+                log.warning("Unloading the music cog failed: %s", exc)
+        for voice_client in list(self.voice_clients):
+            try:
+                await voice_client.disconnect(force=True)
+            except Exception as exc:
+                log.debug("Voice disconnect failed: %s", exc)
+
+    async def _close_http_session(self) -> None:
+        session, self.http_session = self.http_session, None
+        if session is not None and not session.closed:
+            await session.close()
+
+    @staticmethod
+    def _stop_warp() -> None:
+        from utils import warp
+
+        warp.stop()
+
     async def close(self) -> None:
-        try:
-            await ai_flush()
-        except Exception as exc:
-            log.warning("AI flush on shutdown failed: %s", exc)
-        if self.http_session is not None:
-            await self.http_session.close()
+        """Flush AI history, leave voice, close HTTP + Mongo, stop WARP, then the gateway.
+
+        Each step has its own time budget so one slow step can't eat Render's grace
+        period; the signal path also wraps the whole thing in SHUTDOWN_TIMEOUT_S.
+        """
+        if self._closing_started:
+            await super().close()
+            return
+        self._closing_started = True
+        started: float = time.monotonic()
+
+        async def step(name: str, action: Callable[[], Any], budget: float) -> None:
+            try:
+                await asyncio.wait_for(action(), budget)
+            except asyncio.TimeoutError:
+                log.warning("Shutdown step '%s' timed out after %.0fs.", name, budget)
+            except Exception as exc:
+                log.warning("Shutdown step '%s' failed: %s", name, exc)
+
+        await step("flush AI history", ai_flush, 6.0)
+        await step("disconnect voice", self._leave_voice, 4.0)
+        await step("close HTTP session", self._close_http_session, 2.0)
+        await step("close MongoDB", lambda: asyncio.to_thread(self.settings.close), 3.0)
+        await step("stop WARP", lambda: asyncio.to_thread(self._stop_warp), 3.0)
+        self.loop_lag.stop()
         await super().close()
+        log.info("Shutdown finished in %.1fs.", time.monotonic() - started)
 
 
 settings_manager: MultiTenantSettingsManager = MultiTenantSettingsManager()
@@ -4700,23 +4981,122 @@ async def before_reminder_loop():
 # --------------------------------------------------------------------------- #
 
 
+HEALTH_STARTUP_GRACE_S: float = 180.0
+_KEEPALIVE_RUNNER: Optional[Any] = None
+
+
+def _deploy_version() -> Optional[str]:
+    commit: str = os.getenv("RENDER_GIT_COMMIT", "").strip()
+    return commit[:7] or None
+
+
+def build_health_payload(
+    target: Any, *, now: float, preview: bool = False
+) -> Tuple[int, Dict[str, Any]]:
+    """(HTTP status, JSON body) for /health. Reads memory only - never the database.
+
+    200 while the gateway is ready with a finite latency, and during the first
+    HEALTH_STARTUP_GRACE_S seconds after start (previews included); 503 otherwise.
+    """
+    uptime: float = max(0.0, now - float(getattr(target, "start_time", now)))
+    try:
+        ready: bool = bool(target.is_ready()) and not bool(target.is_closed())
+    except Exception:
+        ready = False
+    latency: Any = getattr(target, "latency", float("nan"))
+    latency_ok: bool = (
+        isinstance(latency, (int, float))
+        and not isinstance(latency, bool)
+        and math.isfinite(latency)
+    )
+    shutting_down: bool = SHUTDOWN.requested
+    if shutting_down:
+        status, code = "shutting_down", 503
+    elif ready and latency_ok:
+        status, code = "ok", 200
+    elif uptime < HEALTH_STARTUP_GRACE_S:
+        status, code = "starting", 200
+    else:
+        status, code = "unavailable", 503
+
+    stats: Dict[str, Any] = collect_runtime_stats(target)
+    cache: Dict[str, Any] = stats.get("attachment_cache") or {}
+    lag: Dict[str, Any] = stats.get("loop_lag") or {}
+    payload: Dict[str, Any] = {
+        "status": status,
+        "ready": ready,
+        "latency_ms": round(latency * 1000, 1) if latency_ok else None,
+        "guilds": stats["guilds"],
+        "uptime_s": int(uptime),
+        "rss_mb": stats["rss_mb"],
+        "peak_rss_mb": stats["peak_rss_mb"],
+        "preview": preview,
+        "version": _deploy_version(),
+        "loop_lag_ms": {"last": lag.get("last_ms"), "max_5m": lag.get("max_ms")},
+        "memory": {
+            "settings_cache_entries": stats["settings_cache_entries"],
+            "attachment_cache_bytes": cache.get("bytes", 0),
+            "attachment_cache_entries": cache.get("entries", 0),
+            "ai_buffer_channels": stats["ai_buffer_channels"],
+            "ai_buffer_messages": stats["ai_buffer_messages"],
+            "ai_pending_messages": stats["ai_pending_messages"],
+            "snipes": stats["snipes"],
+        },
+        "runtime": {
+            "threads": stats["threads"],
+            "asyncio_tasks": stats["asyncio_tasks"],
+            "background_tasks": stats["background_tasks"],
+            "voice_clients": stats["voice_clients"],
+        },
+    }
+    return code, payload
+
+
+async def _keepalive_root(request: Any) -> Any:
+    from aiohttp import web
+
+    # Uptime monitors hit this to keep the free instance awake: always 200.
+    return web.Response(text="OK")
+
+
+async def _health_handler(request: Any) -> Any:
+    from aiohttp import web
+
+    code, payload = build_health_payload(
+        bot, now=time.time(), preview=_is_preview_deploy()
+    )
+    return web.json_response(
+        payload, status=code, headers={"Cache-Control": "no-store"}
+    )
+
+
 async def _start_keepalive_server() -> None:
+    global _KEEPALIVE_RUNNER
     port: Optional[str] = os.getenv("PORT")
     if not port:
         return
     from aiohttp import web
 
-    async def health(_: web.Request) -> web.Response:
-        return web.Response(text="OK")
-
     app: web.Application = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    runner: web.AppRunner = web.AppRunner(app)
+    app.router.add_get("/", _keepalive_root)  # GET and HEAD
+    app.router.add_get("/health", _health_handler)
+    # No access log: two uptime monitors would otherwise add ~576 lines a day.
+    runner: web.AppRunner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site: web.TCPSite = web.TCPSite(runner, "0.0.0.0", int(port))
     await site.start()
+    _KEEPALIVE_RUNNER = runner
     log.info("Keepalive HTTP server listening on port %s.", port)
+
+
+async def _stop_keepalive_server() -> None:
+    global _KEEPALIVE_RUNNER
+    runner, _KEEPALIVE_RUNNER = _KEEPALIVE_RUNNER, None
+    if runner is not None:
+        try:
+            await runner.cleanup()
+        except Exception as exc:
+            log.debug("Keepalive server cleanup failed: %s", exc)
 
 
 def _is_preview_deploy() -> bool:
@@ -4773,8 +5153,7 @@ async def _run_preview_diagnostics() -> None:
             await run("through Cloudflare WARP")
         else:
             log.warning("WARP didn't start, so it wasn't probed (see the lines above)")
-    while True:
-        await asyncio.sleep(3600)
+    await SHUTDOWN.wait()  # idle until Render stops the preview
 
 
 async def _apply_guild_automations(message: discord.Message) -> None:
@@ -9586,49 +9965,164 @@ async def diagnose_cmd(ctx: commands.Context) -> None:
     started: float = time.perf_counter()
     db_ok: bool = await bot.settings.ping()
     db_ms: float = (time.perf_counter() - started) * 1000
+    guild_settings: Dict[str, Any] = await bot.settings.fetch_settings(ctx.guild.id)
 
-    loops: Dict[str, Any] = {
-        "reminders": reminder_loop,
-        "ai flush": ai_flush_loop,
-        "tempbans": tempban_loop,
-        "personal reminders": personal_reminder_loop,
-    }
-    loop_lines: List[str] = []
-    for name, loop_obj in loops.items():
-        if loop_obj.is_running():
-            failed: bool = bool(loop_obj.failed())
-            mark: str = "\u26a0\ufe0f" if failed else "\u2705"
-            suffix: str = " (failed)" if failed else ""
-            loop_lines.append(f"{mark} {name}{suffix}")
-        else:
-            loop_lines.append(f"\u274c {name} (stopped)")
+    embed: discord.Embed = build_diagnose_embed(
+        bot, ctx.guild, db_ok=db_ok, db_ms=db_ms, guild_settings=guild_settings
+    )
+    await ctx.send(embed=embed, ephemeral=True)
 
-    me: discord.Member = ctx.guild.me
+
+DIAGNOSE_LOOPS: Dict[str, Any] = {}  # filled below once every loop exists
+
+
+def _memory_limit_mb() -> Optional[float]:
+    """The instance's memory limit, for "% used": MEMORY_LIMIT_MB, else 512 on Render."""
+    raw: str = os.getenv("MEMORY_LIMIT_MB", "").strip()
+    if raw:
+        try:
+            return float(raw) if float(raw) > 0 else None
+        except ValueError:
+            return None
+    return 512.0 if os.getenv("RENDER") else None
+
+
+def _fmt_ms(value: Optional[float]) -> str:
+    return "n/a" if value is None else f"{value:.0f} ms"
+
+
+def _diagnose_music_lines(target: Any) -> List[str]:
+    music: Any = target.get_cog("Music") if hasattr(target, "get_cog") else None
+    lines: List[str] = [
+        f"Voice connections **{len(getattr(target, 'voice_clients', None) or [])}**"
+    ]
+    if music is None:
+        lines.append("\u26a0\ufe0f Music module not loaded")
+        return lines
+    lines.append(f"Players **{len(getattr(music, 'players', {}) or {})}**")
+    try:
+        from utils import warp, ytdl
+
+        route: Dict[str, Any] = ytdl.route_status()
+        warp_state: Dict[str, Any] = warp.status()
+        lines.append(f"YouTube route **{route['route']}**")
+        if route.get("preferred"):
+            lines.append(f"Clients `{route['preferred'][:60]}`")
+        warp_text: str = "running" if warp_state["running"] else (
+            "available" if warp_state["available"] else "unavailable"
+        )
+        lines.append(f"WARP **{warp_state['mode']}** \u00b7 {warp_text}")
+    except Exception as exc:  # diagnostics must never fail the command
+        lines.append(f"Route unknown ({type(exc).__name__})")
+    return lines
+
+
+def _diagnose_feature_lines(settings: Dict[str, Any]) -> List[str]:
+    def on(flag: Any) -> str:
+        return "\U0001f7e2" if flag else "\u26aa"
+
+    counting: Dict[str, Any] = settings.get("counting") or {}
+    ai: Dict[str, Any] = settings.get("ai") or {}
+    messagelog: Dict[str, Any] = settings.get("messagelog") or {}
+    modlog: Dict[str, Any] = settings.get("modlog") or {}
+    automod: Dict[str, Any] = settings.get("automod") or {}
+    automod_on: List[str] = [
+        key for key in ("invites", "links", "spam", "caps", "mentions") if automod.get(key)
+    ]
+    return [
+        f"{on(counting.get('channel_id'))} Counting"
+        + (f" in <#{counting['channel_id']}>" if counting.get("channel_id") else ""),
+        f"{on(ai.get('enabled'))} AI chat ({len(ai.get('channels') or [])} channels)",
+        f"{on(messagelog.get('enabled') and messagelog.get('channel_id'))} Message log"
+        + (" + attachment cache" if messagelog.get("cache_attachments") else ""),
+        f"{on(modlog.get('enabled') and modlog.get('channel_id'))} Mod log",
+        f"{on(automod_on)} Automod" + (f" ({', '.join(automod_on)})" if automod_on else ""),
+        f"{on((settings.get('raid') or {}).get('enabled'))} Raid protection",
+        f"{on((settings.get('modmail') or {}).get('enabled'))} Tickets",
+    ]
+
+
+def build_diagnose_embed(
+    target: Any,
+    guild: discord.Guild,
+    *,
+    db_ok: bool,
+    db_ms: float,
+    guild_settings: Optional[Dict[str, Any]] = None,
+) -> discord.Embed:
+    """The /diagnose report. Pure apart from reading in-memory state."""
+    stats: Dict[str, Any] = collect_runtime_stats(target)
+    lag: Dict[str, Any] = stats.get("loop_lag") or {}
+    cache: Dict[str, int] = target.settings.cache_stats()
+    lookups: int = cache["hits"] + cache["misses"]
+    hit_rate: float = (cache["hits"] / lookups * 100) if lookups else 100.0
+    errors: Dict[str, Any] = target.errors.stats()
+    uptime: float = time.time() - target.start_time
+    latency: float = target.latency
+    latency_text: str = (
+        f"{latency * 1000:.0f} ms" if math.isfinite(latency) else "not connected"
+    )
+
+    me: Any = guild.me
     missing: List[str] = [
         permission.replace("_", " ")
         for permission in REQUIRED_GUILD_PERMISSIONS
         if not getattr(me.guild_permissions, permission, False)
     ]
 
-    cache: Dict[str, int] = bot.settings.cache_stats()
-    lookups: int = cache["hits"] + cache["misses"]
-    hit_rate: float = (cache["hits"] / lookups * 100) if lookups else 100.0
-    errors: Dict[str, Any] = bot.errors.stats()
-    uptime: float = time.time() - bot.start_time
+    loop_lines: List[str] = []
+    for name, loop_obj in DIAGNOSE_LOOPS.items():
+        if loop_obj.is_running():
+            failed: bool = bool(loop_obj.failed())
+            mark: str = "\u26a0\ufe0f" if failed else "\u2705"
+            loop_lines.append(f"{mark} {name}{' (failed)' if failed else ''}")
+        else:
+            loop_lines.append(f"\u274c {name} (stopped)")
+    lag_monitor: Any = getattr(target, "loop_lag", None)
+    if isinstance(lag_monitor, LoopLagMonitor):
+        loop_lines.append(
+            ("\u2705" if lag_monitor.running else "\u274c") + " loop-lag monitor"
+        )
+
+    rss: Optional[float] = stats.get("rss_mb")
+    limit: Optional[float] = _memory_limit_mb()
+    memory_share: Optional[float] = (rss / limit * 100) if (rss and limit) else None
+    attachment: Dict[str, Any] = stats.get("attachment_cache") or {}
+    lag_max: Optional[float] = lag.get("max_ms")
+
+    warnings: List[str] = []
+    if not db_ok:
+        warnings.append("database unreachable")
+    if missing:
+        warnings.append("missing permissions")
+    if memory_share is not None and memory_share >= 85:
+        warnings.append(f"memory at {memory_share:.0f}% of the limit")
+    if lag_max is not None and lag_max >= 1000:
+        warnings.append("event loop was blocked for over a second")
+    if any("\u274c" in line or "failed" in line for line in loop_lines):
+        warnings.append("a background loop is down")
 
     embed: discord.Embed = discord.Embed(
         title="\U0001fa7a Bot diagnostics",
+        description=(
+            "\u2705 Everything looks healthy."
+            if not warnings
+            else "\u26a0\ufe0f " + "; ".join(warnings).capitalize() + "."
+        ),
         color=(
-            discord.Color.green() if db_ok and not missing else discord.Color.orange()
+            discord.Color.red()
+            if not db_ok
+            else discord.Color.orange() if warnings else discord.Color.green()
         ),
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(
         name="Gateway",
         value=(
-            f"Latency **{bot.latency * 1000:.0f} ms**\n"
-            f"Uptime **{int(uptime // 3600)}h {int(uptime % 3600 // 60)}m**\n"
-            f"Guilds **{len(bot.guilds)}**"
+            f"Latency **{latency_text}**\n"
+            f"Uptime **{humanize_seconds(uptime)}**\n"
+            f"Guilds **{stats['guilds']}** \u00b7 Shards **{target.shard_count or 1}**\n"
+            f"Cached users **{len(getattr(target, 'users', None) or [])}**"
         ),
         inline=True,
     )
@@ -9655,7 +10149,43 @@ async def diagnose_cmd(ctx: commands.Context) -> None:
         ),
         inline=True,
     )
-    embed.add_field(name="Background loops", value="\n".join(loop_lines), inline=False)
+    memory_lines: List[str] = [
+        f"RSS **{rss if rss is not None else 'n/a'} MB**"
+        + (f" ({memory_share:.0f}% of {limit:.0f} MB)" if memory_share is not None else "")
+        + f" \u00b7 peak {stats.get('peak_rss_mb') or 'n/a'} MB",
+        f"Attachment cache **{attachment.get('bytes', 0) / 1048576:.1f}"
+        f"/{attachment.get('max_bytes', 0) / 1048576:.0f} MB** "
+        f"({attachment.get('entries', 0)} msgs, {attachment.get('evictions', 0)} evicted)",
+        f"Settings cache **{stats['settings_cache_entries']}** guilds",
+        f"AI buffers **{stats['ai_buffer_messages']}** msgs in "
+        f"{stats['ai_buffer_channels']} channels \u00b7 {stats['ai_pending_messages']} unsaved",
+        f"Snipes **{stats['snipes']}**",
+    ]
+    embed.add_field(name="Memory", value="\n".join(memory_lines), inline=False)
+    runtime_lines: List[str] = [
+        f"Python **{_sys.version.split()[0]}** \u00b7 discord.py **{discord.__version__}**"
+        f" \u00b7 aiohttp **{aiohttp.__version__}**",
+        f"Event-loop lag **{_fmt_ms(lag.get('last_ms'))}** now \u00b7 "
+        f"p50 {_fmt_ms(lag.get('p50_ms'))} \u00b7 max {_fmt_ms(lag_max)} (5 min)",
+        f"Threads **{stats['threads']}** \u00b7 asyncio tasks **{stats['asyncio_tasks']}**"
+        f" \u00b7 background **{stats['background_tasks']}**",
+    ]
+    version: Optional[str] = _deploy_version()
+    if version:
+        runtime_lines.append(f"Deployed commit `{version}`")
+    embed.add_field(name="Runtime", value="\n".join(runtime_lines), inline=False)
+    embed.add_field(
+        name="Music", value="\n".join(_diagnose_music_lines(target))[:1024], inline=True
+    )
+    embed.add_field(
+        name="Background loops", value="\n".join(loop_lines)[:1024] or "none", inline=True
+    )
+    if guild_settings is not None:
+        embed.add_field(
+            name="This server",
+            value="\n".join(_diagnose_feature_lines(guild_settings))[:1024],
+            inline=False,
+        )
     embed.add_field(
         name="Permissions in this server",
         value=(
@@ -9665,8 +10195,20 @@ async def diagnose_cmd(ctx: commands.Context) -> None:
         ),
         inline=False,
     )
-    embed.set_footer(text="Run /errors detail <id> for tracebacks")
-    await ctx.send(embed=embed, ephemeral=True)
+    embed.set_footer(text="Run /errors detail <id> for tracebacks \u00b7 GET /health for JSON")
+    return embed
+
+
+DIAGNOSE_LOOPS.update(
+    {
+        "reminders": reminder_loop,
+        "ai flush": ai_flush_loop,
+        "tempbans": tempban_loop,
+        "personal reminders": personal_reminder_loop,
+        "state janitor": state_janitor_loop,
+        "memory report": memory_report_loop,
+    }
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -13374,51 +13916,22 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     async def runner() -> None:
+        install_signal_handlers(asyncio.get_running_loop(), bot.close)
         await _start_keepalive_server()
-
-        if _is_preview_deploy():
-            await _run_preview_diagnostics()
-            return
-
-        base_backoff: float = 15.0
-        max_backoff: float = 300.0
-        backoff: float = base_backoff
-
-        while True:
-            attempt_started: float = time.monotonic()
-            try:
-                await bot.start(token)
-                log.info("Gateway session closed cleanly - exiting supervisor.")
-                return
-            except (discord.LoginFailure, discord.PrivilegedIntentsRequired) as exc:
-                log.critical("Unrecoverable startup failure: %s", exc)
-                raise SystemExit(1) from exc
-            except discord.HTTPException as exc:
-                if exc.status == 429:
-                    log.warning("Rate limited (HTTP 429) during startup: %s", exc)
-                else:
-                    log.warning(
-                        "HTTP error during startup (status %s): %s", exc.status, exc
-                    )
-            except (
-                discord.ConnectionClosed,
-                discord.GatewayNotFound,
-                aiohttp.ClientError,
-                OSError,
-            ) as exc:
-                log.warning("Transport failure: %s", exc)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Unexpected supervisor failure.")
-
-            if time.monotonic() - attempt_started > 600:
-                backoff = base_backoff  # A long-lived session earns a fresh budget.
-
-            delay: float = backoff + random.uniform(0.0, 5.0)
-            log.info("Reconnecting in %.1fs.", delay)
-            await asyncio.sleep(delay)
-            backoff = min(backoff * 2, max_backoff)
+        try:
+            if _is_preview_deploy():
+                # Stop probing as soon as Render asks the preview to stop.
+                probe = asyncio.ensure_future(_run_preview_diagnostics())
+                stop = asyncio.ensure_future(SHUTDOWN.wait())
+                await asyncio.wait({probe, stop}, return_when=asyncio.FIRST_COMPLETED)
+                for pending in (probe, stop):
+                    pending.cancel()
+            else:
+                await supervise(lambda: bot.start(token), is_closed=bot.is_closed)
+            if SHUTDOWN.task is not None:
+                await SHUTDOWN.task
+        finally:
+            await _stop_keepalive_server()
 
     try:
         asyncio.run(runner())

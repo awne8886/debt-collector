@@ -97,6 +97,19 @@ def proxy_url() -> Optional[str]:
         return None
 
 
+def status() -> Dict[str, Any]:
+    """Diagnostics only: mode, whether WARP may run here, and whether it is running."""
+    with _lock:
+        running: bool = bool(_proxy and _process is not None and _process.poll() is None)
+        failed_ago: Optional[float] = (time.monotonic() - _failed_at) if _failed_at else None
+    return {
+        "mode": mode(),
+        "available": available(),
+        "running": running,
+        "last_failure_s_ago": round(failed_ago) if failed_ago is not None else None,
+    }
+
+
 def ensure_started() -> Optional[str]:
     """Start WARP if it isn't running. Returns the proxy URL, or None if it can't start."""
     global _process, _proxy, _failed_at

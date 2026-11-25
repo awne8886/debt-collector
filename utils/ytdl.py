@@ -379,6 +379,26 @@ _demoted: Optional[Strategy] = None  # its last stream died at once; tried last
 _stream_cache: Dict[str, Tuple[float, "StreamInfo"]] = {}
 
 
+def route_status() -> Dict[str, Any]:
+    """Diagnostics only: which route YouTube traffic takes and which clients lead."""
+    with _state_lock:
+        preferred: Optional[Strategy] = _preferred
+        demoted: Optional[Strategy] = _demoted
+        cached: int = len(_stream_cache)
+    if os.getenv("YTDL_PROXY", "").strip():
+        route = "YTDL_PROXY"
+    elif warp.proxy_url() is not None:
+        route = "Cloudflare WARP"
+    else:
+        route = "direct"
+    return {
+        "route": route,
+        "preferred": preferred.label if preferred else None,
+        "demoted": demoted.label if demoted else None,
+        "cached_streams": cached,
+    }
+
+
 def _rotation_enabled() -> bool:
     return os.getenv("YTDL_CLIENT_ROTATION", "1").strip().lower() not in ("0", "false", "off", "no")
 
