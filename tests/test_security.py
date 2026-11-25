@@ -106,7 +106,7 @@ class TestSafeCountingParser(unittest.TestCase):
 
 class TestSuperuserIds(unittest.TestCase):
     def test_env_set_is_used_exactly(self):
-        from main import resolve_superuser_ids
+        from core.config import resolve_superuser_ids
 
         with self.assertNoLogs("debt-collector", level="WARNING"):
             result = resolve_superuser_ids("111, 222")
@@ -114,7 +114,7 @@ class TestSuperuserIds(unittest.TestCase):
         self.assertNotIn(1120393965485703219, result)
 
     def test_unset_falls_back_with_one_warning(self):
-        from main import DEFAULT_SUPERUSER_IDS, resolve_superuser_ids
+        from core.config import DEFAULT_SUPERUSER_IDS, resolve_superuser_ids
 
         for raw in (None, "", "   "):
             with self.subTest(raw=raw):
@@ -128,7 +128,7 @@ class TestSuperuserIds(unittest.TestCase):
         )
 
     def test_only_invalid_entries_fall_back(self):
-        from main import DEFAULT_SUPERUSER_IDS, resolve_superuser_ids
+        from core.config import DEFAULT_SUPERUSER_IDS, resolve_superuser_ids
 
         with self.assertLogs("debt-collector", level="WARNING"):
             self.assertEqual(resolve_superuser_ids("abc"), DEFAULT_SUPERUSER_IDS)
@@ -161,20 +161,21 @@ class TestCloneCommandsCanRun(unittest.TestCase):
     def test_asyncio_is_not_shadowed_by_a_local_import(self):
         # A late `import asyncio` inside the function made the first
         # asyncio.to_thread call raise UnboundLocalError (rollback_clone always failed).
-        import main
+        from main import clone_server, rollback_clone
 
-        for command in (main.clone_server, main.rollback_clone):
+        for command in (clone_server, rollback_clone):
             with self.subTest(command=command.name):
                 self.assertNotIn("asyncio", command.callback.__code__.co_varnames)
 
 
 class TestCommandCategories(unittest.TestCase):
     def test_every_root_command_has_a_category(self):
-        import main
+        import main  # noqa: F401  # registers every command
+        from main import COMMAND_CATEGORY, _uncategorised_roots
 
-        self.assertEqual(main.COMMAND_CATEGORY.get("clone_server"), "config")
-        self.assertEqual(main.COMMAND_CATEGORY.get("rollback_clone"), "config")
-        self.assertEqual(main._uncategorised_roots(), [])
+        self.assertEqual(COMMAND_CATEGORY.get("clone_server"), "config")
+        self.assertEqual(COMMAND_CATEGORY.get("rollback_clone"), "config")
+        self.assertEqual(_uncategorised_roots(), [])
 
 
 if __name__ == "__main__":

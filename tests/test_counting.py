@@ -3,9 +3,11 @@ import copy
 import threading
 import time
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
+
+from support import patch_bot
 
 
 class FakeCollection:
@@ -85,19 +87,19 @@ def make_interaction(guild_id, user_id=7):
 
 class CountingTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        import main
+        import main as counting
 
-        main._COUNTING_LOCKS.clear()
+        counting._COUNTING_LOCKS.clear()
 
 
 class TestCountingConcurrency(CountingTestCase):
     async def test_same_number_at_once_only_one_counts(self):
-        import main
+        import main as counting
 
         bot = make_bot(delay=0.02)
         first, second = make_message("1", 10), make_message("1", 11)
-        with patch("main.bot", bot):
-            await asyncio.gather(main.handle_counting(first), main.handle_counting(second))
+        with patch_bot(bot):
+            await asyncio.gather(counting.handle_counting(first), counting.handle_counting(second))
 
         ticks = [m for m in (first, second) if m.add_reaction.await_args_list
                  and m.add_reaction.await_args_list[0].args[0] == "✅"]
@@ -107,43 +109,43 @@ class TestCountingConcurrency(CountingTestCase):
         self.assertTrue(state["broken"])  # the slower one broke the streak
 
     async def test_sequence_counts_up(self):
-        import main
+        import main as counting
 
         bot = make_bot()
-        with patch("main.bot", bot):
+        with patch_bot(bot):
             for number, author in ((1, 10), (2, 11), (3, 10)):
-                await main.handle_counting(make_message(str(number), author))
+                await counting.handle_counting(make_message(str(number), author))
         state = bot.settings.counting.find_one({"guild_id": 1})
         self.assertEqual((state["current"], state["streak"], state["broken"]), (3, 3, False))
 
     async def test_counting_twice_in_a_row_breaks(self):
-        import main
+        import main as counting
 
         bot = make_bot()
-        with patch("main.bot", bot):
-            await main.handle_counting(make_message("1", 10))
+        with patch_bot(bot):
+            await counting.handle_counting(make_message("1", 10))
             again = make_message("2", 10)
-            await main.handle_counting(again)
+            await counting.handle_counting(again)
         again.channel.send.assert_awaited_once()
         self.assertTrue(bot.settings.counting.find_one({"guild_id": 1})["broken"])
 
     async def test_other_channel_is_ignored(self):
-        import main
+        import main as counting
 
         bot = make_bot()
-        with patch("main.bot", bot):
-            await main.handle_counting(make_message("1", 10, channel_id=99))
+        with patch_bot(bot):
+            await counting.handle_counting(make_message("1", 10, channel_id=99))
         self.assertIsNone(bot.settings.counting.find_one({"guild_id": 1}))
 
     async def test_deleting_the_current_count_breaks_the_streak(self):
-        import main
+        import main as counting
 
         bot = make_bot()
-        with patch("main.bot", bot):
-            await main.handle_counting(make_message("1", 10))
+        with patch_bot(bot):
+            await counting.handle_counting(make_message("1", 10))
             deleted = make_message("1", 10)
-            self.assertTrue(await main.handle_counting_retraction(deleted, deleted, "deleted"))
-            self.assertFalse(await main.handle_counting_retraction(deleted, deleted, "deleted"))
+            self.assertTrue(await counting.handle_counting_retraction(deleted, deleted, "deleted"))
+            self.assertFalse(await counting.handle_counting_retraction(deleted, deleted, "deleted"))
         embed = deleted.channel.send.await_args.kwargs["embed"]
         self.assertIn("deleted their valid count", embed.description)
 
@@ -158,39 +160,39 @@ class TestCountingSaves(CountingTestCase):
         )
 
     async def test_saves_are_counted_per_server(self):
-        import main
+        import main as counting
 
         bot = make_bot(saves=1)
         for guild_id in (1, 2):
             self._break(bot, guild_id)
-        with patch("main.bot", bot):
+        with patch_bot(bot):
             one = make_interaction(1)
-            await main._counting_use_save(one, 1)
+            await counting._counting_use_save(one, 1)
             one.response.edit_message.assert_awaited_once()
 
             two = make_interaction(2)
-            await main._counting_use_save(two, 2)  # a different server: its own budget
+            await counting._counting_use_save(two, 2)  # a different server: its own budget
             two.response.edit_message.assert_awaited_once()
 
             self._break(bot, 1)
             again = make_interaction(1)
-            await main._counting_use_save(again, 1)
+            await counting._counting_use_save(again, 1)
             again.response.edit_message.assert_not_awaited()
             self.assertIn("all 1 of your saves", again.response.send_message.await_args.args[0])
 
-            today = main._counting_today()
-            self.assertEqual(await main._counting_saves_used(1, 7, today), 1)
-            self.assertEqual(await main._counting_saves_used(2, 7, today), 1)
-            self.assertEqual(await main._counting_saves_used(3, 7, today), 0)
+            today = counting._counting_today()
+            self.assertEqual(await counting._counting_saves_used(1, 7, today), 1)
+            self.assertEqual(await counting._counting_saves_used(2, 7, today), 1)
+            self.assertEqual(await counting._counting_saves_used(3, 7, today), 0)
 
     async def test_save_answers_with_edit_message_and_reads_db_state(self):
-        import main
+        import main as counting
 
         bot = make_bot()
         self._break(bot, 1)
         interaction = make_interaction(1)
-        with patch("main.bot", bot):
-            await main._counting_use_save(interaction, 1)
+        with patch_bot(bot):
+            await counting._counting_use_save(interaction, 1)
         interaction.response.edit_message.assert_awaited_once()
         interaction.message.edit.assert_not_awaited()
         kwargs = interaction.response.edit_message.await_args.kwargs
@@ -200,22 +202,22 @@ class TestCountingSaves(CountingTestCase):
         self.assertFalse(bot.settings.counting.find_one({"guild_id": 1})["broken"])
 
     async def test_save_when_not_broken(self):
-        import main
+        import main as counting
 
         bot = make_bot()
         interaction = make_interaction(1)
-        with patch("main.bot", bot):
-            await main._counting_use_save(interaction, 1)
+        with patch_bot(bot):
+            await counting._counting_use_save(interaction, 1)
         self.assertIn("no longer broken", interaction.response.send_message.await_args.args[0])
 
     async def test_button_from_another_guild_is_refused(self):
-        import main
+        import main as counting
 
         bot = make_bot()
         self._break(bot, 1)
         interaction = make_interaction(2)
-        with patch("main.bot", bot):
-            await main._counting_use_save(interaction, 1)
+        with patch_bot(bot):
+            await counting._counting_use_save(interaction, 1)
         interaction.response.edit_message.assert_not_awaited()
         self.assertTrue(bot.settings.counting.find_one({"guild_id": 1})["broken"])
 
@@ -237,9 +239,12 @@ class TestCountingButton(unittest.IsolatedAsyncioTestCase):
     async def test_registered_on_setup(self):
         import inspect
 
-        import main
+        from core import registry
+        from core.bot import DebtCollectorBot
+        from main import CountingSaveButton
 
-        self.assertIn("add_dynamic_items(CountingSaveButton)", inspect.getsource(main.DebtCollectorBot.setup_hook))
+        self.assertIn(CountingSaveButton, registry.DYNAMIC_ITEMS)
+        self.assertIn("add_dynamic_items(*registry.DYNAMIC_ITEMS)", inspect.getsource(DebtCollectorBot.setup_hook))
 
     def test_broken_embed_shows_configured_saves(self):
         from main import _counting_broken_embed

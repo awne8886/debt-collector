@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import aiohttp
 from main import fetch_reaction_gif
+from support import patch_bot
 
 class TestFetchReactionGif(unittest.IsolatedAsyncioTestCase):
     async def test_fetch_reaction_gif_fallback(self):
@@ -74,7 +75,7 @@ class TestAIRateLimitHandling(unittest.IsolatedAsyncioTestCase):
         mock_message.channel.typing.return_value = FailingTyping()
         mock_message.reply = AsyncMock()
 
-        with patch("main.bot") as mock_bot, \
+        with patch_bot(MagicMock()) as mock_bot, \
              patch("main.ai_config", return_value={"enabled": True, "channels": ["789"], "probability": 100.0, "cooldown": 0, "daily_limit": 0, "provider_order": ["openrouter"], "models": {}}), \
              patch("main._get_ai_history", return_value=[{"role": "user", "author": "TestUser", "author_id": 456, "content": "hello bot"}]), \
              patch("main._reply_target_is_bot", return_value=(False, None)), \
@@ -126,7 +127,7 @@ class TestAITargeting(unittest.IsolatedAsyncioTestCase):
 
         mock_msg1.channel.typing.return_value = DummyTyping()
 
-        with patch("main.bot") as mock_bot, \
+        with patch_bot(MagicMock()) as mock_bot, \
              patch("main.ai_config", return_value={"enabled": True, "channels": ["789"], "probability": 100.0, "cooldown": 0, "daily_limit": 0, "provider_order": ["openrouter"], "models": {}}), \
              patch("main._get_ai_history", return_value=[{"role": "user", "author": "User1", "author_id": 111, "content": "hello bot from user 1"}]), \
              patch("main._reply_target_is_bot", return_value=(False, None)), \
@@ -181,7 +182,7 @@ class TestConcurrentAIMessages(unittest.IsolatedAsyncioTestCase):
         mock_msg1.channel.typing.side_effect = lambda: DelayTyping()
         mock_msg2.channel.typing.side_effect = lambda: DelayTyping()
 
-        with patch("main.bot") as mock_bot,              patch("main.ai_config", return_value={"enabled": True, "channels": ["789"], "probability": 100.0, "cooldown": 0, "daily_limit": 0, "provider_order": ["openrouter"], "models": {}}),              patch("main._get_ai_history", side_effect=lambda cid: mock_bot.ai_history_buffer.get(cid, [])),              patch("main._reply_target_is_bot", return_value=(False, None)),              patch("main.ai_generate_reply", side_effect=[("Reply 1", "openrouter"), ("Reply 2", "openrouter")]):
+        with patch_bot(MagicMock()) as mock_bot,              patch("main.ai_config", return_value={"enabled": True, "channels": ["789"], "probability": 100.0, "cooldown": 0, "daily_limit": 0, "provider_order": ["openrouter"], "models": {}}),              patch("main._get_ai_history", side_effect=lambda cid: mock_bot.ai_history_buffer.get(cid, [])),              patch("main._reply_target_is_bot", return_value=(False, None)),              patch("main.ai_generate_reply", side_effect=[("Reply 1", "openrouter"), ("Reply 2", "openrouter")]):
 
             mock_bot.user = MagicMock(id=999, display_name="BotName")
             mock_bot.user.mentioned_in.return_value = True
@@ -203,7 +204,7 @@ class TestConcurrentAIMessages(unittest.IsolatedAsyncioTestCase):
 
 class TestSanitizeMassPings(unittest.TestCase):
     def test_sanitize_mass_pings(self):
-        from main import sanitize_mass_pings
+        from core.helpers import sanitize_mass_pings
 
         # Test basic replacements
         self.assertEqual(sanitize_mass_pings("@everyone"), "@\u200beveryone")
@@ -231,21 +232,21 @@ class TestSanitizeMassPings(unittest.TestCase):
 
 class TestDeepMerge(unittest.TestCase):
     def test_deep_merge_basic(self):
-        from main import _deep_merge
+        from core.settings import _deep_merge
         base = {"a": 1, "b": 2}
         override = {"b": 3, "c": 4}
         result = _deep_merge(base, override)
         self.assertEqual(result, {"a": 1, "b": 3, "c": 4})
 
     def test_deep_merge_nested(self):
-        from main import _deep_merge
+        from core.settings import _deep_merge
         base = {"a": {"x": 1, "y": 2}, "b": 2}
         override = {"a": {"y": 3, "z": 4}, "c": 5}
         result = _deep_merge(base, override)
         self.assertEqual(result, {"a": {"x": 1, "y": 3, "z": 4}, "b": 2, "c": 5})
 
     def test_deep_merge_type_mismatch(self):
-        from main import _deep_merge
+        from core.settings import _deep_merge
         # Override dict with scalar
         base1 = {"a": {"x": 1}}
         override1 = {"a": 2}
@@ -259,7 +260,7 @@ class TestDeepMerge(unittest.TestCase):
         self.assertEqual(result2, {"a": {"x": 2}})
 
     def test_deep_merge_in_place_modification(self):
-        from main import _deep_merge
+        from core.settings import _deep_merge
         base = {"a": {"x": 1}}
         override = {"a": {"y": 2}}
         result = _deep_merge(base, override)
@@ -268,7 +269,7 @@ class TestDeepMerge(unittest.TestCase):
 
 class TestHumanizeSeconds(unittest.TestCase):
     def test_humanize_seconds(self):
-        from main import humanize_seconds
+        from core.helpers import humanize_seconds
         cases = [
             (-5, "0s"),
             (0, "0s"),
@@ -287,28 +288,28 @@ class TestHumanizeSeconds(unittest.TestCase):
 
 class TestPaginateLines(unittest.TestCase):
     def test_empty_lines(self):
-        from main import paginate_lines
+        from utils.pagination import paginate_lines
         self.assertEqual(paginate_lines([]), ["*Nothing to show.*"])
 
     def test_single_page(self):
-        from main import paginate_lines
+        from utils.pagination import paginate_lines
         lines = ["line 1", "line 2", "line 3"]
         self.assertEqual(paginate_lines(lines, per_page=5, char_budget=100), ["line 1\nline 2\nline 3"])
 
     def test_per_page_limit(self):
-        from main import paginate_lines
+        from utils.pagination import paginate_lines
         lines = ["1", "2", "3", "4", "5"]
         self.assertEqual(paginate_lines(lines, per_page=2, char_budget=100), ["1\n2", "3\n4", "5"])
 
     def test_char_budget_limit(self):
-        from main import paginate_lines
+        from utils.pagination import paginate_lines
         # If budget is smaller than two lines combined, they should split
         lines = ["aaaaa", "bbbbb"]
         self.assertEqual(paginate_lines(lines, per_page=5, char_budget=11), ["aaaaa", "bbbbb"])
         self.assertEqual(paginate_lines(lines, per_page=5, char_budget=12), ["aaaaa\nbbbbb"])
 
     def test_line_truncation(self):
-        from main import paginate_lines
+        from utils.pagination import paginate_lines
         # A single line exceeding char_budget should be truncated
         lines = ["a" * 20]
         self.assertEqual(paginate_lines(lines, per_page=5, char_budget=10), ["a" * 10])
@@ -342,7 +343,7 @@ class TestParseCountingNumber(unittest.TestCase):
 
 class TestParseIdSet(unittest.TestCase):
     def test_parse_id_set(self):
-        from main import _parse_id_set
+        from core.config import _parse_id_set
 
         cases = [
             (None, frozenset()),
@@ -365,7 +366,7 @@ class TestPreviewDetection(unittest.TestCase):
     def test_render_previews_do_not_run_the_bot(self):
         from unittest.mock import patch
 
-        from main import _is_preview_deploy
+        from core.web import _is_preview_deploy
 
         with patch.dict("os.environ", {}, clear=True):
             self.assertFalse(_is_preview_deploy())
@@ -384,11 +385,9 @@ class TestAIPersonasAndSpeakers(unittest.IsolatedAsyncioTestCase):
     """Combos, late messages and per-user personas must stay tied to the right person."""
 
     def setUp(self):
-        from unittest.mock import patch
-
-        self.bot_patch = patch("main.bot")
-        self.mock_bot = self.bot_patch.start()
-        self.addCleanup(self.bot_patch.stop)
+        self.bot_patch = patch_bot(MagicMock())
+        self.mock_bot = self.bot_patch.__enter__()
+        self.addCleanup(self.bot_patch.__exit__, None, None, None)
         self.mock_bot.ai_history_buffer = {}
         self.mock_bot.ai_pending = {}
         self.mock_bot.ai_history_dirty = set()
