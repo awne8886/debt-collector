@@ -440,12 +440,33 @@ AI_HISTORY_COLLECTION_NAME: str = os.getenv("MONGO_AI_COLLECTION", "ai_history")
 
 # Snowflake-only. Username matching was removed: Discord usernames are user-mutable
 # and re-claimable, so name-based authorization is a privilege-escalation vector.
-_parsed_superusers = _parse_id_set(os.getenv("SUPERUSER_IDS"))
-if _parsed_superusers is None:
-    _parsed_superusers = frozenset(
-        {1120393965485703219, 600689350686146562, 760531428881465366}
-    )
-SUPERUSER_IDS: frozenset = frozenset(list(_parsed_superusers) + [1120393965485703219])
+# Superusers skip every permission check, rate limit and owner check in every
+# server, so the list is exactly what SUPERUSER_IDS says. The built-in fallback is
+# only used (with a warning) when the variable is unset or holds no valid IDs.
+DEFAULT_SUPERUSER_IDS: frozenset = frozenset(
+    {1120393965485703219, 600689350686146562, 760531428881465366}
+)
+
+
+def resolve_superuser_ids(raw: Optional[str]) -> frozenset:
+    """Return the superuser set for a SUPERUSER_IDS value (pure apart from logging)."""
+    if raw is None or not raw.strip():
+        log.warning(
+            "SUPERUSER_IDS is not set; falling back to the built-in superuser list. "
+            "Set SUPERUSER_IDS to control who bypasses every permission check."
+        )
+        return DEFAULT_SUPERUSER_IDS
+    parsed = _parse_id_set(raw)
+    if not parsed:
+        log.warning(
+            "SUPERUSER_IDS contains no valid user IDs; falling back to the built-in "
+            "superuser list."
+        )
+        return DEFAULT_SUPERUSER_IDS
+    return parsed
+
+
+SUPERUSER_IDS: frozenset = resolve_superuser_ids(os.getenv("SUPERUSER_IDS"))
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "echoset": False,

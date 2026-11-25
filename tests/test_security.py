@@ -104,5 +104,35 @@ class TestSafeCountingParser(unittest.TestCase):
         self.assertNotIn("sympy", sys.modules)
 
 
+class TestSuperuserIds(unittest.TestCase):
+    def test_env_set_is_used_exactly(self):
+        from main import resolve_superuser_ids
+
+        with self.assertNoLogs("debt-collector", level="WARNING"):
+            result = resolve_superuser_ids("111, 222")
+        self.assertEqual(result, frozenset({111, 222}))
+        self.assertNotIn(1120393965485703219, result)
+
+    def test_unset_falls_back_with_one_warning(self):
+        from main import DEFAULT_SUPERUSER_IDS, resolve_superuser_ids
+
+        for raw in (None, "", "   "):
+            with self.subTest(raw=raw):
+                with self.assertLogs("debt-collector", level="WARNING") as logs:
+                    result = resolve_superuser_ids(raw)
+                self.assertEqual(len(logs.records), 1)
+                self.assertEqual(result, DEFAULT_SUPERUSER_IDS)
+        self.assertEqual(
+            DEFAULT_SUPERUSER_IDS,
+            frozenset({1120393965485703219, 600689350686146562, 760531428881465366}),
+        )
+
+    def test_only_invalid_entries_fall_back(self):
+        from main import DEFAULT_SUPERUSER_IDS, resolve_superuser_ids
+
+        with self.assertLogs("debt-collector", level="WARNING"):
+            self.assertEqual(resolve_superuser_ids("abc"), DEFAULT_SUPERUSER_IDS)
+
+
 if __name__ == "__main__":
     unittest.main()
