@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # ubuntu-latest (26.04) has no prebuilt Python 3.11.9, and CI should run the
+    # exact version Render uses (.python-version). Move up once one is published.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: pip install -r requirements.txt pytest ruff
+
+      - name: Lint (ruff)
+        run: ruff check --select F,E9,B,S102,S307,ASYNC .
+
+      - name: Test
+        env:
+          # MongoClient connects lazily; nothing in the suite reaches a database.
+          MONGO_URI: mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200
+        run: python -m pytest -q

@@ -92,7 +92,7 @@ def _parse_url(raw: str) -> ParsedQuery:
         parsed = urlparse(raw)
         host: str = (parsed.hostname or "").lower()
     except ValueError:
-        raise InvalidQuery("That doesn't look like a valid link.")
+        raise InvalidQuery("That doesn't look like a valid link.") from None
 
     if parsed.scheme not in ("http", "https") or host not in YOUTUBE_HOSTS:
         raise InvalidQuery("I can only play YouTube and YouTube Music links.")

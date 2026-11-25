@@ -4,16 +4,17 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
+import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import aiohttp
-import sympy
 from word2number import w2n
 
 import discord
@@ -22,6 +23,16 @@ from discord.ext import commands, tasks
 from pymongo import MongoClient, UpdateOne
 from pymongo.collection import Collection
 from pymongo.errors import PyMongoError
+
+from utils.attachment_cache import AttachmentCache
+from utils.runtime_stats import (
+    LoopLagMonitor,
+    peak_rss_bytes,
+    rss_bytes,
+    thread_count,
+    to_mb,
+)
+from utils.safe_math import safe_eval_int
 
 # --------------------------------------------------------------------------- #
 # Logging
@@ -376,7 +387,7 @@ async def backup_guild(guild: discord.Guild, bot: commands.Bot) -> dict:
         backup_data["bot_settings"] = copy.deepcopy(settings)
 
     try:
-        bot.settings.backups.insert_one(backup_data)
+        await asyncio.to_thread(bot.settings.backups.insert_one, backup_data)
         return backup_data
     except Exception as e:
         import logging
@@ -439,12 +450,33 @@ AI_HISTORY_COLLECTION_NAME: str = os.getenv("MONGO_AI_COLLECTION", "ai_history")
 
 # Snowflake-only. Username matching was removed: Discord usernames are user-mutable
 # and re-claimable, so name-based authorization is a privilege-escalation vector.
-_parsed_superusers = _parse_id_set(os.getenv("SUPERUSER_IDS"))
-if _parsed_superusers is None:
-    _parsed_superusers = frozenset(
-        {1120393965485703219, 600689350686146562, 760531428881465366}
-    )
-SUPERUSER_IDS: frozenset = frozenset(list(_parsed_superusers) + [1120393965485703219])
+# Superusers skip every permission check, rate limit and owner check in every
+# server, so the list is exactly what SUPERUSER_IDS says. The built-in fallback is
+# only used (with a warning) when the variable is unset or holds no valid IDs.
+DEFAULT_SUPERUSER_IDS: frozenset = frozenset(
+    {1120393965485703219, 600689350686146562, 760531428881465366}
+)
+
+
+def resolve_superuser_ids(raw: Optional[str]) -> frozenset:
+    """Return the superuser set for a SUPERUSER_IDS value (pure apart from logging)."""
+    if raw is None or not raw.strip():
+        log.warning(
+            "SUPERUSER_IDS is not set; falling back to the built-in superuser list. "
+            "Set SUPERUSER_IDS to control who bypasses every permission check."
+        )
+        return DEFAULT_SUPERUSER_IDS
+    parsed = _parse_id_set(raw)
+    if not parsed:
+        log.warning(
+            "SUPERUSER_IDS contains no valid user IDs; falling back to the built-in "
+            "superuser list."
+        )
+        return DEFAULT_SUPERUSER_IDS
+    return parsed
+
+
+SUPERUSER_IDS: frozenset = resolve_superuser_ids(os.getenv("SUPERUSER_IDS"))
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "echoset": False,
@@ -553,7 +585,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "evasion_days": 30,
         "name_patterns": [],
     },
-    "messagelog": {"enabled": False, "channel_id": None, "ignored_channels": []},
+    "messagelog": {
+        "enabled": False,
+        "channel_id": None,
+        "ignored_channels": [],
+        "cache_attachments": False,
+    },
     "modlog": {"enabled": False, "channel_id": None},
     "modmail": {
         "enabled": False,
@@ -623,32 +660,147 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 # --------------------------------------------------------------------------- #
 
 
-class CountingSaveView(discord.ui.View):
-    def __init__(self, state: dict, guild_id: int, channel_id: int):
-        super().__init__(timeout=None)
-        self.state = state
-        self.guild_id = guild_id
-        self.channel_id = channel_id
+COUNTING_SAVE_ID_PREFIX: str = "counting:save:"
+COUNTING_SAVE_TTL_S: int = 2 * 86400  # save counters are per UTC day
+_COUNTING_LOCKS: Dict[int, asyncio.Lock] = {}
 
-    @discord.ui.button(
-        label="Save Streak (-1 Save)", style=discord.ButtonStyle.success, emoji="🚑"
+
+def _counting_lock(guild_id: int) -> asyncio.Lock:
+    """One lock per guild around every counting read-modify-write."""
+    lock = _COUNTING_LOCKS.get(guild_id)
+    if lock is None:
+        lock = _COUNTING_LOCKS[guild_id] = asyncio.Lock()
+    return lock
+
+
+def _counting_today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _counting_fresh_state(guild_id: int) -> Dict[str, Any]:
+    return {
+        "guild_id": guild_id,
+        "current": 0,
+        "last_user": None,
+        "streak": 0,
+        "broken": False,
+        "broken_time": None,
+    }
+
+
+async def _counting_load(guild_id: int) -> Optional[Dict[str, Any]]:
+    state = await asyncio.to_thread(
+        bot.settings.counting.find_one, {"guild_id": guild_id}
     )
-    async def save_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        settings = bot.settings.peek_settings(self.guild_id)
-        max_saves = settings.get("counting", {}).get("default_saves", 3)
+    if state is not None:
+        state.pop("_id", None)
+    return state
 
-        import datetime
 
-        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-        user_id = interaction.user.id
+async def _counting_store(guild_id: int, state: Dict[str, Any]) -> None:
+    fields = {k: v for k, v in state.items() if k != "_id"}
+    await asyncio.to_thread(
+        bot.settings.counting.update_one,
+        {"guild_id": guild_id},
+        {"$set": fields},
+        upsert=True,
+    )
 
-        save_record = bot.settings.counting_saves.find_one(
-            {"user_id": user_id, "date": today}
+
+def _counting_save_key(guild_id: int, user_id: int, day: str) -> Dict[str, Any]:
+    # guild_id is part of the key: a save used in one server is not used up in others.
+    return {"guild_id": guild_id, "user_id": user_id, "date": day}
+
+
+async def _counting_saves_used(guild_id: int, user_id: int, day: str) -> int:
+    record = await asyncio.to_thread(
+        bot.settings.counting_saves.find_one,
+        _counting_save_key(guild_id, user_id, day),
+    )
+    return int((record or {}).get("used", 0))
+
+
+async def _counting_spend_save(guild_id: int, user_id: int, day: str) -> None:
+    await asyncio.to_thread(
+        bot.settings.counting_saves.update_one,
+        _counting_save_key(guild_id, user_id, day),
+        {
+            "$inc": {"used": 1},
+            "$setOnInsert": {"created_at": datetime.now(timezone.utc)},
+        },
+        upsert=True,
+    )
+
+
+def _counting_max_saves(settings: Dict[str, Any]) -> int:
+    try:
+        return int((settings.get("counting") or {}).get("default_saves", 3))
+    except (TypeError, ValueError):
+        return 3
+
+
+class CountingSaveButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"counting:save:(?P<guild_id>[0-9]{1,20})",
+):
+    """The "Save Streak" button. Persistent: it works after a restart because the
+    guild is in its custom_id and the state is read from the database on click."""
+
+    def __init__(self, guild_id: int) -> None:
+        super().__init__(
+            discord.ui.Button(
+                label="Save Streak (-1 Save)",
+                style=discord.ButtonStyle.success,
+                emoji="\U0001f691",
+                custom_id=f"{COUNTING_SAVE_ID_PREFIX}{guild_id}",
+            )
         )
-        used_saves = save_record["used"] if save_record else 0
+        self.guild_id: int = guild_id
 
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Button,
+        match: "re.Match[str]",
+    ) -> "CountingSaveButton":
+        return cls(int(match["guild_id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await _counting_use_save(interaction, self.guild_id)
+
+
+class CountingSaveView(discord.ui.View):
+    def __init__(self, guild_id: int) -> None:
+        super().__init__(timeout=None)
+        self.add_item(CountingSaveButton(guild_id))
+
+
+def _counting_saved_embed(
+    original: Optional[discord.Embed], user: discord.abc.User, state: Dict[str, Any]
+) -> discord.Embed:
+    embed = original.copy() if original is not None else discord.Embed()
+    embed.color = discord.Color.green()
+    embed.title = "Streak Saved!"
+    embed.description = (
+        f"{user.mention} used a save! The streak continues at "
+        f"**{state['streak']}**. Next number is **{state['current'] + 1}**."
+    )
+    return embed
+
+
+async def _counting_use_save(interaction: discord.Interaction, guild_id: int) -> None:
+    if interaction.guild_id != guild_id:
+        await interaction.response.send_message(
+            "This button belongs to another server.", ephemeral=True
+        )
+        return
+    user_id: int = interaction.user.id
+    today: str = _counting_today()
+    async with _counting_lock(guild_id):
+        settings = await bot.settings.fetch_settings(guild_id)
+        max_saves: int = _counting_max_saves(settings)
+        used_saves: int = await _counting_saves_used(guild_id, user_id, today)
         if used_saves >= max_saves:
             await interaction.response.send_message(
                 f"You have already used all {max_saves} of your saves today!",
@@ -656,49 +808,40 @@ class CountingSaveView(discord.ui.View):
             )
             return
 
-        current_state = bot.settings.counting.find_one({"guild_id": self.guild_id})
-        if not current_state or not current_state.get("broken"):
+        state = await _counting_load(guild_id)
+        if not state or not state.get("broken"):
             await interaction.response.send_message(
                 "The streak is no longer broken!", ephemeral=True
             )
             return
 
-        bot.settings.counting_saves.update_one(
-            {"user_id": user_id, "date": today}, {"$inc": {"used": 1}}, upsert=True
-        )
+        await _counting_spend_save(guild_id, user_id, today)
+        state["broken"] = False
+        state["broken_time"] = None
+        await _counting_store(guild_id, state)
 
-        current_state["broken"] = False
-        current_state["broken_time"] = None
-        bot.settings.counting.update_one(
-            {"guild_id": self.guild_id}, {"$set": current_state}
-        )
-
-        for item in self.children:
-            item.disabled = True
-
-        embed = interaction.message.embeds[0]
-        embed.color = discord.Color.green()
-        embed.title = "Streak Saved!"
-        embed.description = f"{interaction.user.mention} used a save! The streak continues at **{current_state['streak']}**. Next number is **{current_state['current'] + 1}**."
-
-        await interaction.message.edit(embed=embed, view=self)
-        await interaction.response.defer()
+    message = interaction.message
+    original = message.embeds[0] if message is not None and message.embeds else None
+    disabled = CountingSaveView(guild_id)
+    for child in disabled.children:
+        child.disabled = True
+    # Answer the interaction itself (not message.edit + defer), within Discord's 3 s.
+    await interaction.response.edit_message(
+        embed=_counting_saved_embed(original, interaction.user, state), view=disabled
+    )
 
 
 def _parse_counting_number(text: str):
+    """Parse a counting message: a plain number, a restricted calculator expression
+    (see utils.safe_math - no eval), or a spelled-out number. Never raises."""
     if not text or len(text) > 100:
         return None
     text = text.lower().strip()
     if text.isdigit():
         return int(text)
-    try:
-        expr = sympy.sympify(text)
-        if expr.is_real and expr.is_integer:
-            return int(expr)
-        elif expr.is_real and float(expr).is_integer():
-            return int(float(expr))
-    except Exception:
-        pass
+    value = safe_eval_int(text)
+    if value is not None:
+        return value
     try:
         val = w2n.word_to_num(text)
         if isinstance(val, (int, float)) and float(val).is_integer():
@@ -708,8 +851,13 @@ def _parse_counting_number(text: str):
     return None
 
 
+COUNTING_MAX_WORDS = 12
+
+
 def _extract_and_parse_number(content: str):
-    words = content.split()
+    # Only the first few words are tried, longest prefix first, so a long message
+    # costs a bounded amount of parsing.
+    words = (content or "").split()[:COUNTING_MAX_WORDS]
     for i in range(len(words), 0, -1):
         prefix = " ".join(words[:i]).rstrip(",.!?")
         parsed = _parse_counting_number(prefix)
@@ -718,16 +866,31 @@ def _extract_and_parse_number(content: str):
     return None
 
 
-async def _break_counting_streak(message: discord.Message, state: dict, reason: str):
-
+def _counting_mark_broken(state: Dict[str, Any]) -> None:
     state["broken"] = True
     state["broken_time"] = time.time()
-    bot.settings.counting.update_one(
-        {"guild_id": message.guild.id}, {"$set": state}, upsert=True
+
+
+def _counting_broken_embed(
+    author: discord.abc.User, state: Dict[str, Any], reason: str, saves: int
+) -> discord.Embed:
+    per_day: str = f"{saves} save{'s' if saves != 1 else ''} per day"
+    return discord.Embed(
+        title="Streak Broken!",
+        description=(
+            f"{author.mention} ruined the streak at **{state['streak']}**.\n\n"
+            f"{reason}\n\n"
+            f"You have {per_day} to restore the streak. Click below to use one!"
+        ),
+        color=discord.Color.red(),
     )
 
-    # Handle streak ruiner role
-    settings = bot.settings.peek_settings(message.guild.id)
+
+async def _announce_counting_break(
+    message: discord.Message, state: Dict[str, Any], reason: str
+) -> None:
+    """Ruiner role, reaction and the "Streak Broken" message. Runs outside the lock."""
+    settings = await bot.settings.fetch_settings(message.guild.id)
     counting_settings = settings.get("counting") or {}
     ruiner_role_id = counting_settings.get("ruiner_role_id")
     if ruiner_role_id:
@@ -751,96 +914,137 @@ async def _break_counting_streak(message: discord.Message, state: dict, reason: 
             except discord.HTTPException:
                 pass
 
-    embed = discord.Embed(
-        title="Streak Broken!",
-        description=f"{message.author.mention} ruined the streak at **{state['streak']}**.\n\n{reason}\n\nYou have 3 saves per day to restore the streak. Click below to use one!",
-        color=discord.Color.red(),
+    embed = _counting_broken_embed(
+        message.author, state, reason, _counting_max_saves(settings)
     )
     try:
-        await message.add_reaction("❌")
+        await message.add_reaction("\u274c")
     except discord.HTTPException:
         pass
-    view = CountingSaveView(state, message.guild.id, message.channel.id)
-    await message.channel.send(embed=embed, view=view)
+    await message.channel.send(embed=embed, view=CountingSaveView(message.guild.id))
+
+
+def _is_counting_channel(guild_id: int, channel_id: int) -> bool:
+    counting_settings = bot.settings.peek_settings(guild_id).get("counting") or {}
+    configured = counting_settings.get("channel_id")
+    try:
+        return bool(configured) and int(configured) == channel_id
+    except (TypeError, ValueError):
+        return False
+
+
+COUNTING_MILESTONES: Dict[int, str] = {
+    69: "\U0001f60f",
+    77: "\U0001f3b0",
+    100: "\U0001f4af",
+    420: "\U0001f33f",
+    666: "\U0001f608",
+}
+
+
+def _counting_reaction(number: int) -> str:
+    if number in COUNTING_MILESTONES:
+        return COUNTING_MILESTONES[number]
+    if number % 1000 == 0:
+        return "\U0001f389"
+    if number % 100 == 0:
+        return "\U0001f31f"
+    return "\u2705"
 
 
 async def handle_counting(message: discord.Message) -> None:
     if message.author.bot or not message.guild:
         return
-    settings = bot.settings.peek_settings(message.guild.id)
-    counting_settings = settings.get("counting") or {}
-    if not counting_settings.get("channel_id") or message.channel.id != int(
-        counting_settings["channel_id"]
-    ):
+    if not _is_counting_channel(message.guild.id, message.channel.id):
         return
 
     parsed = _extract_and_parse_number(message.content)
     if parsed is None:
         return
 
-    state = bot.settings.counting.find_one({"guild_id": message.guild.id})
-    if not state:
-        state = {
-            "guild_id": message.guild.id,
-            "current": 0,
-            "last_user": None,
-            "streak": 0,
-            "broken": False,
-            "broken_time": None,
-        }
+    guild_id: int = message.guild.id
+    broke_reason: Optional[str] = None
+    async with _counting_lock(guild_id):
+        state = await _counting_load(guild_id) or _counting_fresh_state(guild_id)
 
-    if state.get("broken"):
+        if state.get("broken"):
+            if state.get("broken_time") and time.time() - state["broken_time"] > 86400:
+                state.update(_counting_fresh_state(guild_id))
+                await _counting_store(guild_id, state)
+            else:
+                return
 
-        if state.get("broken_time") and time.time() - state["broken_time"] > 86400:
-            state["broken"] = False
-            state["current"] = 0
-            state["last_user"] = None
-            state["streak"] = 0
-            state["broken_time"] = None
-            bot.settings.counting.update_one(
-                {"guild_id": message.guild.id}, {"$set": state}, upsert=True
-            )
+        expected = state["current"] + 1
+        if parsed != expected:
+            broke_reason = f"Expected {expected}, but got {parsed}."
+        elif state["last_user"] == message.author.id:
+            broke_reason = f"{message.author.mention} tried to count twice in a row!"
+
+        if broke_reason is not None:
+            _counting_mark_broken(state)
         else:
-            return
+            state["current"] = expected
+            state["last_user"] = message.author.id
+            state["streak"] += 1
+        await _counting_store(guild_id, state)
 
-    expected = state["current"] + 1
-    if parsed != expected:
-        await _break_counting_streak(
-            message, state, f"Expected {expected}, but got {parsed}."
-        )
-    elif state["last_user"] == message.author.id:
-        await _break_counting_streak(
-            message, state, f"{message.author.mention} tried to count twice in a row!"
-        )
-    else:
-        state["current"] = expected
-        state["last_user"] = message.author.id
-        state["streak"] += 1
-        bot.settings.counting.update_one(
-            {"guild_id": message.guild.id}, {"$set": state}, upsert=True
-        )
+    if broke_reason is not None:
+        await _announce_counting_break(message, state, broke_reason)
+        return
+    try:
+        await message.add_reaction(_counting_reaction(expected))
+    except discord.HTTPException:
+        pass
 
-        # Add dynamic milestone reactions
-        reaction = "✅"
-        if expected == 69:
-            reaction = "😏"
-        elif expected == 77:
-            reaction = "🎰"
-        elif expected == 100:
-            reaction = "💯"
-        elif expected == 420:
-            reaction = "🌿"
-        elif expected == 666:
-            reaction = "😈"
-        elif expected % 1000 == 0:
-            reaction = "🎉"
-        elif expected % 100 == 0:
-            reaction = "🌟"
 
-        try:
-            await message.add_reaction(reaction)
-        except discord.HTTPException:
-            pass
+async def handle_counting_retraction(
+    message: discord.Message, announce_on: discord.Message, verb: str
+) -> bool:
+    """A valid count was edited or deleted: break the streak. Returns True if it did."""
+    if message.guild is None or message.author.bot:
+        return False
+    if not _is_counting_channel(message.guild.id, message.channel.id):
+        return False
+    parsed = _extract_and_parse_number(message.content)
+    if parsed is None:
+        return False
+    guild_id: int = message.guild.id
+    async with _counting_lock(guild_id):
+        state = await _counting_load(guild_id)
+        if not state or state.get("broken") or parsed != state.get("current"):
+            return False
+        _counting_mark_broken(state)
+        await _counting_store(guild_id, state)
+    await _announce_counting_break(
+        announce_on, state, f"{message.author.mention} {verb} their valid count!"
+    )
+    return True
+
+
+# Fail fast instead of hanging worker threads: a slow Atlas used to hold a call for
+# up to 10 s. Options written in MONGO_URI itself take precedence over these.
+MONGO_CLIENT_DEFAULTS: Dict[str, Any] = {
+    "maxPoolSize": 50,
+    "retryWrites": True,
+    "serverSelectionTimeoutMS": 5_000,
+    "connectTimeoutMS": 5_000,
+    "timeoutMS": 8_000,  # client-side limit for a whole operation, retries included
+}
+
+
+def mongo_client_options(uri: str) -> Dict[str, Any]:
+    """MONGO_CLIENT_DEFAULTS minus any option the URI already sets (case-insensitive)."""
+    query: str = uri.split("?", 1)[1] if "?" in uri else ""
+    in_uri: set = {
+        part.split("=", 1)[0].strip().lower()
+        for part in re.split(r"[&;]", query)
+        if part
+    }
+    return {
+        key: value
+        for key, value in MONGO_CLIENT_DEFAULTS.items()
+        if key.lower() not in in_uri
+    }
 
 
 class MultiTenantSettingsManager:
@@ -849,10 +1053,7 @@ class MultiTenantSettingsManager:
         if not mongo_uri:
             raise RuntimeError("MONGO_URI environment variable is not set.")
         self._client: MongoClient = MongoClient(
-            mongo_uri,
-            maxPoolSize=50,
-            serverSelectionTimeoutMS=10_000,
-            retryWrites=True,
+            mongo_uri, **mongo_client_options(mongo_uri)
         )
         self._collection: Collection = self._client[MONGO_DB_NAME][
             MONGO_COLLECTION_NAME
@@ -963,6 +1164,17 @@ class MultiTenantSettingsManager:
             (self.reminders, "due_at", {}),
             (self.reminders, "user_id", {}),
             (self.backups, "createdAt", {"expireAfterSeconds": 259200}),
+            (self.counting, "guild_id", {}),
+            (
+                self.counting_saves,
+                [("guild_id", 1), ("user_id", 1), ("date", 1)],
+                {},
+            ),
+            (
+                self.counting_saves,
+                "created_at",
+                {"expireAfterSeconds": COUNTING_SAVE_TTL_S},
+            ),
         ):
             try:
                 collection.create_index(spec, **options)
@@ -1020,6 +1232,10 @@ class MultiTenantSettingsManager:
         except PyMongoError as exc:
             log.warning("Database ping failed: %s", exc)
             return False
+
+    def close(self) -> None:
+        """Close the Mongo client (blocking; call from a thread)."""
+        self._client.close()
 
     def cache_stats(self) -> Dict[str, int]:
         return {
@@ -1090,6 +1306,362 @@ async def before_ai_flush_loop() -> None:
     await bot.wait_until_ready()
 
 
+# --------------------------------------------------------------------------- #
+# Clean shutdown (SIGTERM from Render on every deploy / restart)
+# --------------------------------------------------------------------------- #
+
+SHUTDOWN_TIMEOUT_S: float = 20.0  # Render waits 30 s after SIGTERM before SIGKILL
+
+
+class ShutdownState:
+    """Process-wide "we are shutting down" flag, with an event to wait on."""
+
+    def __init__(self) -> None:
+        self.requested: bool = False
+        self.reason: Optional[str] = None
+        self.task: Optional["asyncio.Task[None]"] = None
+        self._event: Optional[asyncio.Event] = None
+
+    def _get_event(self) -> asyncio.Event:
+        if self._event is None:
+            self._event = asyncio.Event()
+            if self.requested:
+                self._event.set()
+        return self._event
+
+    def request(self, reason: str) -> bool:
+        """Set the flag. Returns False if a shutdown was already requested."""
+        if self.requested:
+            return False
+        self.requested = True
+        self.reason = reason
+        if self._event is not None:
+            self._event.set()
+        return True
+
+    async def wait(self, within: Optional[float] = None) -> bool:
+        """Wait until shutdown is requested (or ``within`` seconds). Returns the flag."""
+        if self.requested:
+            return True
+        try:
+            await asyncio.wait_for(self._get_event().wait(), within)
+        except asyncio.TimeoutError:
+            pass
+        return self.requested
+
+    def reset(self) -> None:  # tests only
+        self.__init__()
+
+
+SHUTDOWN: ShutdownState = ShutdownState()
+
+
+async def _close_within(
+    close: Callable[[], Any], budget: float = SHUTDOWN_TIMEOUT_S
+) -> None:
+    try:
+        await asyncio.wait_for(close(), budget)
+    except asyncio.TimeoutError:
+        log.warning("Shutdown took longer than %.0fs; exiting anyway.", budget)
+    except Exception:
+        log.exception("Shutdown failed part-way; exiting anyway.")
+
+
+def handle_shutdown_signal(
+    signal_name: str, close: Callable[[], Any]
+) -> Optional["asyncio.Task[None]"]:
+    """Signal handler body: set the flag once and schedule ``close()`` (time-boxed)."""
+    if not SHUTDOWN.request(signal_name):
+        return None
+    log.info("Shutting down (%s).", signal_name)
+    SHUTDOWN.task = asyncio.get_running_loop().create_task(
+        _close_within(close), name="shutdown"
+    )
+    return SHUTDOWN.task
+
+
+def install_signal_handlers(
+    loop: asyncio.AbstractEventLoop, close: Callable[[], Any]
+) -> List[str]:
+    """Route SIGTERM/SIGINT to handle_shutdown_signal where the platform allows it."""
+    installed: List[str] = []
+    for name in ("SIGTERM", "SIGINT"):
+        sig: Any = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, handle_shutdown_signal, name, close)
+        except (NotImplementedError, RuntimeError, ValueError, AttributeError):
+            continue  # e.g. Windows, or not in the main thread
+        installed.append(name)
+    return installed
+
+
+async def supervise(
+    start: Callable[[], Any],
+    *,
+    is_closed: Callable[[], bool] = lambda: False,
+    base_backoff: float = 15.0,
+    max_backoff: float = 300.0,
+) -> str:
+    """Run ``start()`` and reconnect with backoff, unless a shutdown was requested.
+
+    Returns why it stopped: "clean", "shutdown" or "closed".
+    """
+    backoff: float = base_backoff
+    while not SHUTDOWN.requested:
+        attempt_started: float = time.monotonic()
+        try:
+            await start()
+            if SHUTDOWN.requested:
+                break
+            log.info("Gateway session closed cleanly - exiting supervisor.")
+            return "clean"
+        except (discord.LoginFailure, discord.PrivilegedIntentsRequired) as exc:
+            log.critical("Unrecoverable startup failure: %s", exc)
+            raise SystemExit(1) from exc
+        except discord.HTTPException as exc:
+            if exc.status == 429:
+                log.warning("Rate limited (HTTP 429) during startup: %s", exc)
+            else:
+                log.warning(
+                    "HTTP error during startup (status %s): %s", exc.status, exc
+                )
+        except (
+            discord.ConnectionClosed,
+            discord.GatewayNotFound,
+            aiohttp.ClientError,
+            OSError,
+        ) as exc:
+            log.warning("Transport failure: %s", exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Unexpected supervisor failure.")
+
+        if SHUTDOWN.requested:
+            break
+        if is_closed():
+            # discord.py closed the client itself; it can't log in again in-process.
+            log.warning("Client was closed - exiting so the host restarts the process.")
+            return "closed"
+
+        if time.monotonic() - attempt_started > 600:
+            backoff = base_backoff  # A long-lived session earns a fresh budget.
+
+        delay: float = backoff + random.uniform(0.0, 5.0)
+        log.info("Reconnecting in %.1fs.", delay)
+        if await SHUTDOWN.wait(delay):
+            break
+        backoff = min(backoff * 2, max_backoff)
+    log.info("Shutdown requested - not reconnecting.")
+    return "shutdown"
+
+
+# --------------------------------------------------------------------------- #
+# State janitor - drops per-channel / per-user state nobody has touched lately
+# --------------------------------------------------------------------------- #
+
+STATE_IDLE_SECONDS: float = 3600.0
+
+
+def _latest_stamp(value: Any) -> Optional[float]:
+    """The most recent timestamp held by a tracker value, if it has one."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (list, tuple)):
+        stamps = [v for v in value if isinstance(v, (int, float))]
+        return max(stamps) if stamps else None
+    if isinstance(value, dict):
+        at = value.get("at")
+        return float(at) if isinstance(at, (int, float)) else None
+    return None
+
+
+def _prune_stamped(
+    mapping: Dict[Any, Any], now: float, idle: float = STATE_IDLE_SECONDS
+) -> int:
+    """Remove entries whose newest timestamp is older than ``idle`` (or missing)."""
+    stale = [
+        key
+        for key, value in mapping.items()
+        if (stamp := _latest_stamp(value)) is None or now - stamp > idle
+    ]
+    for key in stale:
+        mapping.pop(key, None)
+    return len(stale)
+
+
+def prune_idle_state(
+    target: Any,
+    *,
+    now: float,
+    today: str,
+    idle: float = STATE_IDLE_SECONDS,
+    extra_stamped: Optional[Dict[str, Dict[Any, Any]]] = None,
+    monotonic_now: Optional[float] = None,
+    monotonic_stamped: Optional[Dict[str, Dict[Any, Any]]] = None,
+) -> Dict[str, int]:
+    """Drop idle per-channel / per-user state from ``target`` (the bot). Pure: no I/O.
+
+    ``now`` is wall-clock (time.time()) and ``today`` is the UTC date
+    (YYYY-MM-DD). Never removes a lock that is held. Returns removals per store.
+    """
+    removed: Dict[str, int] = {}
+
+    for name in ("automod_recent", "automod_strikes", "ai_user_recent", "ai_repeat"):
+        mapping = getattr(target, name, None)
+        if isinstance(mapping, dict):
+            removed[name] = _prune_stamped(mapping, now, idle)
+
+    sticky_last: Dict[int, float] = getattr(target, "sticky_last", {})
+    removed["sticky_last"] = _prune_stamped(sticky_last, now, idle)
+    sticky_locks: Dict[int, asyncio.Lock] = getattr(target, "sticky_locks", {})
+    idle_locks = [
+        key
+        for key, lock in sticky_locks.items()
+        if key not in sticky_last and not lock.locked()
+    ]
+    for key in idle_locks:
+        sticky_locks.pop(key, None)
+    removed["sticky_locks"] = len(idle_locks)
+
+    ai_daily: Dict[str, int] = getattr(target, "ai_daily", {})
+    old_days = [key for key in ai_daily if not key.endswith(f":{today}")]
+    for key in old_days:
+        ai_daily.pop(key, None)
+    removed["ai_daily"] = len(old_days)
+
+    snipes: Dict[int, Any] = getattr(target, "snipes", {})
+    old_snipes = []
+    for key, sniped in snipes.items():
+        deleted_at = getattr(sniped, "deleted_at", None)
+        if deleted_at is None or now - deleted_at.timestamp() > idle:
+            old_snipes.append(key)
+    for key in old_snipes:
+        snipes.pop(key, None)
+    removed["snipes"] = len(old_snipes)
+
+    # next_fire holds the *next* due time; one overdue by more than `idle` is no
+    # longer serviced by the reminder loop (reminder disabled or guild left).
+    next_fire: Dict[str, float] = getattr(target, "next_fire", {})
+    overdue = [key for key, due in next_fire.items() if now - float(due) > idle]
+    for key in overdue:
+        next_fire.pop(key, None)
+    removed["next_fire"] = len(overdue)
+
+    # Cached starboard webhooks for channels the bot can no longer see.
+    webhooks: Dict[int, Any] = getattr(target, "starboard_webhooks", {})
+    is_ready = getattr(target, "is_ready", None)
+    if callable(is_ready) and is_ready():
+        gone = [cid for cid in webhooks if target.get_channel(cid) is None]
+        for cid in gone:
+            webhooks.pop(cid, None)
+        removed["starboard_webhooks"] = len(gone)
+
+    for name, mapping in (extra_stamped or {}).items():
+        removed[name] = _prune_stamped(mapping, now, idle)
+    if monotonic_now is not None:
+        for name, mapping in (monotonic_stamped or {}).items():
+            removed[name] = _prune_stamped(mapping, monotonic_now, idle)
+    return removed
+
+
+@tasks.loop(minutes=10)
+async def state_janitor_loop() -> None:
+    removed = prune_idle_state(
+        bot,
+        now=time.time(),
+        today=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        extra_stamped={"modmail_last_open": _MODMAIL_LAST_OPEN},
+        monotonic_now=time.monotonic(),
+        monotonic_stamped={"command_cooldowns": _COOLDOWN_STATE},
+    )
+    music = bot.get_cog("Music")
+    prune_players = getattr(music, "prune_idle_players", None)
+    if callable(prune_players):
+        removed["music_players"] = await prune_players(STATE_IDLE_SECONDS)
+    total = sum(removed.values())
+    if total:
+        log.info(
+            "State janitor removed %d idle entries (%s).",
+            total,
+            ", ".join(f"{k}={v}" for k, v in sorted(removed.items()) if v),
+        )
+
+
+@state_janitor_loop.before_loop
+async def before_state_janitor_loop() -> None:
+    await bot.wait_until_ready()
+
+
+# --------------------------------------------------------------------------- #
+# Runtime stats - one source for the memory log, /diagnose and /health
+# --------------------------------------------------------------------------- #
+
+
+def collect_runtime_stats(target: Any) -> Dict[str, Any]:
+    """Process and in-memory state numbers. Never touches the database or network."""
+    rss = rss_bytes()
+    stats: Dict[str, Any] = {
+        "rss_mb": to_mb(rss),
+        "peak_rss_mb": to_mb(peak_rss_bytes()),
+        "guilds": len(getattr(target, "guilds", None) or []),
+        "threads": thread_count(),
+    }
+    settings = getattr(target, "settings", None)
+    try:
+        stats["settings_cache_entries"] = int(settings.cache_stats()["entries"])
+    except Exception:
+        stats["settings_cache_entries"] = None
+    cache = getattr(target, "attachment_cache", None)
+    try:
+        stats["attachment_cache"] = cache.stats()
+    except Exception:
+        stats["attachment_cache"] = None
+    buffers: Dict[int, List[Any]] = getattr(target, "ai_history_buffer", None) or {}
+    pending: Dict[int, List[Any]] = getattr(target, "ai_pending", None) or {}
+    stats["ai_buffer_channels"] = len(buffers)
+    stats["ai_buffer_messages"] = sum(len(v) for v in buffers.values())
+    stats["ai_pending_messages"] = sum(len(v) for v in pending.values())
+    stats["snipes"] = len(getattr(target, "snipes", None) or {})
+    stats["background_tasks"] = len(getattr(target, "_background_tasks", None) or ())
+    try:
+        stats["asyncio_tasks"] = len(asyncio.all_tasks())
+    except RuntimeError:
+        stats["asyncio_tasks"] = None
+    stats["voice_clients"] = len(getattr(target, "voice_clients", None) or [])
+    lag = getattr(target, "loop_lag", None)
+    stats["loop_lag"] = lag.stats() if isinstance(lag, LoopLagMonitor) else None
+    return stats
+
+
+def _format_memory_line(stats: Dict[str, Any]) -> str:
+    cache = stats.get("attachment_cache") or {}
+    return (
+        f"rss_mb={stats.get('rss_mb')} peak_rss_mb={stats.get('peak_rss_mb')} "
+        f"guilds={stats.get('guilds')} "
+        f"settings_cache={stats.get('settings_cache_entries')} "
+        f"attachment_cache_bytes={cache.get('bytes', 0)} "
+        f"attachment_cache_entries={cache.get('entries', 0)} "
+        f"ai_buffer_channels={stats.get('ai_buffer_channels')} "
+        f"ai_buffer_messages={stats.get('ai_buffer_messages')} "
+        f"ai_pending={stats.get('ai_pending_messages')} "
+        f"snipes={stats.get('snipes')} threads={stats.get('threads')} "
+        f"tasks={stats.get('asyncio_tasks')}"
+    )
+
+
+@tasks.loop(minutes=30)
+async def memory_report_loop() -> None:
+    log.info("Memory: %s", _format_memory_line(collect_runtime_stats(bot)))
+
+
+@memory_report_loop.before_loop
+async def before_memory_report_loop() -> None:
+    await bot.wait_until_ready()
+
+
 class DebtCollectorBot(commands.Bot):
     def __init__(self, settings_manager: MultiTenantSettingsManager) -> None:
         intents: discord.Intents = discord.Intents.default()
@@ -1133,6 +1705,12 @@ class DebtCollectorBot(commands.Bot):
         self.automod_strikes: Dict[Any, List[float]] = {}
         self.errors: ErrorRecorder = ErrorRecorder()
         self._background_tasks: set = set()
+        # Attachments of recent messages, so the message log can re-upload them
+        # after a delete. Byte-budgeted LRU (ATTACHMENT_CACHE_MB / _TTL_S).
+        self.attachment_cache: AttachmentCache = AttachmentCache()
+        self.attachment_semaphore: asyncio.Semaphore = asyncio.Semaphore(2)
+        self.loop_lag: LoopLagMonitor = LoopLagMonitor()
+        self._closing_started: bool = False
 
     def spawn(self, coro: Any, *, name: Optional[str] = None) -> Any:
         """Fire-and-forget with a hard reference and a terminal error sink."""
@@ -1177,6 +1755,7 @@ class DebtCollectorBot(commands.Bot):
             log.warning("Index setup failed: %s", exc)
         self.add_view(ModmailPanelView())
         self.add_view(TicketCloseView())
+        self.add_dynamic_items(CountingSaveButton)
         try:
             await self.load_extension("cogs.music")
         except Exception as exc:
@@ -1187,9 +1766,12 @@ class DebtCollectorBot(commands.Bot):
             ai_flush_loop,
             tempban_loop,
             personal_reminder_loop,
+            state_janitor_loop,
+            memory_report_loop,
         ):
             if not loop_task.is_running():
                 loop_task.start()
+        self.loop_lag.start()
 
     async def _sync_commands_if_changed(self) -> None:
         """Only hit Discord's sync endpoint when the command surface actually changed."""
@@ -1214,14 +1796,59 @@ class DebtCollectorBot(commands.Bot):
         else:
             log.info("Command signature unchanged — skipping sync.")
 
+    async def _leave_voice(self) -> None:
+        # Unloading the music cog runs its cog_unload, which stops every player and
+        # disconnects it the same way /stop does.
+        if "cogs.music" in self.extensions:
+            try:
+                await self.unload_extension("cogs.music")
+            except Exception as exc:
+                log.warning("Unloading the music cog failed: %s", exc)
+        for voice_client in list(self.voice_clients):
+            try:
+                await voice_client.disconnect(force=True)
+            except Exception as exc:
+                log.debug("Voice disconnect failed: %s", exc)
+
+    async def _close_http_session(self) -> None:
+        session, self.http_session = self.http_session, None
+        if session is not None and not session.closed:
+            await session.close()
+
+    @staticmethod
+    def _stop_warp() -> None:
+        from utils import warp
+
+        warp.stop()
+
     async def close(self) -> None:
-        try:
-            await ai_flush()
-        except Exception as exc:
-            log.warning("AI flush on shutdown failed: %s", exc)
-        if self.http_session is not None:
-            await self.http_session.close()
+        """Flush AI history, leave voice, close HTTP + Mongo, stop WARP, then the gateway.
+
+        Each step has its own time budget so one slow step can't eat Render's grace
+        period; the signal path also wraps the whole thing in SHUTDOWN_TIMEOUT_S.
+        """
+        if self._closing_started:
+            await super().close()
+            return
+        self._closing_started = True
+        started: float = time.monotonic()
+
+        async def step(name: str, action: Callable[[], Any], budget: float) -> None:
+            try:
+                await asyncio.wait_for(action(), budget)
+            except asyncio.TimeoutError:
+                log.warning("Shutdown step '%s' timed out after %.0fs.", name, budget)
+            except Exception as exc:
+                log.warning("Shutdown step '%s' failed: %s", name, exc)
+
+        await step("flush AI history", ai_flush, 6.0)
+        await step("disconnect voice", self._leave_voice, 4.0)
+        await step("close HTTP session", self._close_http_session, 2.0)
+        await step("close MongoDB", lambda: asyncio.to_thread(self.settings.close), 3.0)
+        await step("stop WARP", lambda: asyncio.to_thread(self._stop_warp), 3.0)
+        self.loop_lag.stop()
         await super().close()
+        log.info("Shutdown finished in %.1fs.", time.monotonic() - started)
 
 
 settings_manager: MultiTenantSettingsManager = MultiTenantSettingsManager()
@@ -1572,7 +2199,7 @@ def humanize_seconds(seconds: float) -> str:
     return f"{d:.0f}d {h:.0f}h"
 
 
-from utils.pagination import (
+from utils.pagination import (  # noqa: F401 # re-exported: tests import paginate_lines from main
     EMBED_DESCRIPTION_LIMIT,
     paginate_lines,
     Paginator,
@@ -1609,20 +2236,7 @@ async def on_message_edit(before: discord.Message, after: discord.Message) -> No
     if before.content == after.content:
         return
     try:
-        settings = bot.settings.peek_settings(before.guild.id)
-        counting_settings = settings.get("counting") or {}
-        if counting_settings.get("channel_id") and before.channel.id == int(
-            counting_settings["channel_id"]
-        ):
-            parsed = _extract_and_parse_number(before.content)
-            if parsed is not None:
-                state = bot.settings.counting.find_one({"guild_id": before.guild.id})
-                if state and not state.get("broken") and parsed == state.get("current"):
-                    await _break_counting_streak(
-                        after,
-                        state,
-                        f"{after.author.mention} edited their valid count!",
-                    )
+        await handle_counting_retraction(before, after, "edited")
     except Exception as exc:
         log.error("on_message_edit counting error: %s", exc)
 
@@ -1647,20 +2261,7 @@ async def on_message_delete(message: discord.Message) -> None:
         log.error("on_message_delete error: %s", exc)
 
     try:
-        settings = bot.settings.peek_settings(message.guild.id)
-        counting_settings = settings.get("counting") or {}
-        if counting_settings.get("channel_id") and message.channel.id == int(
-            counting_settings["channel_id"]
-        ):
-            parsed = _extract_and_parse_number(message.content)
-            if parsed is not None:
-                state = bot.settings.counting.find_one({"guild_id": message.guild.id})
-                if state and not state.get("broken") and parsed == state.get("current"):
-                    await _break_counting_streak(
-                        message,
-                        state,
-                        f"{message.author.mention} deleted their valid count!",
-                    )
+        await handle_counting_retraction(message, message, "deleted")
     except Exception as exc:
         log.error("on_message_delete counting error: %s", exc)
 
@@ -1760,24 +2361,45 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
             bot.log_error("reactionrole:remove", exc, guild=guild, user=member)
 
 
+def _is_cacheable_media(attachment: Any) -> bool:
+    content_type: str = getattr(attachment, "content_type", None) or ""
+    return content_type.startswith("image/") or content_type.startswith("video/")
+
+
+def _attachments_to_cache(message: discord.Message) -> List[Any]:
+    """Attachments of ``message`` the message-log cache should download, if any."""
+    if message.guild is None or not message.attachments:
+        return []
+    if message.author.bot and not getattr(message, "webhook_id", None):
+        return []  # the message log never reports deletes of bot messages
+    config: Dict[str, Any] = _messagelog_config(message.guild.id)
+    if not config.get("cache_attachments"):
+        return []
+    if not config.get("enabled") or not config.get("channel_id"):
+        return []
+    if _messagelog_skip(message.guild.id, message.channel.id):
+        return []
+    cache: AttachmentCache = bot.attachment_cache
+    return [
+        a
+        for a in message.attachments
+        if _is_cacheable_media(a) and cache.accepts(getattr(a, "size", None))
+    ]
+
+
 async def _cache_single_attachment(
     message_id: int, attachment: discord.Attachment
 ) -> None:
+    cache: AttachmentCache = bot.attachment_cache
+    if not cache.accepts(getattr(attachment, "size", None)):
+        return
     try:
-        data = await attachment.read()
-        if not hasattr(bot, "attachment_cache"):
-            bot.attachment_cache = {}
-        if message_id not in bot.attachment_cache:
-            bot.attachment_cache[message_id] = []
-        bot.attachment_cache[message_id].append(
-            {
-                "filename": attachment.filename,
-                "content_type": attachment.content_type,
-                "data": data,
-            }
-        )
-    except Exception as exc:
+        async with bot.attachment_semaphore:
+            data = await attachment.read()
+    except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError) as exc:
         log.debug("Failed to cache attachment: %s", exc)
+        return
+    cache.put(message_id, attachment.filename, attachment.content_type, data)
 
 
 def _extract_message_text(message: discord.Message) -> str:
@@ -1787,11 +2409,11 @@ def _extract_message_text(message: discord.Message) -> str:
             parts.append(embed.title)
         if embed.description:
             parts.append(embed.description)
-        for field in embed.fields:
-            if field.name:
-                parts.append(field.name)
-            if field.value:
-                parts.append(field.value)
+        for embed_field in embed.fields:
+            if embed_field.name:
+                parts.append(embed_field.name)
+            if embed_field.value:
+                parts.append(embed_field.value)
         if embed.author and embed.author.name:
             parts.append(embed.author.name)
         if embed.footer and embed.footer.text:
@@ -1809,35 +2431,11 @@ async def on_message(message: discord.Message) -> None:
             await _handle_afk_return(message)
             await _handle_afk_mentions(message)
 
-        if message.attachments:
-            config = (
-                bot.settings.peek_settings(message.guild.id).get("messagelog") or {}
+        for attachment in _attachments_to_cache(message):
+            bot.spawn(
+                _cache_single_attachment(message.id, attachment),
+                name=f"attachment-cache:{message.id}",
             )
-            if config.get("cache_attachments"):
-                # limit cache size
-                if len(getattr(bot, "attachment_cache", {})) > 500:
-                    bot.attachment_cache = {}
-
-                cached_files = []
-                for a in message.attachments:
-                    if (
-                        a.content_type
-                        and (
-                            a.content_type.startswith("image/")
-                            or a.content_type.startswith("video/")
-                        )
-                        and a.size < 5_000_000
-                    ):
-                        try:
-                            # We can just store the proxy URL or bytes, but to send we need bytes.
-                            # It's better to fetch and store bytes in memory.
-                            # But wait! If we do it synchronously here we block on_message.
-                            # Let's spawn a task.
-                            bot.loop.create_task(
-                                _cache_single_attachment(message.id, a)
-                            )
-                        except Exception:
-                            pass
 
         settings: Dict[str, Any] = bot.settings.peek_settings(message.guild.id)
         autopurge: Dict[str, Any] = settings.get("autopurge") or {
@@ -2081,18 +2679,18 @@ async def joinrole_cmd(ctx: commands.Context, *, role: str):
     if resolved is None:
         return await ctx.send("❌ No role found.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     joinroles = settings.get("joinroles", [])
 
     if str(resolved.id) in joinroles:
         joinroles.remove(str(resolved.id))
-        bot.settings.update_settings(ctx.guild.id, {"joinroles": joinroles})
+        await bot.settings.push_settings(ctx.guild.id, {"joinroles": joinroles})
         await ctx.send(
             f"✅ **{resolved.name}** will no longer be given to new joiners."
         )
     else:
         joinroles.append(str(resolved.id))
-        bot.settings.update_settings(ctx.guild.id, {"joinroles": joinroles})
+        await bot.settings.push_settings(ctx.guild.id, {"joinroles": joinroles})
         await ctx.send(f"✅ **{resolved.name}** will now be given to all new joiners.")
 
 
@@ -2233,19 +2831,19 @@ async def reactionrole_group(
             ephemeral=True,
         )
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     reactionroles = settings.get("reactionroles", {})
     key = f"{msg.id}_{emoji}"
 
     if key in reactionroles and reactionroles[key] == str(resolved.id):
         del reactionroles[key]
-        bot.settings.update_settings(ctx.guild.id, {"reactionroles": reactionroles})
+        await bot.settings.push_settings(ctx.guild.id, {"reactionroles": reactionroles})
         await ctx.send(
             f"✅ Removed reaction role **{resolved.name}** from that message."
         )
     else:
         reactionroles[key] = str(resolved.id)
-        bot.settings.update_settings(ctx.guild.id, {"reactionroles": reactionroles})
+        await bot.settings.push_settings(ctx.guild.id, {"reactionroles": reactionroles})
         await ctx.send(
             f"✅ Added reaction role **{resolved.name}** to that message. Users who react with {emoji} will receive the role."
         )
@@ -2264,7 +2862,7 @@ async def reactionrole_list(ctx: commands.Context):
     if not member_has_perms(ctx.author, manage_roles=True):
         return await ctx.send("❌ You need Manage Roles permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     reactionroles: Dict[str, Any] = settings.get("reactionroles", {}) or {}
     if not reactionroles:
         return await ctx.send(
@@ -2315,7 +2913,7 @@ async def reactionrole_remove(
             "❌ Give me a message ID or a message link.", ephemeral=True
         )
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     reactionroles: Dict[str, Any] = dict(settings.get("reactionroles", {}) or {})
     targets: List[str] = [
         key
@@ -2374,7 +2972,7 @@ async def reaction_cmd(ctx: commands.Context, link: str, emoji: str):
 
 
 # --------------------------------------------------------------------------- #
-# MODERATION & UTILITY (Migrated from bot.py)
+# MODERATION & UTILITY
 # --------------------------------------------------------------------------- #
 
 
@@ -2498,7 +3096,7 @@ async def softban_cmd(
 
     try:
         await user.ban(reason=f"Softban: {reason}", delete_message_days=7)
-        await ctx.guild.unban(user, reason=f"Softban release")
+        await ctx.guild.unban(user, reason="Softban release")
         await ctx.send(f"🔨 **{user}** was softbanned. Reason: {reason}")
         embed = discord.Embed(title="Member Softbanned", color=discord.Color.orange())
         embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
@@ -2584,7 +3182,7 @@ async def warn_cmd(
 ):
     if not member_has_perms(ctx.author, manage_messages=True):
         return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     warns = settings.setdefault("warns", {})
     uw = warns.setdefault(str(user.id), [])
     if dm:
@@ -2595,7 +3193,7 @@ async def warn_cmd(
         except discord.DiscordException:
             pass
     uw.append({"reason": reason, "by": ctx.author.id, "at": int(time.time())})
-    bot.settings.update_settings(ctx.guild.id, {"warns": warns})
+    await bot.settings.push_settings(ctx.guild.id, {"warns": warns})
     await ctx.send(f"⚠️ **{user}** was warned. Reason: {reason}")
     embed = discord.Embed(title="Member Warned", color=discord.Color.gold())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
@@ -2611,7 +3209,7 @@ async def warn_cmd(
 @commands.guild_only()
 @app_commands.describe(user="Whose warnings to show")
 async def warnings_cmd(ctx: commands.Context, user: discord.Member):
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     uw = settings.get("warns", {}).get(str(user.id), [])
     if not uw:
         return await ctx.send(f"**{user}** has no warnings.", ephemeral=True)
@@ -2637,11 +3235,11 @@ async def warnings_cmd(ctx: commands.Context, user: discord.Member):
 async def clearwarns_cmd(ctx: commands.Context, user: discord.Member):
     if not member_has_perms(ctx.author, manage_messages=True):
         return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     warns = settings.get("warns", {})
     if str(user.id) in warns:
         del warns[str(user.id)]
-        bot.settings.update_settings(ctx.guild.id, {"warns": warns})
+        await bot.settings.push_settings(ctx.guild.id, {"warns": warns})
 
     strike_key = (ctx.guild.id, user.id)
     if strike_key in bot.automod_strikes:
@@ -3115,6 +3713,8 @@ COMMAND_CATEGORY: Dict[str, str] = {
     "remind": "config",
     "export": "config",
     "import": "config",
+    "clone_server": "config",
+    "rollback_clone": "config",
     "errors": "config",
     "diagnose": "config",
     "screening": "config",
@@ -3212,7 +3812,6 @@ COMMAND_SUMMARY: Dict[str, str] = {
     # --- Configuration ---
     "set": "Core server configuration.",
     "set prefix": "Change the chat command prefix for this server (default `!`).",
-    "set modlog": "Send a log of every moderation action to a channel; empty turns it off.",
     "echoset": "Allow or block the /echo command server-wide.",
     "autoreact": "React with chosen emojis whenever a message contains a trigger word.",
     "autoreact add": "Add a trigger plus the emojis to react with, and whether it matches "
@@ -3283,8 +3882,8 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "leaver off": "Stop announcing leaves, keeping the message and styling.",
     "set messagelog": "Choose the channel edited and deleted messages are logged to.",
     "set modlog": "Choose the channel moderation actions are logged to.",
-    "diagnose": "Health check: gateway latency, database reachability, background loops, "
-    "cache hit rate and the bot's missing permissions.",
+    "diagnose": "Health check: gateway, database, memory, event-loop lag, music/WARP, "
+    "background loops and the bot's missing permissions.",
     # --- AI ---
     "ai": "Configure the AI assistant for this server.",
     "ai setup": "Enable or disable the AI in a channel and set its reply chance.",
@@ -3706,7 +4305,7 @@ async def echoset(ctx: commands.Context, state: Literal["on", "off"]) -> None:
         )
         return
     enabled: bool = state == "on"
-    saved: bool = bot.settings.update_settings(ctx.guild.id, {"echoset": enabled})  # type: ignore[union-attr]
+    saved: bool = await bot.settings.push_settings(ctx.guild.id, {"echoset": enabled})  # type: ignore[union-attr]
     if saved:
         await ctx.send(
             f"📢 Echo is now **{'enabled' if enabled else 'disabled'}** for this server."
@@ -3741,7 +4340,7 @@ async def echo(
         await ctx.send("❌ You must provide a message to echo.", ephemeral=True)
         return
 
-    settings: Dict[str, Any] = bot.settings.get_settings(guild.id)
+    settings: Dict[str, Any] = await bot.settings.fetch_settings(guild.id)
     if not settings.get("echoset", False):
         await ctx.send(
             "❌ Echo is disabled on this server. An admin can enable it with `/echoset on`.",
@@ -3855,10 +4454,12 @@ async def autopurge_on(
     if hours or days:
         until = int(time.time()) + (hours or 0) * 3600 + (days or 0) * 86400
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.setdefault("autopurge", {"channels": {}, "exempt_roles": []})
-    ap["channels"][str(channel.id)] = {"until": until}
-    bot.settings.update_settings(ctx.guild.id, settings)
+    ap.setdefault("channels", {})[str(channel.id)] = {"until": until}
+    await bot.settings.push_fields(
+        ctx.guild.id, {f"autopurge.channels.{channel.id}": {"until": until}}
+    )
 
     when = f"until <t:{until}:f>" if until else "until you run `/autopurge off`"
     await ctx.send(
@@ -3878,12 +4479,13 @@ async def autopurge_off(
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
     channel = channel or ctx.channel
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.get("autopurge", {"channels": {}, "exempt_roles": []})
-    removed = ap["channels"].pop(str(channel.id), None)
+    channels = ap.setdefault("channels", {})
+    removed = channels.pop(str(channel.id), None)
 
     if removed:
-        bot.settings.update_settings(ctx.guild.id, settings)
+        await bot.settings.push_fields(ctx.guild.id, {"autopurge.channels": channels})
 
     msg = (
         f"✅ Auto-purge turned off in {channel.mention}."
@@ -3905,7 +4507,7 @@ async def autopurge_exempt(
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.setdefault("autopurge", {"channels": {}, "exempt_roles": []})
     exempt = ap["exempt_roles"]
 
@@ -3919,7 +4521,7 @@ async def autopurge_exempt(
     else:
         msg = f"{role.mention} wasn't exempt."
 
-    bot.settings.update_settings(ctx.guild.id, settings)
+    await bot.settings.push_fields(ctx.guild.id, {"autopurge.exempt_roles": exempt})
     await ctx.send(msg, ephemeral=True)
 
 
@@ -3947,7 +4549,7 @@ async def autopurge_msg_on(
     if hours or days:
         until = int(time.time()) + (hours or 0) * 3600 + (days or 0) * 86400
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.setdefault(
         "autopurge", {"channels": {}, "exempt_roles": [], "users": {}, "messages": {}}
     )
@@ -3955,7 +4557,8 @@ async def autopurge_msg_on(
 
     key = f"{match_type}:{text}"
     messages_dict[key] = {"until": until, "text": text, "match_type": match_type}
-    bot.settings.update_settings(ctx.guild.id, settings)
+    # The key holds user text (may contain "." or "$"), so write the whole map.
+    await bot.settings.push_fields(ctx.guild.id, {"autopurge.messages": messages_dict})
 
     when = f"until <t:{until}:f>" if until else "until you run `/autopurge msg_off`"
 
@@ -3989,7 +4592,7 @@ async def autopurge_msg_off(
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.get(
         "autopurge", {"channels": {}, "exempt_roles": [], "users": {}, "messages": {}}
     )
@@ -3999,7 +4602,9 @@ async def autopurge_msg_off(
     removed = messages_dict.pop(key, None)
 
     if removed:
-        bot.settings.update_settings(ctx.guild.id, settings)
+        await bot.settings.push_fields(
+            ctx.guild.id, {"autopurge.messages": messages_dict}
+        )
 
     msg = (
         f"✅ Auto-purge turned off for messages matching `{text}`."
@@ -4031,14 +4636,17 @@ async def autopurge_user_on(
     if hours or days:
         until = int(time.time()) + (hours or 0) * 3600 + (days or 0) * 86400
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.setdefault(
         "autopurge", {"channels": {}, "exempt_roles": [], "users": {}}
     )
     users = ap.setdefault("users", {})
 
     users[str(user.id)] = {"until": until, "exempt_channels": []}
-    bot.settings.update_settings(ctx.guild.id, settings)
+    await bot.settings.push_fields(
+        ctx.guild.id,
+        {f"autopurge.users.{user.id}": {"until": until, "exempt_channels": []}},
+    )
 
     when = (
         f"until <t:{until}:f>"
@@ -4061,14 +4669,14 @@ async def autopurge_user_off(ctx: commands.Context, user: discord.Member):
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.get("autopurge", {"channels": {}, "exempt_roles": [], "users": {}})
     users = ap.get("users", {})
 
     removed = users.pop(str(user.id), None)
 
     if removed:
-        bot.settings.update_settings(ctx.guild.id, settings)
+        await bot.settings.push_fields(ctx.guild.id, {"autopurge.users": users})
 
     msg = (
         f"✅ Auto-purge turned off for {user.mention}."
@@ -4094,7 +4702,7 @@ async def autopurge_user_exempt(
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.setdefault(
         "autopurge", {"channels": {}, "exempt_roles": [], "users": {}}
     )
@@ -4120,7 +4728,10 @@ async def autopurge_user_exempt(
     else:
         msg = f"{channel.mention} wasn't exempt for {user.mention}."
 
-    bot.settings.update_settings(ctx.guild.id, settings)
+    await bot.settings.push_fields(
+        ctx.guild.id,
+        {f"autopurge.users.{user.id}.exempt_channels": exempt_channels},
+    )
     await ctx.send(msg, ephemeral=True)
 
 
@@ -4131,7 +4742,7 @@ async def autopurge_status(ctx: commands.Context):
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.get("autopurge", {"channels": {}, "exempt_roles": [], "users": {}})
     now = time.time()
     lines = []
@@ -4178,7 +4789,7 @@ async def autopurge_status(ctx: commands.Context):
         )
 
     msg_lines = []
-    for k, v in ap.get("messages", {}).items():
+    for _key, v in ap.get("messages", {}).items():
         until = v.get("until")
         mtype = v.get("match_type")
         txt = v.get("text")
@@ -4531,23 +5142,122 @@ async def before_reminder_loop():
 # --------------------------------------------------------------------------- #
 
 
+HEALTH_STARTUP_GRACE_S: float = 180.0
+_KEEPALIVE_RUNNER: Optional[Any] = None
+
+
+def _deploy_version() -> Optional[str]:
+    commit: str = os.getenv("RENDER_GIT_COMMIT", "").strip()
+    return commit[:7] or None
+
+
+def build_health_payload(
+    target: Any, *, now: float, preview: bool = False
+) -> Tuple[int, Dict[str, Any]]:
+    """(HTTP status, JSON body) for /health. Reads memory only - never the database.
+
+    200 while the gateway is ready with a finite latency, and during the first
+    HEALTH_STARTUP_GRACE_S seconds after start (previews included); 503 otherwise.
+    """
+    uptime: float = max(0.0, now - float(getattr(target, "start_time", now)))
+    try:
+        ready: bool = bool(target.is_ready()) and not bool(target.is_closed())
+    except Exception:
+        ready = False
+    latency: Any = getattr(target, "latency", float("nan"))
+    latency_ok: bool = (
+        isinstance(latency, (int, float))
+        and not isinstance(latency, bool)
+        and math.isfinite(latency)
+    )
+    shutting_down: bool = SHUTDOWN.requested
+    if shutting_down:
+        status, code = "shutting_down", 503
+    elif ready and latency_ok:
+        status, code = "ok", 200
+    elif uptime < HEALTH_STARTUP_GRACE_S:
+        status, code = "starting", 200
+    else:
+        status, code = "unavailable", 503
+
+    stats: Dict[str, Any] = collect_runtime_stats(target)
+    cache: Dict[str, Any] = stats.get("attachment_cache") or {}
+    lag: Dict[str, Any] = stats.get("loop_lag") or {}
+    payload: Dict[str, Any] = {
+        "status": status,
+        "ready": ready,
+        "latency_ms": round(latency * 1000, 1) if latency_ok else None,
+        "guilds": stats["guilds"],
+        "uptime_s": int(uptime),
+        "rss_mb": stats["rss_mb"],
+        "peak_rss_mb": stats["peak_rss_mb"],
+        "preview": preview,
+        "version": _deploy_version(),
+        "loop_lag_ms": {"last": lag.get("last_ms"), "max_5m": lag.get("max_ms")},
+        "memory": {
+            "settings_cache_entries": stats["settings_cache_entries"],
+            "attachment_cache_bytes": cache.get("bytes", 0),
+            "attachment_cache_entries": cache.get("entries", 0),
+            "ai_buffer_channels": stats["ai_buffer_channels"],
+            "ai_buffer_messages": stats["ai_buffer_messages"],
+            "ai_pending_messages": stats["ai_pending_messages"],
+            "snipes": stats["snipes"],
+        },
+        "runtime": {
+            "threads": stats["threads"],
+            "asyncio_tasks": stats["asyncio_tasks"],
+            "background_tasks": stats["background_tasks"],
+            "voice_clients": stats["voice_clients"],
+        },
+    }
+    return code, payload
+
+
+async def _keepalive_root(request: Any) -> Any:
+    from aiohttp import web
+
+    # Uptime monitors hit this to keep the free instance awake: always 200.
+    return web.Response(text="OK")
+
+
+async def _health_handler(request: Any) -> Any:
+    from aiohttp import web
+
+    code, payload = build_health_payload(
+        bot, now=time.time(), preview=_is_preview_deploy()
+    )
+    return web.json_response(
+        payload, status=code, headers={"Cache-Control": "no-store"}
+    )
+
+
 async def _start_keepalive_server() -> None:
+    global _KEEPALIVE_RUNNER
     port: Optional[str] = os.getenv("PORT")
     if not port:
         return
     from aiohttp import web
 
-    async def health(_: web.Request) -> web.Response:
-        return web.Response(text="OK")
-
     app: web.Application = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    runner: web.AppRunner = web.AppRunner(app)
+    app.router.add_get("/", _keepalive_root)  # GET and HEAD
+    app.router.add_get("/health", _health_handler)
+    # No access log: two uptime monitors would otherwise add ~576 lines a day.
+    runner: web.AppRunner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site: web.TCPSite = web.TCPSite(runner, "0.0.0.0", int(port))
     await site.start()
+    _KEEPALIVE_RUNNER = runner
     log.info("Keepalive HTTP server listening on port %s.", port)
+
+
+async def _stop_keepalive_server() -> None:
+    global _KEEPALIVE_RUNNER
+    runner, _KEEPALIVE_RUNNER = _KEEPALIVE_RUNNER, None
+    if runner is not None:
+        try:
+            await runner.cleanup()
+        except Exception as exc:
+            log.debug("Keepalive server cleanup failed: %s", exc)
 
 
 def _is_preview_deploy() -> bool:
@@ -4604,8 +5314,7 @@ async def _run_preview_diagnostics() -> None:
             await run("through Cloudflare WARP")
         else:
             log.warning("WARP didn't start, so it wasn't probed (see the lines above)")
-    while True:
-        await asyncio.sleep(3600)
+    await SHUTDOWN.wait()  # idle until Render stops the preview
 
 
 async def _apply_guild_automations(message: discord.Message) -> None:
@@ -4731,7 +5440,7 @@ async def autorespond_cmd(
             "❌ You need the **Manage Server** permission for this.", ephemeral=True
         )
         return
-    settings: Dict[str, Any] = bot.settings.get_settings(ctx.guild.id)  # type: ignore[union-attr]
+    settings: Dict[str, Any] = await bot.settings.fetch_settings(ctx.guild.id)  # type: ignore[union-attr]
     conf: Dict[str, Any] = dict(
         settings.get("autorespond") or {"enabled": False, "triggers": {}}
     )
@@ -4754,7 +5463,7 @@ async def autorespond_cmd(
         triggers.pop(trigger, None)
         conf["triggers"] = triggers
 
-    saved: bool = bot.settings.update_settings(ctx.guild.id, {"autorespond": conf})  # type: ignore[union-attr]
+    saved: bool = await bot.settings.push_settings(ctx.guild.id, {"autorespond": conf})  # type: ignore[union-attr]
     await ctx.send(
         f"{'✅' if saved else '⚠️'} Autorespond is **{'enabled' if conf.get('enabled') else 'disabled'}** "
         f"with **{len(triggers)}** trigger(s)."
@@ -7069,7 +7778,7 @@ async def aiopt_cmd(
 async def _handle_sticky(message: discord.Message) -> None:
     """Re-post the channel's sticky message underneath new chatter."""
     assert message.guild is not None
-    settings = bot.settings.get_settings(message.guild.id)
+    settings = await bot.settings.fetch_settings(message.guild.id)
     sticky: Dict[str, Any] = settings.get("sticky") or {}
     entry: Optional[Dict[str, Any]] = sticky.get(str(message.channel.id))
     if not entry or not entry.get("content"):
@@ -7128,7 +7837,7 @@ async def sticky_group(ctx: commands.Context, *, message: str):
     if not content:
         return await ctx.send("❌ Give me some text to stick.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     sticky: Dict[str, Any] = dict(settings.get("sticky") or {})
     existing: Dict[str, Any] = sticky.get(str(ctx.channel.id)) or {}
     sticky[str(ctx.channel.id)] = {
@@ -7157,7 +7866,7 @@ async def sticky_off(
         return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
 
     target = channel or ctx.channel
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     sticky: Dict[str, Any] = dict(settings.get("sticky") or {})
     entry: Optional[Dict[str, Any]] = sticky.pop(str(target.id), None)
     if entry is None:
@@ -7189,7 +7898,7 @@ async def sticky_list(ctx: commands.Context):
     if not member_has_perms(ctx.author, manage_messages=True):
         return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     sticky: Dict[str, Any] = settings.get("sticky") or {}
     if not sticky:
         return await ctx.send(
@@ -7375,7 +8084,7 @@ async def send_modlog(
     guild: discord.Guild,
     title: str,
     description: str,
-    color: discord.Color = discord.Color.orange(),
+    color: Optional[discord.Color] = None,
     fields: Optional[List[Tuple[str, str]]] = None,
 ) -> None:
     settings = bot.settings.peek_settings(guild.id)
@@ -7388,7 +8097,7 @@ async def send_modlog(
     embed = discord.Embed(
         title=title,
         description=description[:4000],
-        color=color,
+        color=color if color is not None else discord.Color.orange(),
         timestamp=datetime.now(timezone.utc),
     )
     for name, value in fields or []:
@@ -7635,7 +8344,7 @@ def _automod_exempt(member: discord.Member, config: Dict[str, Any]) -> bool:
 async def _handle_automod(message: discord.Message) -> bool:
     """Returns True when the message was removed and further handling should stop."""
     assert message.guild is not None
-    config = bot.settings.get_settings(message.guild.id).get("automod") or {}
+    config = (await bot.settings.fetch_settings(message.guild.id)).get("automod") or {}
     if not any(config.get(rule) for rule in AUTOMOD_RULES):
         return False
     if not isinstance(message.author, discord.Member) or _automod_exempt(
@@ -7689,13 +8398,13 @@ async def _handle_automod(message: discord.Message) -> bool:
     bot.automod_strikes[strike_key] = strikes
 
     try:
-        notice = await message.channel.send(
+        await message.channel.send(
             f"🛡️ {message.author.mention} — that message was removed ({violation}).",
             delete_after=6.0,
             allowed_mentions=discord.AllowedMentions(users=True),
         )
     except discord.DiscordException:
-        notice = None
+        pass
 
     await send_modlog(
         message.guild,
@@ -7724,7 +8433,7 @@ async def _handle_automod(message: discord.Message) -> bool:
 
         # Helper to warn
         async def apply_warn():
-            settings = bot.settings.get_settings(message.guild.id)
+            settings = await bot.settings.fetch_settings(message.guild.id)
             warns = dict(settings.get("warns") or {})
             entries = list(warns.get(str(message.author.id)) or [])
             entries.append(
@@ -7750,7 +8459,7 @@ async def _handle_automod(message: discord.Message) -> bool:
             # Escalate if needed
             escalate_threshold = config.get("escalate_threshold")
             if escalate_threshold:
-                settings = bot.settings.get_settings(message.guild.id)
+                settings = await bot.settings.fetch_settings(message.guild.id)
                 warns = settings.get("warns", {})
                 entries = warns.get(str(message.author.id), [])
                 if len(entries) >= escalate_threshold:
@@ -7848,7 +8557,7 @@ async def _handle_automod(message: discord.Message) -> bool:
 async def automod_group(ctx: commands.Context):
     if ctx.invoked_subcommand is not None:
         return
-    config = bot.settings.get_settings(ctx.guild.id).get("automod") or {}
+    config = (await bot.settings.fetch_settings(ctx.guild.id)).get("automod") or {}
     lines = [
         f"{'🟢' if config.get(rule) else '🔴'} **{rule}**" for rule in AUTOMOD_RULES
     ]
@@ -8038,7 +8747,7 @@ async def automod_exempt(
         return await ctx.send(
             "❌ You need the **Manage Server** permission.", ephemeral=True
         )
-    config = bot.settings.get_settings(ctx.guild.id).get("automod") or {}
+    config = (await bot.settings.fetch_settings(ctx.guild.id)).get("automod") or {}
     exempt = [str(r) for r in (config.get("exempt_roles") or [])]
     if action == "add" and str(role.id) not in exempt:
         exempt.append(str(role.id))
@@ -8092,7 +8801,7 @@ async def tempban_cmd(
         delete_message_seconds=0,
     )
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     tempbans = dict(settings.get("tempbans") or {})
     tempbans[str(user.id)] = {"until": until, "reason": reason, "by": str(ctx.author)}
     await bot.settings.push_fields(ctx.guild.id, {"tempbans": tempbans})
@@ -8151,7 +8860,7 @@ async def before_tempban_loop() -> None:
 async def remind_group(ctx: commands.Context):
     if ctx.invoked_subcommand is not None:
         return
-    config = bot.settings.get_settings(ctx.guild.id).get("remind") or {}
+    config = (await bot.settings.fetch_settings(ctx.guild.id)).get("remind") or {}
     if not config.get("enabled"):
         return await ctx.send(
             "🔕 No recurring reminder is set. Use `/remind set`.", ephemeral=True
@@ -8229,7 +8938,7 @@ async def remind_off(ctx: commands.Context):
 async def tag_group(ctx: commands.Context, name: Optional[str] = None):
     if ctx.invoked_subcommand is not None:
         return
-    tags = bot.settings.get_settings(ctx.guild.id).get("tags") or {}
+    tags = (await bot.settings.fetch_settings(ctx.guild.id)).get("tags") or {}
     if not name:
         return await ctx.send(
             "Available tags: "
@@ -8252,7 +8961,7 @@ async def tag_add(ctx: commands.Context, name: str, *, content: str):
         return await ctx.send(
             "❌ You need the **Manage Messages** permission.", ephemeral=True
         )
-    tags = dict(bot.settings.get_settings(ctx.guild.id).get("tags") or {})
+    tags = dict((await bot.settings.fetch_settings(ctx.guild.id)).get("tags") or {})
     if len(tags) >= 200 and name.lower() not in tags:
         return await ctx.send("❌ This server already has 200 tags.", ephemeral=True)
     tags[name.lower()[:50]] = content[:1800]
@@ -8268,7 +8977,7 @@ async def tag_remove(ctx: commands.Context, name: str):
         return await ctx.send(
             "❌ You need the **Manage Messages** permission.", ephemeral=True
         )
-    tags = dict(bot.settings.get_settings(ctx.guild.id).get("tags") or {})
+    tags = dict((await bot.settings.fetch_settings(ctx.guild.id)).get("tags") or {})
     if tags.pop(name.lower(), None) is None:
         return await ctx.send(f"❌ No tag called `{name}`.", ephemeral=True)
     saved = await bot.settings.push_fields(ctx.guild.id, {"tags": tags})
@@ -8279,7 +8988,7 @@ async def tag_remove(ctx: commands.Context, name: str):
 
 @tag_group.command(name="list", description="List every tag in this server")
 async def tag_list(ctx: commands.Context):
-    tags = bot.settings.get_settings(ctx.guild.id).get("tags") or {}
+    tags = (await bot.settings.fetch_settings(ctx.guild.id)).get("tags") or {}
     if not tags:
         return await ctx.send(
             "ℹ️ No tags yet — add one with `/tag add`.", ephemeral=True
@@ -9144,16 +9853,13 @@ async def counting_set_channel(
     guild_id = interaction.guild_id
     if not guild_id:
         return
-    settings = await bot.settings.fetch_settings(guild_id)
-    if "counting" not in settings:
-        settings["counting"] = copy.deepcopy(DEFAULT_SETTINGS["counting"])
     if channel:
-        settings["counting"]["channel_id"] = channel.id
+        value: Optional[int] = channel.id
         msg = f"Counting channel set to {channel.mention}."
     else:
-        settings["counting"]["channel_id"] = None
+        value = None
         msg = "Counting disabled."
-    await bot.settings.push_settings(guild_id, settings)
+    await bot.settings.push_fields(guild_id, {"counting.channel_id": value})
     await interaction.response.send_message(msg, ephemeral=True)
 
 
@@ -9167,11 +9873,7 @@ async def counting_set_saves(
     guild_id = interaction.guild_id
     if not guild_id:
         return
-    settings = await bot.settings.fetch_settings(guild_id)
-    if "counting" not in settings:
-        settings["counting"] = copy.deepcopy(DEFAULT_SETTINGS["counting"])
-    settings["counting"]["default_saves"] = saves
-    await bot.settings.push_settings(guild_id, settings)
+    await bot.settings.push_fields(guild_id, {"counting.default_saves": saves})
     await interaction.response.send_message(
         f"Counting default saves per day set to {saves}.", ephemeral=True
     )
@@ -9189,16 +9891,13 @@ async def counting_set_ruiner_role(
     guild_id = interaction.guild_id
     if not guild_id:
         return
-    settings = await bot.settings.fetch_settings(guild_id)
-    if "counting" not in settings:
-        settings["counting"] = copy.deepcopy(DEFAULT_SETTINGS["counting"])
     if role:
-        settings["counting"]["ruiner_role_id"] = role.id
+        value: Optional[int] = role.id
         msg = f"Streak ruiner role set to {role.mention}."
     else:
-        settings["counting"]["ruiner_role_id"] = None
+        value = None
         msg = "Streak ruiner role disabled."
-    await bot.settings.push_settings(guild_id, settings)
+    await bot.settings.push_fields(guild_id, {"counting.ruiner_role_id": value})
     await interaction.response.send_message(msg, ephemeral=True)
 
 
@@ -9209,25 +9908,8 @@ async def counting_reset(interaction: discord.Interaction):
     guild_id = interaction.guild_id
     if not guild_id:
         return
-    state = bot.settings.counting.find_one({"guild_id": guild_id})
-    if not state:
-        state = {
-            "guild_id": guild_id,
-            "current": 0,
-            "last_user": None,
-            "streak": 0,
-            "broken": False,
-            "broken_time": None,
-        }
-    else:
-        state["current"] = 0
-        state["last_user"] = None
-        state["streak"] = 0
-        state["broken"] = False
-        state["broken_time"] = None
-    bot.settings.counting.update_one(
-        {"guild_id": guild_id}, {"$set": state}, upsert=True
-    )
+    async with _counting_lock(guild_id):
+        await _counting_store(guild_id, _counting_fresh_state(guild_id))
     await interaction.response.send_message(
         "The counting streak has been reset to 0.", ephemeral=True
     )
@@ -9417,49 +10099,164 @@ async def diagnose_cmd(ctx: commands.Context) -> None:
     started: float = time.perf_counter()
     db_ok: bool = await bot.settings.ping()
     db_ms: float = (time.perf_counter() - started) * 1000
+    guild_settings: Dict[str, Any] = await bot.settings.fetch_settings(ctx.guild.id)
 
-    loops: Dict[str, Any] = {
-        "reminders": reminder_loop,
-        "ai flush": ai_flush_loop,
-        "tempbans": tempban_loop,
-        "personal reminders": personal_reminder_loop,
-    }
-    loop_lines: List[str] = []
-    for name, loop_obj in loops.items():
-        if loop_obj.is_running():
-            failed: bool = bool(loop_obj.failed())
-            mark: str = "\u26a0\ufe0f" if failed else "\u2705"
-            suffix: str = " (failed)" if failed else ""
-            loop_lines.append(f"{mark} {name}{suffix}")
-        else:
-            loop_lines.append(f"\u274c {name} (stopped)")
+    embed: discord.Embed = build_diagnose_embed(
+        bot, ctx.guild, db_ok=db_ok, db_ms=db_ms, guild_settings=guild_settings
+    )
+    await ctx.send(embed=embed, ephemeral=True)
 
-    me: discord.Member = ctx.guild.me
+
+DIAGNOSE_LOOPS: Dict[str, Any] = {}  # filled below once every loop exists
+
+
+def _memory_limit_mb() -> Optional[float]:
+    """The instance's memory limit, for "% used": MEMORY_LIMIT_MB, else 512 on Render."""
+    raw: str = os.getenv("MEMORY_LIMIT_MB", "").strip()
+    if raw:
+        try:
+            return float(raw) if float(raw) > 0 else None
+        except ValueError:
+            return None
+    return 512.0 if os.getenv("RENDER") else None
+
+
+def _fmt_ms(value: Optional[float]) -> str:
+    return "n/a" if value is None else f"{value:.0f} ms"
+
+
+def _diagnose_music_lines(target: Any) -> List[str]:
+    music: Any = target.get_cog("Music") if hasattr(target, "get_cog") else None
+    lines: List[str] = [
+        f"Voice connections **{len(getattr(target, 'voice_clients', None) or [])}**"
+    ]
+    if music is None:
+        lines.append("\u26a0\ufe0f Music module not loaded")
+        return lines
+    lines.append(f"Players **{len(getattr(music, 'players', {}) or {})}**")
+    try:
+        from utils import warp, ytdl
+
+        route: Dict[str, Any] = ytdl.route_status()
+        warp_state: Dict[str, Any] = warp.status()
+        lines.append(f"YouTube route **{route['route']}**")
+        if route.get("preferred"):
+            lines.append(f"Clients `{route['preferred'][:60]}`")
+        warp_text: str = "running" if warp_state["running"] else (
+            "available" if warp_state["available"] else "unavailable"
+        )
+        lines.append(f"WARP **{warp_state['mode']}** \u00b7 {warp_text}")
+    except Exception as exc:  # diagnostics must never fail the command
+        lines.append(f"Route unknown ({type(exc).__name__})")
+    return lines
+
+
+def _diagnose_feature_lines(settings: Dict[str, Any]) -> List[str]:
+    def on(flag: Any) -> str:
+        return "\U0001f7e2" if flag else "\u26aa"
+
+    counting: Dict[str, Any] = settings.get("counting") or {}
+    ai: Dict[str, Any] = settings.get("ai") or {}
+    messagelog: Dict[str, Any] = settings.get("messagelog") or {}
+    modlog: Dict[str, Any] = settings.get("modlog") or {}
+    automod: Dict[str, Any] = settings.get("automod") or {}
+    automod_on: List[str] = [
+        key for key in ("invites", "links", "spam", "caps", "mentions") if automod.get(key)
+    ]
+    return [
+        f"{on(counting.get('channel_id'))} Counting"
+        + (f" in <#{counting['channel_id']}>" if counting.get("channel_id") else ""),
+        f"{on(ai.get('enabled'))} AI chat ({len(ai.get('channels') or [])} channels)",
+        f"{on(messagelog.get('enabled') and messagelog.get('channel_id'))} Message log"
+        + (" + attachment cache" if messagelog.get("cache_attachments") else ""),
+        f"{on(modlog.get('enabled') and modlog.get('channel_id'))} Mod log",
+        f"{on(automod_on)} Automod" + (f" ({', '.join(automod_on)})" if automod_on else ""),
+        f"{on((settings.get('raid') or {}).get('enabled'))} Raid protection",
+        f"{on((settings.get('modmail') or {}).get('enabled'))} Tickets",
+    ]
+
+
+def build_diagnose_embed(
+    target: Any,
+    guild: discord.Guild,
+    *,
+    db_ok: bool,
+    db_ms: float,
+    guild_settings: Optional[Dict[str, Any]] = None,
+) -> discord.Embed:
+    """The /diagnose report. Pure apart from reading in-memory state."""
+    stats: Dict[str, Any] = collect_runtime_stats(target)
+    lag: Dict[str, Any] = stats.get("loop_lag") or {}
+    cache: Dict[str, int] = target.settings.cache_stats()
+    lookups: int = cache["hits"] + cache["misses"]
+    hit_rate: float = (cache["hits"] / lookups * 100) if lookups else 100.0
+    errors: Dict[str, Any] = target.errors.stats()
+    uptime: float = time.time() - target.start_time
+    latency: float = target.latency
+    latency_text: str = (
+        f"{latency * 1000:.0f} ms" if math.isfinite(latency) else "not connected"
+    )
+
+    me: Any = guild.me
     missing: List[str] = [
         permission.replace("_", " ")
         for permission in REQUIRED_GUILD_PERMISSIONS
         if not getattr(me.guild_permissions, permission, False)
     ]
 
-    cache: Dict[str, int] = bot.settings.cache_stats()
-    lookups: int = cache["hits"] + cache["misses"]
-    hit_rate: float = (cache["hits"] / lookups * 100) if lookups else 100.0
-    errors: Dict[str, Any] = bot.errors.stats()
-    uptime: float = time.time() - bot.start_time
+    loop_lines: List[str] = []
+    for name, loop_obj in DIAGNOSE_LOOPS.items():
+        if loop_obj.is_running():
+            failed: bool = bool(loop_obj.failed())
+            mark: str = "\u26a0\ufe0f" if failed else "\u2705"
+            loop_lines.append(f"{mark} {name}{' (failed)' if failed else ''}")
+        else:
+            loop_lines.append(f"\u274c {name} (stopped)")
+    lag_monitor: Any = getattr(target, "loop_lag", None)
+    if isinstance(lag_monitor, LoopLagMonitor):
+        loop_lines.append(
+            ("\u2705" if lag_monitor.running else "\u274c") + " loop-lag monitor"
+        )
+
+    rss: Optional[float] = stats.get("rss_mb")
+    limit: Optional[float] = _memory_limit_mb()
+    memory_share: Optional[float] = (rss / limit * 100) if (rss and limit) else None
+    attachment: Dict[str, Any] = stats.get("attachment_cache") or {}
+    lag_max: Optional[float] = lag.get("max_ms")
+
+    warnings: List[str] = []
+    if not db_ok:
+        warnings.append("database unreachable")
+    if missing:
+        warnings.append("missing permissions")
+    if memory_share is not None and memory_share >= 85:
+        warnings.append(f"memory at {memory_share:.0f}% of the limit")
+    if lag_max is not None and lag_max >= 1000:
+        warnings.append("event loop was blocked for over a second")
+    if any("\u274c" in line or "failed" in line for line in loop_lines):
+        warnings.append("a background loop is down")
 
     embed: discord.Embed = discord.Embed(
         title="\U0001fa7a Bot diagnostics",
+        description=(
+            "\u2705 Everything looks healthy."
+            if not warnings
+            else "\u26a0\ufe0f " + "; ".join(warnings).capitalize() + "."
+        ),
         color=(
-            discord.Color.green() if db_ok and not missing else discord.Color.orange()
+            discord.Color.red()
+            if not db_ok
+            else discord.Color.orange() if warnings else discord.Color.green()
         ),
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(
         name="Gateway",
         value=(
-            f"Latency **{bot.latency * 1000:.0f} ms**\n"
-            f"Uptime **{int(uptime // 3600)}h {int(uptime % 3600 // 60)}m**\n"
-            f"Guilds **{len(bot.guilds)}**"
+            f"Latency **{latency_text}**\n"
+            f"Uptime **{humanize_seconds(uptime)}**\n"
+            f"Guilds **{stats['guilds']}** \u00b7 Shards **{target.shard_count or 1}**\n"
+            f"Cached users **{len(getattr(target, 'users', None) or [])}**"
         ),
         inline=True,
     )
@@ -9486,7 +10283,43 @@ async def diagnose_cmd(ctx: commands.Context) -> None:
         ),
         inline=True,
     )
-    embed.add_field(name="Background loops", value="\n".join(loop_lines), inline=False)
+    memory_lines: List[str] = [
+        f"RSS **{rss if rss is not None else 'n/a'} MB**"
+        + (f" ({memory_share:.0f}% of {limit:.0f} MB)" if memory_share is not None else "")
+        + f" \u00b7 peak {stats.get('peak_rss_mb') or 'n/a'} MB",
+        f"Attachment cache **{attachment.get('bytes', 0) / 1048576:.1f}"
+        f"/{attachment.get('max_bytes', 0) / 1048576:.0f} MB** "
+        f"({attachment.get('entries', 0)} msgs, {attachment.get('evictions', 0)} evicted)",
+        f"Settings cache **{stats['settings_cache_entries']}** guilds",
+        f"AI buffers **{stats['ai_buffer_messages']}** msgs in "
+        f"{stats['ai_buffer_channels']} channels \u00b7 {stats['ai_pending_messages']} unsaved",
+        f"Snipes **{stats['snipes']}**",
+    ]
+    embed.add_field(name="Memory", value="\n".join(memory_lines), inline=False)
+    runtime_lines: List[str] = [
+        f"Python **{_sys.version.split()[0]}** \u00b7 discord.py **{discord.__version__}**"
+        f" \u00b7 aiohttp **{aiohttp.__version__}**",
+        f"Event-loop lag **{_fmt_ms(lag.get('last_ms'))}** now \u00b7 "
+        f"p50 {_fmt_ms(lag.get('p50_ms'))} \u00b7 max {_fmt_ms(lag_max)} (5 min)",
+        f"Threads **{stats['threads']}** \u00b7 asyncio tasks **{stats['asyncio_tasks']}**"
+        f" \u00b7 background **{stats['background_tasks']}**",
+    ]
+    version: Optional[str] = _deploy_version()
+    if version:
+        runtime_lines.append(f"Deployed commit `{version}`")
+    embed.add_field(name="Runtime", value="\n".join(runtime_lines), inline=False)
+    embed.add_field(
+        name="Music", value="\n".join(_diagnose_music_lines(target))[:1024], inline=True
+    )
+    embed.add_field(
+        name="Background loops", value="\n".join(loop_lines)[:1024] or "none", inline=True
+    )
+    if guild_settings is not None:
+        embed.add_field(
+            name="This server",
+            value="\n".join(_diagnose_feature_lines(guild_settings))[:1024],
+            inline=False,
+        )
     embed.add_field(
         name="Permissions in this server",
         value=(
@@ -9496,8 +10329,20 @@ async def diagnose_cmd(ctx: commands.Context) -> None:
         ),
         inline=False,
     )
-    embed.set_footer(text="Run /errors detail <id> for tracebacks")
-    await ctx.send(embed=embed, ephemeral=True)
+    embed.set_footer(text="Run /errors detail <id> for tracebacks \u00b7 GET /health for JSON")
+    return embed
+
+
+DIAGNOSE_LOOPS.update(
+    {
+        "reminders": reminder_loop,
+        "ai flush": ai_flush_loop,
+        "tempbans": tempban_loop,
+        "personal reminders": personal_reminder_loop,
+        "state janitor": state_janitor_loop,
+        "memory report": memory_report_loop,
+    }
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -10912,6 +11757,10 @@ async def messagelog_edit(payload: discord.RawMessageUpdateEvent) -> None:
 async def messagelog_delete(payload: discord.RawMessageDeleteEvent) -> None:
     if payload.guild_id is None:
         return
+    # Always free the cached bytes: the message is gone either way.
+    cached_attachments: List[Dict[str, Any]] = bot.attachment_cache.pop(
+        payload.message_id
+    )
     guild: Optional[discord.Guild] = bot.get_guild(payload.guild_id)
     if guild is None or _messagelog_skip(guild.id, payload.channel_id):
         return
@@ -10924,6 +11773,7 @@ async def messagelog_delete(payload: discord.RawMessageDeleteEvent) -> None:
     ):
         return
 
+    files: List[discord.File] = []
     embed: discord.Embed = discord.Embed(
         title="\U0001f5d1\ufe0f Message deleted",
         color=discord.Color.red(),
@@ -10939,10 +11789,6 @@ async def messagelog_delete(payload: discord.RawMessageDeleteEvent) -> None:
             else "*no text content*"
         )
         attachments: str = _describe_attachments(list(cached.attachments))
-        files = []
-        cached_attachments = getattr(bot, "attachment_cache", {}).get(
-            payload.message_id, []
-        )
         for i, a in enumerate(cached_attachments):
             if a["data"]:
                 try:
@@ -10979,13 +11825,15 @@ async def messagelog_delete(payload: discord.RawMessageDeleteEvent) -> None:
         embed.set_footer(text=f"Message ID {payload.message_id}")
 
     embed.add_field(name="Channel", value=f"<#{payload.channel_id}>", inline=True)
-    await _post_messagelog(guild, embed, files=files if "files" in locals() else None)
+    await _post_messagelog(guild, embed, files=files or None)
 
 
 @bot.listen("on_raw_bulk_message_delete")
 async def messagelog_bulk_delete(payload: discord.RawBulkMessageDeleteEvent) -> None:
     if payload.guild_id is None:
         return
+    for message_id in payload.message_ids:
+        bot.attachment_cache.pop(message_id)
     guild: Optional[discord.Guild] = bot.get_guild(payload.guild_id)
     if guild is None or _messagelog_skip(guild.id, payload.channel_id):
         return
@@ -11111,6 +11959,12 @@ async def messagelog_cache(ctx: commands.Context) -> None:
         outcome = "\u2705 I will now cache small image and video attachments to ensure they are visible if deleted."
     else:
         outcome = "\U0001f507 Attachment caching disabled."
+    stats: Dict[str, int] = bot.attachment_cache.stats()
+    outcome += (
+        f"\n-# Cache (all servers): {stats['entries']} messages, "
+        f"{stats['bytes'] / 1048576:.1f}/{stats['max_bytes'] / 1048576:.0f} MB, "
+        f"{stats['hits']} hits, {stats['evictions']} evictions."
+    )
 
     await ctx.send(
         outcome + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
@@ -12043,9 +12897,9 @@ def _format_member_message(template: str, member: discord.Member) -> str:
 def _greeter_config(guild_id: int, key: str) -> Dict[str, Any]:
     stored: Dict[str, Any] = bot.settings.peek_settings(guild_id).get(key) or {}
     config: Dict[str, Any] = copy.deepcopy(DEFAULT_SETTINGS[key])
-    for field, value in stored.items():
-        if field in config:
-            config[field] = value
+    for name, value in stored.items():
+        if name in config:
+            config[name] = value
     return config
 
 
@@ -12551,8 +13405,6 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
     # 1. Backup the current server
     await backup_guild(ctx.guild, bot)
 
-    import asyncio
-
     # 2. Deletion Process
     # Channels
     for channel in ctx.guild.channels:
@@ -12899,8 +13751,6 @@ async def rollback_clone(ctx: commands.Context):
 
     await ctx.send("Starting the rollback process... this may take up to 10 minutes.")
 
-    import asyncio
-
     # Deletion Process (Delete current state)
     for channel in ctx.guild.channels:
         try:
@@ -13196,51 +14046,22 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     async def runner() -> None:
+        install_signal_handlers(asyncio.get_running_loop(), bot.close)
         await _start_keepalive_server()
-
-        if _is_preview_deploy():
-            await _run_preview_diagnostics()
-            return
-
-        base_backoff: float = 15.0
-        max_backoff: float = 300.0
-        backoff: float = base_backoff
-
-        while True:
-            attempt_started: float = time.monotonic()
-            try:
-                await bot.start(token)
-                log.info("Gateway session closed cleanly - exiting supervisor.")
-                return
-            except (discord.LoginFailure, discord.PrivilegedIntentsRequired) as exc:
-                log.critical("Unrecoverable startup failure: %s", exc)
-                raise SystemExit(1) from exc
-            except discord.HTTPException as exc:
-                if exc.status == 429:
-                    log.warning("Rate limited (HTTP 429) during startup: %s", exc)
-                else:
-                    log.warning(
-                        "HTTP error during startup (status %s): %s", exc.status, exc
-                    )
-            except (
-                discord.ConnectionClosed,
-                discord.GatewayNotFound,
-                aiohttp.ClientError,
-                OSError,
-            ) as exc:
-                log.warning("Transport failure: %s", exc)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Unexpected supervisor failure.")
-
-            if time.monotonic() - attempt_started > 600:
-                backoff = base_backoff  # A long-lived session earns a fresh budget.
-
-            delay: float = backoff + random.uniform(0.0, 5.0)
-            log.info("Reconnecting in %.1fs.", delay)
-            await asyncio.sleep(delay)
-            backoff = min(backoff * 2, max_backoff)
+        try:
+            if _is_preview_deploy():
+                # Stop probing as soon as Render asks the preview to stop.
+                probe = asyncio.ensure_future(_run_preview_diagnostics())
+                stop = asyncio.ensure_future(SHUTDOWN.wait())
+                await asyncio.wait({probe, stop}, return_when=asyncio.FIRST_COMPLETED)
+                for pending in (probe, stop):
+                    pending.cancel()
+            else:
+                await supervise(lambda: bot.start(token), is_closed=bot.is_closed)
+            if SHUTDOWN.task is not None:
+                await SHUTDOWN.task
+        finally:
+            await _stop_keepalive_server()
 
     try:
         asyncio.run(runner())

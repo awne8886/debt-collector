@@ -379,6 +379,26 @@ _demoted: Optional[Strategy] = None  # its last stream died at once; tried last
 _stream_cache: Dict[str, Tuple[float, "StreamInfo"]] = {}
 
 
+def route_status() -> Dict[str, Any]:
+    """Diagnostics only: which route YouTube traffic takes and which clients lead."""
+    with _state_lock:
+        preferred: Optional[Strategy] = _preferred
+        demoted: Optional[Strategy] = _demoted
+        cached: int = len(_stream_cache)
+    if os.getenv("YTDL_PROXY", "").strip():
+        route = "YTDL_PROXY"
+    elif warp.proxy_url() is not None:
+        route = "Cloudflare WARP"
+    else:
+        route = "direct"
+    return {
+        "route": route,
+        "preferred": preferred.label if preferred else None,
+        "demoted": demoted.label if demoted else None,
+        "cached_streams": cached,
+    }
+
+
 def _rotation_enabled() -> bool:
     return os.getenv("YTDL_CLIENT_ROTATION", "1").strip().lower() not in ("0", "false", "off", "no")
 
@@ -489,6 +509,44 @@ _IP_BLOCK_SIGNS: Tuple[str, ...] = (
 )
 
 
+# Route hooks, set by the music cog so this module needn't know about the database.
+# Both are called from worker threads and may block.
+_on_warp_needed: Optional[Callable[[], None]] = None
+_on_direct_success: Optional[Callable[[], None]] = None
+
+
+def set_route_hooks(
+    *,
+    warp_needed: Optional[Callable[[], None]] = None,
+    direct_success: Optional[Callable[[], None]] = None,
+) -> None:
+    """``warp_needed`` runs when YouTube refuses this host's IP and WARP is tried;
+    ``direct_success`` runs after a request succeeds without WARP or a proxy."""
+    global _on_warp_needed, _on_direct_success
+    _on_warp_needed, _on_direct_success = warp_needed, direct_success
+
+
+def _call_hook(hook: Optional[Callable[[], None]]) -> None:
+    if hook is None:
+        return
+    try:
+        hook()
+    except Exception as exc:
+        log.debug("Route hook failed: %s", exc)
+
+
+def _on_direct_route() -> bool:
+    return not os.getenv("YTDL_PROXY", "").strip() and warp.proxy_url() is None
+
+
+def start_warp_early() -> bool:
+    """Route YouTube through WARP before any direct attempt (the host is known to be
+    refused). False if WARP can't be used or didn't start; the caller carries on."""
+    if warp.mode() != "auto" or not warp.available() or warp.proxy_url() is not None:
+        return False
+    return _switch_to_warp()
+
+
 class _RouteChanged(Exception):
     """YouTube traffic now goes another way (WARP); start the rotation again."""
 
@@ -565,12 +623,15 @@ def _rotate(
                 and _looks_ip_blocked(message, logger.warnings)
             ):
                 log.warning("YouTube is refusing this server's IP; trying Cloudflare WARP")
+                _call_hook(_on_warp_needed)
                 if _switch_to_warp():
-                    raise _RouteChanged()
+                    raise _RouteChanged() from None
             continue
         if tried:
             log.info("Recovered %s via %s after: %s", target, strategy.label, "; ".join(tried))
         _remember(strategy)
+        if _on_direct_route():
+            _call_hook(_on_direct_success)
         return info
     raise ExtractionError(friendly_error(first_error or "")) from None
 
