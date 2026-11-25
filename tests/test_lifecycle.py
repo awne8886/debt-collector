@@ -286,7 +286,7 @@ class TestShutdown(unittest.IsolatedAsyncioTestCase):
 
 class TestDiagnose(unittest.TestCase):
     def test_embed_has_the_new_sections(self):
-        import main as info
+        import features.info as info
 
         bot = _fake_bot()
         bot.errors = MagicMock()
@@ -317,7 +317,7 @@ class TestDiagnose(unittest.TestCase):
         self.assertIn("Attachment cache", memory)
 
     def test_database_down_is_red(self):
-        import main as info
+        import features.info as info
 
         bot = _fake_bot()
         bot.errors = MagicMock()
