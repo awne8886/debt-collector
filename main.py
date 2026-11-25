@@ -387,7 +387,7 @@ async def backup_guild(guild: discord.Guild, bot: commands.Bot) -> dict:
         backup_data["bot_settings"] = copy.deepcopy(settings)
 
     try:
-        bot.settings.backups.insert_one(backup_data)
+        await asyncio.to_thread(bot.settings.backups.insert_one, backup_data)
         return backup_data
     except Exception as e:
         import logging
@@ -1021,16 +1021,39 @@ async def handle_counting_retraction(
     return True
 
 
+# Fail fast instead of hanging worker threads: a slow Atlas used to hold a call for
+# up to 10 s. Options written in MONGO_URI itself take precedence over these.
+MONGO_CLIENT_DEFAULTS: Dict[str, Any] = {
+    "maxPoolSize": 50,
+    "retryWrites": True,
+    "serverSelectionTimeoutMS": 5_000,
+    "connectTimeoutMS": 5_000,
+    "timeoutMS": 8_000,  # client-side limit for a whole operation, retries included
+}
+
+
+def mongo_client_options(uri: str) -> Dict[str, Any]:
+    """MONGO_CLIENT_DEFAULTS minus any option the URI already sets (case-insensitive)."""
+    query: str = uri.split("?", 1)[1] if "?" in uri else ""
+    in_uri: set = {
+        part.split("=", 1)[0].strip().lower()
+        for part in re.split(r"[&;]", query)
+        if part
+    }
+    return {
+        key: value
+        for key, value in MONGO_CLIENT_DEFAULTS.items()
+        if key.lower() not in in_uri
+    }
+
+
 class MultiTenantSettingsManager:
     def __init__(self) -> None:
         mongo_uri: Optional[str] = os.getenv("MONGO_URI")
         if not mongo_uri:
             raise RuntimeError("MONGO_URI environment variable is not set.")
         self._client: MongoClient = MongoClient(
-            mongo_uri,
-            maxPoolSize=50,
-            serverSelectionTimeoutMS=10_000,
-            retryWrites=True,
+            mongo_uri, **mongo_client_options(mongo_uri)
         )
         self._collection: Collection = self._client[MONGO_DB_NAME][
             MONGO_COLLECTION_NAME
@@ -2656,18 +2679,18 @@ async def joinrole_cmd(ctx: commands.Context, *, role: str):
     if resolved is None:
         return await ctx.send("❌ No role found.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     joinroles = settings.get("joinroles", [])
 
     if str(resolved.id) in joinroles:
         joinroles.remove(str(resolved.id))
-        bot.settings.update_settings(ctx.guild.id, {"joinroles": joinroles})
+        await bot.settings.push_settings(ctx.guild.id, {"joinroles": joinroles})
         await ctx.send(
             f"✅ **{resolved.name}** will no longer be given to new joiners."
         )
     else:
         joinroles.append(str(resolved.id))
-        bot.settings.update_settings(ctx.guild.id, {"joinroles": joinroles})
+        await bot.settings.push_settings(ctx.guild.id, {"joinroles": joinroles})
         await ctx.send(f"✅ **{resolved.name}** will now be given to all new joiners.")
 
 
@@ -2808,19 +2831,19 @@ async def reactionrole_group(
             ephemeral=True,
         )
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     reactionroles = settings.get("reactionroles", {})
     key = f"{msg.id}_{emoji}"
 
     if key in reactionroles and reactionroles[key] == str(resolved.id):
         del reactionroles[key]
-        bot.settings.update_settings(ctx.guild.id, {"reactionroles": reactionroles})
+        await bot.settings.push_settings(ctx.guild.id, {"reactionroles": reactionroles})
         await ctx.send(
             f"✅ Removed reaction role **{resolved.name}** from that message."
         )
     else:
         reactionroles[key] = str(resolved.id)
-        bot.settings.update_settings(ctx.guild.id, {"reactionroles": reactionroles})
+        await bot.settings.push_settings(ctx.guild.id, {"reactionroles": reactionroles})
         await ctx.send(
             f"✅ Added reaction role **{resolved.name}** to that message. Users who react with {emoji} will receive the role."
         )
@@ -2839,7 +2862,7 @@ async def reactionrole_list(ctx: commands.Context):
     if not member_has_perms(ctx.author, manage_roles=True):
         return await ctx.send("❌ You need Manage Roles permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     reactionroles: Dict[str, Any] = settings.get("reactionroles", {}) or {}
     if not reactionroles:
         return await ctx.send(
@@ -2890,7 +2913,7 @@ async def reactionrole_remove(
             "❌ Give me a message ID or a message link.", ephemeral=True
         )
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     reactionroles: Dict[str, Any] = dict(settings.get("reactionroles", {}) or {})
     targets: List[str] = [
         key
@@ -3159,7 +3182,7 @@ async def warn_cmd(
 ):
     if not member_has_perms(ctx.author, manage_messages=True):
         return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     warns = settings.setdefault("warns", {})
     uw = warns.setdefault(str(user.id), [])
     if dm:
@@ -3170,7 +3193,7 @@ async def warn_cmd(
         except discord.DiscordException:
             pass
     uw.append({"reason": reason, "by": ctx.author.id, "at": int(time.time())})
-    bot.settings.update_settings(ctx.guild.id, {"warns": warns})
+    await bot.settings.push_settings(ctx.guild.id, {"warns": warns})
     await ctx.send(f"⚠️ **{user}** was warned. Reason: {reason}")
     embed = discord.Embed(title="Member Warned", color=discord.Color.gold())
     embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
@@ -3186,7 +3209,7 @@ async def warn_cmd(
 @commands.guild_only()
 @app_commands.describe(user="Whose warnings to show")
 async def warnings_cmd(ctx: commands.Context, user: discord.Member):
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     uw = settings.get("warns", {}).get(str(user.id), [])
     if not uw:
         return await ctx.send(f"**{user}** has no warnings.", ephemeral=True)
@@ -3212,11 +3235,11 @@ async def warnings_cmd(ctx: commands.Context, user: discord.Member):
 async def clearwarns_cmd(ctx: commands.Context, user: discord.Member):
     if not member_has_perms(ctx.author, manage_messages=True):
         return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     warns = settings.get("warns", {})
     if str(user.id) in warns:
         del warns[str(user.id)]
-        bot.settings.update_settings(ctx.guild.id, {"warns": warns})
+        await bot.settings.push_settings(ctx.guild.id, {"warns": warns})
 
     strike_key = (ctx.guild.id, user.id)
     if strike_key in bot.automod_strikes:
@@ -4281,7 +4304,7 @@ async def echoset(ctx: commands.Context, state: Literal["on", "off"]) -> None:
         )
         return
     enabled: bool = state == "on"
-    saved: bool = bot.settings.update_settings(ctx.guild.id, {"echoset": enabled})  # type: ignore[union-attr]
+    saved: bool = await bot.settings.push_settings(ctx.guild.id, {"echoset": enabled})  # type: ignore[union-attr]
     if saved:
         await ctx.send(
             f"📢 Echo is now **{'enabled' if enabled else 'disabled'}** for this server."
@@ -4316,7 +4339,7 @@ async def echo(
         await ctx.send("❌ You must provide a message to echo.", ephemeral=True)
         return
 
-    settings: Dict[str, Any] = bot.settings.get_settings(guild.id)
+    settings: Dict[str, Any] = await bot.settings.fetch_settings(guild.id)
     if not settings.get("echoset", False):
         await ctx.send(
             "❌ Echo is disabled on this server. An admin can enable it with `/echoset on`.",
@@ -4430,10 +4453,12 @@ async def autopurge_on(
     if hours or days:
         until = int(time.time()) + (hours or 0) * 3600 + (days or 0) * 86400
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.setdefault("autopurge", {"channels": {}, "exempt_roles": []})
-    ap["channels"][str(channel.id)] = {"until": until}
-    bot.settings.update_settings(ctx.guild.id, settings)
+    ap.setdefault("channels", {})[str(channel.id)] = {"until": until}
+    await bot.settings.push_fields(
+        ctx.guild.id, {f"autopurge.channels.{channel.id}": {"until": until}}
+    )
 
     when = f"until <t:{until}:f>" if until else "until you run `/autopurge off`"
     await ctx.send(
@@ -4453,12 +4478,13 @@ async def autopurge_off(
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
     channel = channel or ctx.channel
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.get("autopurge", {"channels": {}, "exempt_roles": []})
-    removed = ap["channels"].pop(str(channel.id), None)
+    channels = ap.setdefault("channels", {})
+    removed = channels.pop(str(channel.id), None)
 
     if removed:
-        bot.settings.update_settings(ctx.guild.id, settings)
+        await bot.settings.push_fields(ctx.guild.id, {"autopurge.channels": channels})
 
     msg = (
         f"✅ Auto-purge turned off in {channel.mention}."
@@ -4480,7 +4506,7 @@ async def autopurge_exempt(
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.setdefault("autopurge", {"channels": {}, "exempt_roles": []})
     exempt = ap["exempt_roles"]
 
@@ -4494,7 +4520,7 @@ async def autopurge_exempt(
     else:
         msg = f"{role.mention} wasn't exempt."
 
-    bot.settings.update_settings(ctx.guild.id, settings)
+    await bot.settings.push_fields(ctx.guild.id, {"autopurge.exempt_roles": exempt})
     await ctx.send(msg, ephemeral=True)
 
 
@@ -4522,7 +4548,7 @@ async def autopurge_msg_on(
     if hours or days:
         until = int(time.time()) + (hours or 0) * 3600 + (days or 0) * 86400
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.setdefault(
         "autopurge", {"channels": {}, "exempt_roles": [], "users": {}, "messages": {}}
     )
@@ -4530,7 +4556,8 @@ async def autopurge_msg_on(
 
     key = f"{match_type}:{text}"
     messages_dict[key] = {"until": until, "text": text, "match_type": match_type}
-    bot.settings.update_settings(ctx.guild.id, settings)
+    # The key holds user text (may contain "." or "$"), so write the whole map.
+    await bot.settings.push_fields(ctx.guild.id, {"autopurge.messages": messages_dict})
 
     when = f"until <t:{until}:f>" if until else "until you run `/autopurge msg_off`"
 
@@ -4564,7 +4591,7 @@ async def autopurge_msg_off(
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.get(
         "autopurge", {"channels": {}, "exempt_roles": [], "users": {}, "messages": {}}
     )
@@ -4574,7 +4601,9 @@ async def autopurge_msg_off(
     removed = messages_dict.pop(key, None)
 
     if removed:
-        bot.settings.update_settings(ctx.guild.id, settings)
+        await bot.settings.push_fields(
+            ctx.guild.id, {"autopurge.messages": messages_dict}
+        )
 
     msg = (
         f"✅ Auto-purge turned off for messages matching `{text}`."
@@ -4606,14 +4635,17 @@ async def autopurge_user_on(
     if hours or days:
         until = int(time.time()) + (hours or 0) * 3600 + (days or 0) * 86400
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.setdefault(
         "autopurge", {"channels": {}, "exempt_roles": [], "users": {}}
     )
     users = ap.setdefault("users", {})
 
     users[str(user.id)] = {"until": until, "exempt_channels": []}
-    bot.settings.update_settings(ctx.guild.id, settings)
+    await bot.settings.push_fields(
+        ctx.guild.id,
+        {f"autopurge.users.{user.id}": {"until": until, "exempt_channels": []}},
+    )
 
     when = (
         f"until <t:{until}:f>"
@@ -4636,14 +4668,14 @@ async def autopurge_user_off(ctx: commands.Context, user: discord.Member):
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.get("autopurge", {"channels": {}, "exempt_roles": [], "users": {}})
     users = ap.get("users", {})
 
     removed = users.pop(str(user.id), None)
 
     if removed:
-        bot.settings.update_settings(ctx.guild.id, settings)
+        await bot.settings.push_fields(ctx.guild.id, {"autopurge.users": users})
 
     msg = (
         f"✅ Auto-purge turned off for {user.mention}."
@@ -4669,7 +4701,7 @@ async def autopurge_user_exempt(
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.setdefault(
         "autopurge", {"channels": {}, "exempt_roles": [], "users": {}}
     )
@@ -4695,7 +4727,10 @@ async def autopurge_user_exempt(
     else:
         msg = f"{channel.mention} wasn't exempt for {user.mention}."
 
-    bot.settings.update_settings(ctx.guild.id, settings)
+    await bot.settings.push_fields(
+        ctx.guild.id,
+        {f"autopurge.users.{user.id}.exempt_channels": exempt_channels},
+    )
     await ctx.send(msg, ephemeral=True)
 
 
@@ -4706,7 +4741,7 @@ async def autopurge_status(ctx: commands.Context):
     if not member_has_perms(ctx.author, administrator=True):
         return await ctx.send("❌ You need Administrator permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     ap = settings.get("autopurge", {"channels": {}, "exempt_roles": [], "users": {}})
     now = time.time()
     lines = []
@@ -5404,7 +5439,7 @@ async def autorespond_cmd(
             "❌ You need the **Manage Server** permission for this.", ephemeral=True
         )
         return
-    settings: Dict[str, Any] = bot.settings.get_settings(ctx.guild.id)  # type: ignore[union-attr]
+    settings: Dict[str, Any] = await bot.settings.fetch_settings(ctx.guild.id)  # type: ignore[union-attr]
     conf: Dict[str, Any] = dict(
         settings.get("autorespond") or {"enabled": False, "triggers": {}}
     )
@@ -5427,7 +5462,7 @@ async def autorespond_cmd(
         triggers.pop(trigger, None)
         conf["triggers"] = triggers
 
-    saved: bool = bot.settings.update_settings(ctx.guild.id, {"autorespond": conf})  # type: ignore[union-attr]
+    saved: bool = await bot.settings.push_settings(ctx.guild.id, {"autorespond": conf})  # type: ignore[union-attr]
     await ctx.send(
         f"{'✅' if saved else '⚠️'} Autorespond is **{'enabled' if conf.get('enabled') else 'disabled'}** "
         f"with **{len(triggers)}** trigger(s)."
@@ -7742,7 +7777,7 @@ async def aiopt_cmd(
 async def _handle_sticky(message: discord.Message) -> None:
     """Re-post the channel's sticky message underneath new chatter."""
     assert message.guild is not None
-    settings = bot.settings.get_settings(message.guild.id)
+    settings = await bot.settings.fetch_settings(message.guild.id)
     sticky: Dict[str, Any] = settings.get("sticky") or {}
     entry: Optional[Dict[str, Any]] = sticky.get(str(message.channel.id))
     if not entry or not entry.get("content"):
@@ -7801,7 +7836,7 @@ async def sticky_group(ctx: commands.Context, *, message: str):
     if not content:
         return await ctx.send("❌ Give me some text to stick.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     sticky: Dict[str, Any] = dict(settings.get("sticky") or {})
     existing: Dict[str, Any] = sticky.get(str(ctx.channel.id)) or {}
     sticky[str(ctx.channel.id)] = {
@@ -7830,7 +7865,7 @@ async def sticky_off(
         return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
 
     target = channel or ctx.channel
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     sticky: Dict[str, Any] = dict(settings.get("sticky") or {})
     entry: Optional[Dict[str, Any]] = sticky.pop(str(target.id), None)
     if entry is None:
@@ -7862,7 +7897,7 @@ async def sticky_list(ctx: commands.Context):
     if not member_has_perms(ctx.author, manage_messages=True):
         return await ctx.send("❌ You need Manage Messages permission.", ephemeral=True)
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     sticky: Dict[str, Any] = settings.get("sticky") or {}
     if not sticky:
         return await ctx.send(
@@ -8308,7 +8343,7 @@ def _automod_exempt(member: discord.Member, config: Dict[str, Any]) -> bool:
 async def _handle_automod(message: discord.Message) -> bool:
     """Returns True when the message was removed and further handling should stop."""
     assert message.guild is not None
-    config = bot.settings.get_settings(message.guild.id).get("automod") or {}
+    config = (await bot.settings.fetch_settings(message.guild.id)).get("automod") or {}
     if not any(config.get(rule) for rule in AUTOMOD_RULES):
         return False
     if not isinstance(message.author, discord.Member) or _automod_exempt(
@@ -8397,7 +8432,7 @@ async def _handle_automod(message: discord.Message) -> bool:
 
         # Helper to warn
         async def apply_warn():
-            settings = bot.settings.get_settings(message.guild.id)
+            settings = await bot.settings.fetch_settings(message.guild.id)
             warns = dict(settings.get("warns") or {})
             entries = list(warns.get(str(message.author.id)) or [])
             entries.append(
@@ -8423,7 +8458,7 @@ async def _handle_automod(message: discord.Message) -> bool:
             # Escalate if needed
             escalate_threshold = config.get("escalate_threshold")
             if escalate_threshold:
-                settings = bot.settings.get_settings(message.guild.id)
+                settings = await bot.settings.fetch_settings(message.guild.id)
                 warns = settings.get("warns", {})
                 entries = warns.get(str(message.author.id), [])
                 if len(entries) >= escalate_threshold:
@@ -8521,7 +8556,7 @@ async def _handle_automod(message: discord.Message) -> bool:
 async def automod_group(ctx: commands.Context):
     if ctx.invoked_subcommand is not None:
         return
-    config = bot.settings.get_settings(ctx.guild.id).get("automod") or {}
+    config = (await bot.settings.fetch_settings(ctx.guild.id)).get("automod") or {}
     lines = [
         f"{'🟢' if config.get(rule) else '🔴'} **{rule}**" for rule in AUTOMOD_RULES
     ]
@@ -8711,7 +8746,7 @@ async def automod_exempt(
         return await ctx.send(
             "❌ You need the **Manage Server** permission.", ephemeral=True
         )
-    config = bot.settings.get_settings(ctx.guild.id).get("automod") or {}
+    config = (await bot.settings.fetch_settings(ctx.guild.id)).get("automod") or {}
     exempt = [str(r) for r in (config.get("exempt_roles") or [])]
     if action == "add" and str(role.id) not in exempt:
         exempt.append(str(role.id))
@@ -8765,7 +8800,7 @@ async def tempban_cmd(
         delete_message_seconds=0,
     )
 
-    settings = bot.settings.get_settings(ctx.guild.id)
+    settings = await bot.settings.fetch_settings(ctx.guild.id)
     tempbans = dict(settings.get("tempbans") or {})
     tempbans[str(user.id)] = {"until": until, "reason": reason, "by": str(ctx.author)}
     await bot.settings.push_fields(ctx.guild.id, {"tempbans": tempbans})
@@ -8824,7 +8859,7 @@ async def before_tempban_loop() -> None:
 async def remind_group(ctx: commands.Context):
     if ctx.invoked_subcommand is not None:
         return
-    config = bot.settings.get_settings(ctx.guild.id).get("remind") or {}
+    config = (await bot.settings.fetch_settings(ctx.guild.id)).get("remind") or {}
     if not config.get("enabled"):
         return await ctx.send(
             "🔕 No recurring reminder is set. Use `/remind set`.", ephemeral=True
@@ -8902,7 +8937,7 @@ async def remind_off(ctx: commands.Context):
 async def tag_group(ctx: commands.Context, name: Optional[str] = None):
     if ctx.invoked_subcommand is not None:
         return
-    tags = bot.settings.get_settings(ctx.guild.id).get("tags") or {}
+    tags = (await bot.settings.fetch_settings(ctx.guild.id)).get("tags") or {}
     if not name:
         return await ctx.send(
             "Available tags: "
@@ -8925,7 +8960,7 @@ async def tag_add(ctx: commands.Context, name: str, *, content: str):
         return await ctx.send(
             "❌ You need the **Manage Messages** permission.", ephemeral=True
         )
-    tags = dict(bot.settings.get_settings(ctx.guild.id).get("tags") or {})
+    tags = dict((await bot.settings.fetch_settings(ctx.guild.id)).get("tags") or {})
     if len(tags) >= 200 and name.lower() not in tags:
         return await ctx.send("❌ This server already has 200 tags.", ephemeral=True)
     tags[name.lower()[:50]] = content[:1800]
@@ -8941,7 +8976,7 @@ async def tag_remove(ctx: commands.Context, name: str):
         return await ctx.send(
             "❌ You need the **Manage Messages** permission.", ephemeral=True
         )
-    tags = dict(bot.settings.get_settings(ctx.guild.id).get("tags") or {})
+    tags = dict((await bot.settings.fetch_settings(ctx.guild.id)).get("tags") or {})
     if tags.pop(name.lower(), None) is None:
         return await ctx.send(f"❌ No tag called `{name}`.", ephemeral=True)
     saved = await bot.settings.push_fields(ctx.guild.id, {"tags": tags})
@@ -8952,7 +8987,7 @@ async def tag_remove(ctx: commands.Context, name: str):
 
 @tag_group.command(name="list", description="List every tag in this server")
 async def tag_list(ctx: commands.Context):
-    tags = bot.settings.get_settings(ctx.guild.id).get("tags") or {}
+    tags = (await bot.settings.fetch_settings(ctx.guild.id)).get("tags") or {}
     if not tags:
         return await ctx.send(
             "ℹ️ No tags yet — add one with `/tag add`.", ephemeral=True
