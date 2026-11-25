@@ -22,6 +22,7 @@ from pymongo import MongoClient, UpdateOne
 from pymongo.collection import Collection
 from pymongo.errors import PyMongoError
 
+from utils.attachment_cache import AttachmentCache
 from utils.safe_math import safe_eval_int
 
 # --------------------------------------------------------------------------- #
@@ -575,7 +576,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "evasion_days": 30,
         "name_patterns": [],
     },
-    "messagelog": {"enabled": False, "channel_id": None, "ignored_channels": []},
+    "messagelog": {
+        "enabled": False,
+        "channel_id": None,
+        "ignored_channels": [],
+        "cache_attachments": False,
+    },
     "modlog": {"enabled": False, "channel_id": None},
     "modmail": {
         "enabled": False,
@@ -1157,6 +1163,10 @@ class DebtCollectorBot(commands.Bot):
         self.automod_strikes: Dict[Any, List[float]] = {}
         self.errors: ErrorRecorder = ErrorRecorder()
         self._background_tasks: set = set()
+        # Attachments of recent messages, so the message log can re-upload them
+        # after a delete. Byte-budgeted LRU (ATTACHMENT_CACHE_MB / _TTL_S).
+        self.attachment_cache: AttachmentCache = AttachmentCache()
+        self.attachment_semaphore: asyncio.Semaphore = asyncio.Semaphore(2)
 
     def spawn(self, coro: Any, *, name: Optional[str] = None) -> Any:
         """Fire-and-forget with a hard reference and a terminal error sink."""
@@ -1784,24 +1794,45 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
             bot.log_error("reactionrole:remove", exc, guild=guild, user=member)
 
 
+def _is_cacheable_media(attachment: Any) -> bool:
+    content_type: str = getattr(attachment, "content_type", None) or ""
+    return content_type.startswith("image/") or content_type.startswith("video/")
+
+
+def _attachments_to_cache(message: discord.Message) -> List[Any]:
+    """Attachments of ``message`` the message-log cache should download, if any."""
+    if message.guild is None or not message.attachments:
+        return []
+    if message.author.bot and not getattr(message, "webhook_id", None):
+        return []  # the message log never reports deletes of bot messages
+    config: Dict[str, Any] = _messagelog_config(message.guild.id)
+    if not config.get("cache_attachments"):
+        return []
+    if not config.get("enabled") or not config.get("channel_id"):
+        return []
+    if _messagelog_skip(message.guild.id, message.channel.id):
+        return []
+    cache: AttachmentCache = bot.attachment_cache
+    return [
+        a
+        for a in message.attachments
+        if _is_cacheable_media(a) and cache.accepts(getattr(a, "size", None))
+    ]
+
+
 async def _cache_single_attachment(
     message_id: int, attachment: discord.Attachment
 ) -> None:
+    cache: AttachmentCache = bot.attachment_cache
+    if not cache.accepts(getattr(attachment, "size", None)):
+        return
     try:
-        data = await attachment.read()
-        if not hasattr(bot, "attachment_cache"):
-            bot.attachment_cache = {}
-        if message_id not in bot.attachment_cache:
-            bot.attachment_cache[message_id] = []
-        bot.attachment_cache[message_id].append(
-            {
-                "filename": attachment.filename,
-                "content_type": attachment.content_type,
-                "data": data,
-            }
-        )
-    except Exception as exc:
+        async with bot.attachment_semaphore:
+            data = await attachment.read()
+    except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError) as exc:
         log.debug("Failed to cache attachment: %s", exc)
+        return
+    cache.put(message_id, attachment.filename, attachment.content_type, data)
 
 
 def _extract_message_text(message: discord.Message) -> str:
@@ -1833,35 +1864,11 @@ async def on_message(message: discord.Message) -> None:
             await _handle_afk_return(message)
             await _handle_afk_mentions(message)
 
-        if message.attachments:
-            config = (
-                bot.settings.peek_settings(message.guild.id).get("messagelog") or {}
+        for attachment in _attachments_to_cache(message):
+            bot.spawn(
+                _cache_single_attachment(message.id, attachment),
+                name=f"attachment-cache:{message.id}",
             )
-            if config.get("cache_attachments"):
-                # limit cache size
-                if len(getattr(bot, "attachment_cache", {})) > 500:
-                    bot.attachment_cache = {}
-
-                cached_files = []
-                for a in message.attachments:
-                    if (
-                        a.content_type
-                        and (
-                            a.content_type.startswith("image/")
-                            or a.content_type.startswith("video/")
-                        )
-                        and a.size < 5_000_000
-                    ):
-                        try:
-                            # We can just store the proxy URL or bytes, but to send we need bytes.
-                            # It's better to fetch and store bytes in memory.
-                            # But wait! If we do it synchronously here we block on_message.
-                            # Let's spawn a task.
-                            bot.loop.create_task(
-                                _cache_single_attachment(message.id, a)
-                            )
-                        except Exception:
-                            pass
 
         settings: Dict[str, Any] = bot.settings.peek_settings(message.guild.id)
         autopurge: Dict[str, Any] = settings.get("autopurge") or {
@@ -10936,6 +10943,10 @@ async def messagelog_edit(payload: discord.RawMessageUpdateEvent) -> None:
 async def messagelog_delete(payload: discord.RawMessageDeleteEvent) -> None:
     if payload.guild_id is None:
         return
+    # Always free the cached bytes: the message is gone either way.
+    cached_attachments: List[Dict[str, Any]] = bot.attachment_cache.pop(
+        payload.message_id
+    )
     guild: Optional[discord.Guild] = bot.get_guild(payload.guild_id)
     if guild is None or _messagelog_skip(guild.id, payload.channel_id):
         return
@@ -10948,6 +10959,7 @@ async def messagelog_delete(payload: discord.RawMessageDeleteEvent) -> None:
     ):
         return
 
+    files: List[discord.File] = []
     embed: discord.Embed = discord.Embed(
         title="\U0001f5d1\ufe0f Message deleted",
         color=discord.Color.red(),
@@ -10963,10 +10975,6 @@ async def messagelog_delete(payload: discord.RawMessageDeleteEvent) -> None:
             else "*no text content*"
         )
         attachments: str = _describe_attachments(list(cached.attachments))
-        files = []
-        cached_attachments = getattr(bot, "attachment_cache", {}).get(
-            payload.message_id, []
-        )
         for i, a in enumerate(cached_attachments):
             if a["data"]:
                 try:
@@ -11003,13 +11011,15 @@ async def messagelog_delete(payload: discord.RawMessageDeleteEvent) -> None:
         embed.set_footer(text=f"Message ID {payload.message_id}")
 
     embed.add_field(name="Channel", value=f"<#{payload.channel_id}>", inline=True)
-    await _post_messagelog(guild, embed, files=files if "files" in locals() else None)
+    await _post_messagelog(guild, embed, files=files or None)
 
 
 @bot.listen("on_raw_bulk_message_delete")
 async def messagelog_bulk_delete(payload: discord.RawBulkMessageDeleteEvent) -> None:
     if payload.guild_id is None:
         return
+    for message_id in payload.message_ids:
+        bot.attachment_cache.pop(message_id)
     guild: Optional[discord.Guild] = bot.get_guild(payload.guild_id)
     if guild is None or _messagelog_skip(guild.id, payload.channel_id):
         return
@@ -11135,6 +11145,12 @@ async def messagelog_cache(ctx: commands.Context) -> None:
         outcome = "\u2705 I will now cache small image and video attachments to ensure they are visible if deleted."
     else:
         outcome = "\U0001f507 Attachment caching disabled."
+    stats: Dict[str, int] = bot.attachment_cache.stats()
+    outcome += (
+        f"\n-# Cache (all servers): {stats['entries']} messages, "
+        f"{stats['bytes'] / 1048576:.1f}/{stats['max_bytes'] / 1048576:.0f} MB, "
+        f"{stats['hits']} hits, {stats['evictions']} evictions."
+    )
 
     await ctx.send(
         outcome + ("" if saved else "\n\u26a0\ufe0f The database write failed."),
