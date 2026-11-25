@@ -7,4 +7,4 @@ pymongo>=4.13,<5
 aiohttp>=3.12.14,<4
 word2number==1.1
 yt-dlp[default,deno]>=2026.11.23
-imageio-ffmpeg>=0.5.1
+imageio-ffmpeg>=0.8.1
