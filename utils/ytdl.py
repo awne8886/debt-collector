@@ -625,7 +625,7 @@ def _rotate(
                 log.warning("YouTube is refusing this server's IP; trying Cloudflare WARP")
                 _call_hook(_on_warp_needed)
                 if _switch_to_warp():
-                    raise _RouteChanged()
+                    raise _RouteChanged() from None
             continue
         if tried:
             log.info("Recovered %s via %s after: %s", target, strategy.label, "; ".join(tried))

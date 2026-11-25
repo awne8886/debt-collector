@@ -1339,12 +1339,12 @@ class ShutdownState:
             self._event.set()
         return True
 
-    async def wait(self, timeout: Optional[float] = None) -> bool:
-        """Wait until shutdown is requested (or ``timeout``). Returns the flag."""
+    async def wait(self, within: Optional[float] = None) -> bool:
+        """Wait until shutdown is requested (or ``within`` seconds). Returns the flag."""
         if self.requested:
             return True
         try:
-            await asyncio.wait_for(self._get_event().wait(), timeout)
+            await asyncio.wait_for(self._get_event().wait(), within)
         except asyncio.TimeoutError:
             pass
         return self.requested
@@ -1357,12 +1357,12 @@ SHUTDOWN: ShutdownState = ShutdownState()
 
 
 async def _close_within(
-    close: Callable[[], Any], timeout: float = SHUTDOWN_TIMEOUT_S
+    close: Callable[[], Any], budget: float = SHUTDOWN_TIMEOUT_S
 ) -> None:
     try:
-        await asyncio.wait_for(close(), timeout)
+        await asyncio.wait_for(close(), budget)
     except asyncio.TimeoutError:
-        log.warning("Shutdown took longer than %.0fs; exiting anyway.", timeout)
+        log.warning("Shutdown took longer than %.0fs; exiting anyway.", budget)
     except Exception:
         log.exception("Shutdown failed part-way; exiting anyway.")
 
@@ -2199,7 +2199,7 @@ def humanize_seconds(seconds: float) -> str:
     return f"{d:.0f}d {h:.0f}h"
 
 
-from utils.pagination import (
+from utils.pagination import (  # noqa: F401 # re-exported: tests import paginate_lines from main
     EMBED_DESCRIPTION_LIMIT,
     paginate_lines,
     Paginator,
@@ -2409,11 +2409,11 @@ def _extract_message_text(message: discord.Message) -> str:
             parts.append(embed.title)
         if embed.description:
             parts.append(embed.description)
-        for field in embed.fields:
-            if field.name:
-                parts.append(field.name)
-            if field.value:
-                parts.append(field.value)
+        for embed_field in embed.fields:
+            if embed_field.name:
+                parts.append(embed_field.name)
+            if embed_field.value:
+                parts.append(embed_field.value)
         if embed.author and embed.author.name:
             parts.append(embed.author.name)
         if embed.footer and embed.footer.text:
@@ -3096,7 +3096,7 @@ async def softban_cmd(
 
     try:
         await user.ban(reason=f"Softban: {reason}", delete_message_days=7)
-        await ctx.guild.unban(user, reason=f"Softban release")
+        await ctx.guild.unban(user, reason="Softban release")
         await ctx.send(f"🔨 **{user}** was softbanned. Reason: {reason}")
         embed = discord.Embed(title="Member Softbanned", color=discord.Color.orange())
         embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
@@ -3810,7 +3810,6 @@ COMMAND_SUMMARY: Dict[str, str] = {
     # --- Configuration ---
     "set": "Core server configuration.",
     "set prefix": "Change the chat command prefix for this server (default `!`).",
-    "set modlog": "Send a log of every moderation action to a channel; empty turns it off.",
     "echoset": "Allow or block the /echo command server-wide.",
     "autoreact": "React with chosen emojis whenever a message contains a trigger word.",
     "autoreact add": "Add a trigger plus the emojis to react with, and whether it matches "
@@ -3881,8 +3880,8 @@ COMMAND_SUMMARY: Dict[str, str] = {
     "leaver off": "Stop announcing leaves, keeping the message and styling.",
     "set messagelog": "Choose the channel edited and deleted messages are logged to.",
     "set modlog": "Choose the channel moderation actions are logged to.",
-    "diagnose": "Health check: gateway latency, database reachability, background loops, "
-    "cache hit rate and the bot's missing permissions.",
+    "diagnose": "Health check: gateway, database, memory, event-loop lag, music/WARP, "
+    "background loops and the bot's missing permissions.",
     # --- AI ---
     "ai": "Configure the AI assistant for this server.",
     "ai setup": "Enable or disable the AI in a channel and set its reply chance.",
@@ -4788,7 +4787,7 @@ async def autopurge_status(ctx: commands.Context):
         )
 
     msg_lines = []
-    for k, v in ap.get("messages", {}).items():
+    for _key, v in ap.get("messages", {}).items():
         until = v.get("until")
         mtype = v.get("match_type")
         txt = v.get("text")
@@ -8083,7 +8082,7 @@ async def send_modlog(
     guild: discord.Guild,
     title: str,
     description: str,
-    color: discord.Color = discord.Color.orange(),
+    color: Optional[discord.Color] = None,
     fields: Optional[List[Tuple[str, str]]] = None,
 ) -> None:
     settings = bot.settings.peek_settings(guild.id)
@@ -8096,7 +8095,7 @@ async def send_modlog(
     embed = discord.Embed(
         title=title,
         description=description[:4000],
-        color=color,
+        color=color if color is not None else discord.Color.orange(),
         timestamp=datetime.now(timezone.utc),
     )
     for name, value in fields or []:
@@ -8397,13 +8396,13 @@ async def _handle_automod(message: discord.Message) -> bool:
     bot.automod_strikes[strike_key] = strikes
 
     try:
-        notice = await message.channel.send(
+        await message.channel.send(
             f"🛡️ {message.author.mention} — that message was removed ({violation}).",
             delete_after=6.0,
             allowed_mentions=discord.AllowedMentions(users=True),
         )
     except discord.DiscordException:
-        notice = None
+        pass
 
     await send_modlog(
         message.guild,
@@ -12896,9 +12895,9 @@ def _format_member_message(template: str, member: discord.Member) -> str:
 def _greeter_config(guild_id: int, key: str) -> Dict[str, Any]:
     stored: Dict[str, Any] = bot.settings.peek_settings(guild_id).get(key) or {}
     config: Dict[str, Any] = copy.deepcopy(DEFAULT_SETTINGS[key])
-    for field, value in stored.items():
-        if field in config:
-            config[field] = value
+    for name, value in stored.items():
+        if name in config:
+            config[name] = value
     return config
 
 
@@ -13404,8 +13403,6 @@ async def clone_server(ctx: commands.Context, reference_guild_id: str):
     # 1. Backup the current server
     await backup_guild(ctx.guild, bot)
 
-    import asyncio
-
     # 2. Deletion Process
     # Channels
     for channel in ctx.guild.channels:
@@ -13751,8 +13748,6 @@ async def rollback_clone(ctx: commands.Context):
         return await ctx.send("No recent backup found for this server.")
 
     await ctx.send("Starting the rollback process... this may take up to 10 minutes.")
-
-    import asyncio
 
     # Deletion Process (Delete current state)
     for channel in ctx.guild.channels:

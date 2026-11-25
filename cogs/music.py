@@ -689,9 +689,9 @@ class MusicCog(commands.Cog, name="Music"):
             try:
                 await channel.connect(self_deaf=True, timeout=CONNECT_TIMEOUT)
             except asyncio.TimeoutError:
-                raise MusicError("I couldn't connect to that voice channel in time.")
+                raise MusicError("I couldn't connect to that voice channel in time.") from None
             except discord.ClientException as exc:
-                raise MusicError(f"I couldn't join voice: {exc}")
+                raise MusicError(f"I couldn't join voice: {exc}") from None
             if isinstance(channel, discord.StageChannel):
                 with contextlib.suppress(discord.HTTPException):
                     await guild.me.edit(suppress=False)
@@ -755,7 +755,7 @@ class MusicCog(commands.Cog, name="Music"):
         try:
             parsed: ParsedQuery = parse_query(query)
         except InvalidQuery as exc:
-            raise MusicError(str(exc))
+            raise MusicError(str(exc)) from None
         player: GuildPlayer = await self._connect(ctx)
         if len(player.queue) >= player.queue.max_size and not front:
             raise MusicError(f"The queue is full ({player.queue.max_size} tracks).")
@@ -767,13 +767,13 @@ class MusicCog(commands.Cog, name="Music"):
                     RESOLVE_TIMEOUT,
                 )
             except ExtractionError as exc:
-                raise MusicError(str(exc))
+                raise MusicError(str(exc)) from None
             except asyncio.TimeoutError:
-                raise MusicError("YouTube took too long to respond. Try again in a moment.")
+                raise MusicError("YouTube took too long to respond. Try again in a moment.") from None
             except Exception as exc:
                 log.exception("resolve_tracks failed for %r", query)
                 self.record_error("music:resolve", exc, ctx.guild)
-                raise MusicError("Something went wrong looking that up.")
+                raise MusicError("Something went wrong looking that up.") from None
 
         tracks: List[Track] = [
             t for t in resolved.tracks if t.duration is None or t.duration <= MAX_TRACK_SECONDS
@@ -978,7 +978,7 @@ class MusicCog(commands.Cog, name="Music"):
             try:
                 seconds: int = parse_timestamp(position)
             except ValueError as exc:
-                raise MusicError(str(exc))
+                raise MusicError(str(exc)) from None
             if seconds >= track.duration:
                 raise MusicError(f"That track is only {format_duration(track.duration)} long.")
             async with ctx.typing():
@@ -1043,7 +1043,7 @@ class MusicCog(commands.Cog, name="Music"):
             try:
                 target: Track = player.queue.peek(position)
             except IndexError as exc:
-                raise MusicError(str(exc))
+                raise MusicError(str(exc)) from None
             if target.requester_id != ctx.author.id:
                 self._require_force(ctx, player, "remove other people's tracks")
             player.queue.remove(position)
@@ -1057,7 +1057,7 @@ class MusicCog(commands.Cog, name="Music"):
             try:
                 track: Track = player.queue.move(source, destination)
             except IndexError as exc:
-                raise MusicError(str(exc))
+                raise MusicError(str(exc)) from None
             await ctx.send(f"↕️ Moved **{_clean_title(track.title)}** to #{destination}.")
 
     @queue.command(name="clear", description="Remove every waiting track (keeps the current one playing)")
@@ -1077,7 +1077,7 @@ class MusicCog(commands.Cog, name="Music"):
             try:
                 player.queue.peek(position)
             except IndexError as exc:
-                raise MusicError(str(exc))
+                raise MusicError(str(exc)) from None
             async with ctx.typing():
                 target: Track = await player.skip_to(position)
             await ctx.send(f"⏭️ Skipped to **{_clean_title(target.title)}**.")

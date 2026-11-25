@@ -157,5 +157,16 @@ class TestPaginatorSuperuserLookup(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await paginator.interaction_check(interaction))
 
 
+class TestCloneCommandsCanRun(unittest.TestCase):
+    def test_asyncio_is_not_shadowed_by_a_local_import(self):
+        # A late `import asyncio` inside the function made the first
+        # asyncio.to_thread call raise UnboundLocalError (rollback_clone always failed).
+        import main
+
+        for command in (main.clone_server, main.rollback_clone):
+            with self.subTest(command=command.name):
+                self.assertNotIn("asyncio", command.callback.__code__.co_varnames)
+
+
 if __name__ == "__main__":
     unittest.main()

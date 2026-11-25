@@ -667,8 +667,6 @@ class TestWarpFallback(unittest.TestCase):
         self.assertEqual(options["proxy"], "http://127.0.0.1:9")
 
     def test_rotation_continues_when_warp_cannot_start(self):
-        import yt_dlp
-
         FakeYoutubeDL.behaviour = {
             (ytdl._JSLESS_CLIENTS, False): "ERROR: [youtube] x: Sign in to confirm you're not a bot",
             ((), True): dict(self.INFO),
@@ -792,8 +790,6 @@ class TestWarpMemory(unittest.TestCase):
         meta.set_meta.assert_not_called()
 
     def test_rotation_calls_the_route_hooks(self):
-        import yt_dlp
-
         events = []
         ytdl.set_route_hooks(
             warp_needed=lambda: events.append("warp_needed"),
@@ -976,9 +972,9 @@ class TestGuildPlayer(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(p.stop)
         self.addCleanup(self.player.shutdown)
 
-    async def until(self, predicate, timeout: float = 3.0):
+    async def until(self, predicate, within: float = 3.0):
         """Wait for something that involves a worker thread (stream resolution)."""
-        deadline = asyncio.get_running_loop().time() + timeout
+        deadline = asyncio.get_running_loop().time() + within
         while not predicate():
             if asyncio.get_running_loop().time() > deadline:
                 self.fail("timed out waiting for the player")
@@ -1062,7 +1058,7 @@ class TestGuildPlayer(unittest.IsolatedAsyncioTestCase):
         with patch("cogs.music.stream_failed") as demote:
             for expected_plays in (2, 3, 4, 5, 6):
                 self.vc.finish_naturally()
-                await self.until(lambda: self.vc.play_calls == expected_plays)
+                await self.until(lambda n=expected_plays: self.vc.play_calls == n)
             self.vc.finish_naturally()
             await self.until(lambda: self.player.queue.current is None)
         self.assertEqual(demote.call_count, 3)

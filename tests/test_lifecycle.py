@@ -183,7 +183,7 @@ class TestShutdown(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(10)
 
         with self.assertLogs("debt-collector", level="WARNING"):
-            await _close_within(slow, timeout=0.05)
+            await _close_within(slow, budget=0.05)
 
     async def test_install_signal_handlers(self):
         from main import install_signal_handlers

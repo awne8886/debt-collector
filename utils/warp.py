@@ -252,7 +252,7 @@ def _start() -> str:
             break
         except Exception as exc:
             if attempt == 2:
-                raise TunnelError(f"no traffic through the tunnel ({exc}); {_tail(log_path)}")
+                raise TunnelError(f"no traffic through the tunnel ({exc}); {_tail(log_path)}") from None
             time.sleep(2)
     if trace.get("warp") not in ("on", "plus"):
         raise TunnelError(f"traffic isn't going through WARP (warp={trace.get('warp')})")
