@@ -87,22 +87,22 @@ class TestAttachmentCacheWiring(unittest.IsolatedAsyncioTestCase):
         return message
 
     async def test_selection_respects_config_and_size(self):
-        import main as messagelog
+        import features.messagelog as messagelog
 
         small, huge, text = _media(10), _media(50 * 1024 * 1024), _media(10, "text/plain")
         message = self._message([small, huge, text])
         enabled = {"enabled": True, "channel_id": 9, "ignored_channels": [], "cache_attachments": True}
-        with patch("main._messagelog_config", return_value=enabled):
+        with patch("features.messagelog._messagelog_config", return_value=enabled):
             self.assertEqual(messagelog._attachments_to_cache(message), [small])
-        with patch("main._messagelog_config", return_value={**enabled, "enabled": False}):
+        with patch("features.messagelog._messagelog_config", return_value={**enabled, "enabled": False}):
             self.assertEqual(messagelog._attachments_to_cache(message), [])
-        with patch("main._messagelog_config", return_value={**enabled, "ignored_channels": ["2"]}):
+        with patch("features.messagelog._messagelog_config", return_value={**enabled, "ignored_channels": ["2"]}):
             self.assertEqual(messagelog._attachments_to_cache(message), [])
-        with patch("main._messagelog_config", return_value={**enabled, "cache_attachments": False}):
+        with patch("features.messagelog._messagelog_config", return_value={**enabled, "cache_attachments": False}):
             self.assertEqual(messagelog._attachments_to_cache(message), [])
 
     async def test_download_goes_into_the_cache(self):
-        import main as messagelog
+        import features.messagelog as messagelog
         from core.bot import bot
 
         attachment = _media(10)
@@ -117,7 +117,7 @@ class TestAttachmentCacheWiring(unittest.IsolatedAsyncioTestCase):
         oversize.read.assert_not_awaited()
 
     async def test_delete_pops_the_cached_entry(self):
-        import main as messagelog
+        import features.messagelog as messagelog
         from core.bot import bot
 
         bot.attachment_cache.put(555, "a.png", "image/png", b"abc")
