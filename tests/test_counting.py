@@ -87,14 +87,14 @@ def make_interaction(guild_id, user_id=7):
 
 class CountingTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        import main as counting
+        import features.counting as counting
 
         counting._COUNTING_LOCKS.clear()
 
 
 class TestCountingConcurrency(CountingTestCase):
     async def test_same_number_at_once_only_one_counts(self):
-        import main as counting
+        import features.counting as counting
 
         bot = make_bot(delay=0.02)
         first, second = make_message("1", 10), make_message("1", 11)
@@ -109,7 +109,7 @@ class TestCountingConcurrency(CountingTestCase):
         self.assertTrue(state["broken"])  # the slower one broke the streak
 
     async def test_sequence_counts_up(self):
-        import main as counting
+        import features.counting as counting
 
         bot = make_bot()
         with patch_bot(bot):
@@ -119,7 +119,7 @@ class TestCountingConcurrency(CountingTestCase):
         self.assertEqual((state["current"], state["streak"], state["broken"]), (3, 3, False))
 
     async def test_counting_twice_in_a_row_breaks(self):
-        import main as counting
+        import features.counting as counting
 
         bot = make_bot()
         with patch_bot(bot):
@@ -130,7 +130,7 @@ class TestCountingConcurrency(CountingTestCase):
         self.assertTrue(bot.settings.counting.find_one({"guild_id": 1})["broken"])
 
     async def test_other_channel_is_ignored(self):
-        import main as counting
+        import features.counting as counting
 
         bot = make_bot()
         with patch_bot(bot):
@@ -138,7 +138,7 @@ class TestCountingConcurrency(CountingTestCase):
         self.assertIsNone(bot.settings.counting.find_one({"guild_id": 1}))
 
     async def test_deleting_the_current_count_breaks_the_streak(self):
-        import main as counting
+        import features.counting as counting
 
         bot = make_bot()
         with patch_bot(bot):
@@ -160,7 +160,7 @@ class TestCountingSaves(CountingTestCase):
         )
 
     async def test_saves_are_counted_per_server(self):
-        import main as counting
+        import features.counting as counting
 
         bot = make_bot(saves=1)
         for guild_id in (1, 2):
@@ -186,7 +186,7 @@ class TestCountingSaves(CountingTestCase):
             self.assertEqual(await counting._counting_saves_used(3, 7, today), 0)
 
     async def test_save_answers_with_edit_message_and_reads_db_state(self):
-        import main as counting
+        import features.counting as counting
 
         bot = make_bot()
         self._break(bot, 1)
@@ -202,7 +202,7 @@ class TestCountingSaves(CountingTestCase):
         self.assertFalse(bot.settings.counting.find_one({"guild_id": 1})["broken"])
 
     async def test_save_when_not_broken(self):
-        import main as counting
+        import features.counting as counting
 
         bot = make_bot()
         interaction = make_interaction(1)
@@ -211,7 +211,7 @@ class TestCountingSaves(CountingTestCase):
         self.assertIn("no longer broken", interaction.response.send_message.await_args.args[0])
 
     async def test_button_from_another_guild_is_refused(self):
-        import main as counting
+        import features.counting as counting
 
         bot = make_bot()
         self._break(bot, 1)
@@ -224,7 +224,7 @@ class TestCountingSaves(CountingTestCase):
 
 class TestCountingButton(unittest.IsolatedAsyncioTestCase):
     async def test_custom_id_round_trip(self):
-        from main import CountingSaveButton, CountingSaveView
+        from features.counting import CountingSaveButton, CountingSaveView
 
         button = CountingSaveButton(123456789012345678)
         self.assertEqual(button.custom_id, "counting:save:123456789012345678")
@@ -241,13 +241,13 @@ class TestCountingButton(unittest.IsolatedAsyncioTestCase):
 
         from core import registry
         from core.bot import DebtCollectorBot
-        from main import CountingSaveButton
+        from features.counting import CountingSaveButton
 
         self.assertIn(CountingSaveButton, registry.DYNAMIC_ITEMS)
         self.assertIn("add_dynamic_items(*registry.DYNAMIC_ITEMS)", inspect.getsource(DebtCollectorBot.setup_hook))
 
     def test_broken_embed_shows_configured_saves(self):
-        from main import _counting_broken_embed
+        from features.counting import _counting_broken_embed
 
         user = MagicMock(mention="<@1>")
         state = {"streak": 9}

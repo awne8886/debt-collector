@@ -316,7 +316,7 @@ class TestPaginateLines(unittest.TestCase):
 
 class TestParseCountingNumber(unittest.TestCase):
     def test_parse_counting_number(self):
-        from main import _parse_counting_number
+        from features.counting import _parse_counting_number
 
         # Test basic numeric strings
         self.assertEqual(_parse_counting_number("123"), 123)

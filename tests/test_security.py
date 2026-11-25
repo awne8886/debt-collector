@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 class TestSafeCountingParser(unittest.TestCase):
     def test_existing_calculator_syntax_still_works(self):
-        from main import _parse_counting_number
+        from features.counting import _parse_counting_number
 
         self.assertEqual(_parse_counting_number("2^3"), 8)
         self.assertEqual(_parse_counting_number("sqrt(16)"), 4)
@@ -22,7 +22,7 @@ class TestSafeCountingParser(unittest.TestCase):
         self.assertIsNone(_parse_counting_number("sqrt(-4)"))
 
     def test_code_is_never_run(self):
-        from main import _parse_counting_number
+        from features.counting import _parse_counting_number
 
         hostile = [
             "__import__('os').getpid()",
@@ -46,7 +46,7 @@ class TestSafeCountingParser(unittest.TestCase):
         getpid.assert_not_called()
 
     def test_expensive_inputs_are_refused_quickly(self):
-        from main import _parse_counting_number
+        from features.counting import _parse_counting_number
 
         for text in ("9**9**9", "10**100", "2**64**2", "1/0", "5//0", "5%0", "1e400"):
             with self.subTest(text=text):
@@ -68,7 +68,7 @@ class TestSafeCountingParser(unittest.TestCase):
         self.assertIsNone(safe_eval(None))  # type: ignore[arg-type]
 
     def test_thousand_hostile_inputs_under_a_second(self):
-        from main import _extract_and_parse_number, _parse_counting_number
+        from features.counting import _extract_and_parse_number, _parse_counting_number
 
         samples = [
             "9**9**9",
@@ -90,9 +90,9 @@ class TestSafeCountingParser(unittest.TestCase):
         self.assertLess(time.perf_counter() - started, 1.0)
 
     def test_extract_only_tries_first_twelve_words(self):
-        from main import _extract_and_parse_number
+        from features.counting import _extract_and_parse_number
 
-        with patch("main._parse_counting_number", return_value=None) as parser:
+        with patch("features.counting._parse_counting_number", return_value=None) as parser:
             _extract_and_parse_number(" ".join(["x"] * 50))
         self.assertEqual(parser.call_count, 12)
         self.assertEqual(_extract_and_parse_number("5 is the number"), 5)
