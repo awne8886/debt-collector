@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import MagicMock
 
 import aiohttp
-from main import fetch_reaction_gif
+from features.reactions import fetch_reaction_gif
 from support import patch_bot
 
 class TestFetchReactionGif(unittest.IsolatedAsyncioTestCase):
