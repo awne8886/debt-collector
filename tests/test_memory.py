@@ -164,7 +164,7 @@ class TestStateJanitor(unittest.IsolatedAsyncioTestCase):
         return target, held, now
 
     async def test_prunes_idle_entries_only(self):
-        from main import prune_idle_state
+        from features.maintenance import prune_idle_state
 
         target, held, now = self._target()
         async with held:
@@ -186,7 +186,7 @@ class TestStateJanitor(unittest.IsolatedAsyncioTestCase):
     async def test_extra_and_monotonic_maps(self):
         from types import SimpleNamespace
 
-        from main import prune_idle_state
+        from features.maintenance import prune_idle_state
 
         modmail = {(1, 1): 0.0, (1, 2): 9_999.0}
         cooldowns = {("ping", "user", 1): [10.0], ("ping", "user", 2): [5_000.0]}
